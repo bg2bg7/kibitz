@@ -1,10 +1,14 @@
 /**
  * Canonical PGNA v1.0 type contracts matching docs/PGNA-v1.0.md.
- * Ready for drop-in replacement by the owner's reference implementation.
+ * Pure isomorphic types — zero DOM / React / Node-only dependencies.
  */
 
 export const PGNA_FORMAT_VERSION = "1.0" as const;
 export const PGNA_MIME_TYPE = "application/vnd.pgn-audio+zip" as const;
+
+export const DEFAULT_SILENT_DURATION_MS = 1500 as const;
+export const DEFAULT_RETURN_PAUSE_MS = 1000 as const;
+export const DEFAULT_GAP_MS = 0 as const;
 
 /** Canonical positional node address: `g<gameIndex>` or `g<gameIndex>/<c0>.<c1>...` */
 export type NodeId = `g${number}` | `g${number}/${string}`;
@@ -34,6 +38,7 @@ export interface LastMoveCoords {
 export interface CompilationOptions {
   timingMode: TimingMode;
   defaultSilentDurationMs: number;
+  defaultReturnPauseMs: number;
   defaultGapMs: number;
   includeUnscheduledAudio: boolean;
 }
@@ -115,6 +120,8 @@ export interface TimelineEntry {
   subtitles?: Record<string, string>;
   cues: CueSnapshot[];
   guess?: GuessSpec;
+  /** True when the timeline returns silently to an already-visited node (audio is always null). */
+  isRevisit?: boolean;
 }
 
 export interface TimelineGameMetadata {
@@ -131,7 +138,10 @@ export interface NodeIndexEntry {
   orientation: BoardOrientation;
   clipId: string | null;
   subtitles?: Record<string, string>;
+  /** Primary (earliest) timeline entry index for this node, or null if unscheduled. */
   timelineIndex: number | null;
+  /** All main-timeline entry indices for this node in ascending timeline order. */
+  timelineIndices: number[];
 }
 
 export interface PgnaTimeline {
@@ -168,4 +178,47 @@ export interface PgnaDiagnostic {
   message: string;
   nodeId?: NodeId;
   path?: string;
+}
+
+export interface ParsedAtTag {
+  mode: "ordinal" | "timestamp";
+  /** For ordinal mode: the numeric ordinal (#1 -> 1). For timestamp mode: milliseconds. */
+  value: number;
+  /** Optional per-occurrence duration override from `dur=<time>`. */
+  durMs?: number;
+  rawSpec: string;
+}
+
+export type CueDirectiveKind =
+  | "clear"
+  | "cal"
+  | "csl"
+  | "+cal"
+  | "-cal"
+  | "+csl"
+  | "-csl";
+
+export interface ParsedCueDirective {
+  kind: CueDirectiveKind;
+  arrows?: ArrowAnnotation[];
+  highlights?: SquareHighlight[];
+}
+
+export interface ParsedCueTag {
+  offsetMs: number;
+  directives: ParsedCueDirective[];
+}
+
+export interface ParsedNodeTags {
+  prose: string;
+  preservedTags: string[];
+  arrows: ArrowAnnotation[];
+  highlights: SquareHighlight[];
+  audioClipId: string | null;
+  atTags: ParsedAtTag[];
+  durMs: number | null;
+  orientation: BoardOrientation | null;
+  guess: { returnPolicy: GuessReturnPolicy } | null;
+  outcome: GuessOutcome | null;
+  cues: ParsedCueTag[];
 }

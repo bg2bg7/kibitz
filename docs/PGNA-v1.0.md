@@ -103,22 +103,31 @@ Attaches a single audio clip (declared in `manifest.json#clips`) to this node.
 - A node **MUST NOT** have more than one `[%audio]` tag (even across multiple `{ ... }` comment blocks on the same node); duplicates are a compiler error (`DUPLICATE_AUDIO_TAG`).
 - Example: `[%audio clip-001]`
 
-#### `[%at <spec>]`
-Places this node on the compiled auto-play timeline. A node **MUST NOT** have more than one `[%at]` tag (even across multiple `{ ... }` comment blocks on the same node); duplicates are a compiler error (`DUPLICATE_AT_TAG`). `<spec>` is either:
+#### `[%at <spec> [dur=<time>]]`
+Places this node on the compiled auto-play timeline. A node **MAY** have multiple `[%at]` tags (across one or more `{ ... }` comment blocks) so the timeline can return to a previously visited position — for example, returning to the main line after walking through a variation. However, a node still **MUST NOT** have more than one `[%audio]` tag (`DUPLICATE_AUDIO_TAG`), and revisiting a node **never** plays audio a second time.
+
+`<spec>` is either:
 - **Explicit timestamp**: `HH:MM:SS(.mmm)`, `MM:SS(.mmm)`, or non-negative decimal seconds (`45.25`, `12`; strict decimal digits — no signs, hex, or scientific notation).
 - **Sequence ordinal**: `#<number>` where `<number>` is a non-negative decimal number (`^\d+(?:\.\d+)?$`, e.g., `#1`, `#2`, `#10`, `#2.5`), allowing easy clip reordering and automatic timestamp reflow when clips are redubbed or trimmed.
 
-Ordering & mode rules during compilation:
-1. All nodes with `[%at]` (or with `[%audio]` if `manifest.compilation.includeUnscheduledAudio` is `true`) are collected across all games and variations.
+Optional per-tag duration override:
+- `dur=<time>` (non-negative decimal seconds or `MM:SS(.mmm)`) overrides the display/pause duration for that specific timeline occurrence (for example, `[%at #4 dur=1.2]`).
+
+Ordering, primary vs. revisit, & mode rules during compilation:
+1. All `[%at]` occurrences across all games and variations (plus nodes with `[%audio]` and no `[%at]` if `manifest.compilation.includeUnscheduledAudio` is `true`) are collected.
 2. **Single scheduling mode per study**: A study **MUST** use either sequence ordinals (`#N`) **or** explicit timestamps consistently across all `[%at]` tags. Mixing `#` ordinals and explicit timestamps in the same study is a compiler error (`MIXED_TIMELINE_MODES`).
-3. Ties in `[%at]` value are broken deterministically by **PGN document order** (the order in which nodes appear in `study.pgn` text, across games and inline RAVs).
-4. A node with `[%audio <clipId>]` and **no** `[%at]` tag is still playable in **Manual Mode**, and is omitted from the auto-play timeline unless `manifest.compilation.includeUnscheduledAudio` is `true` (in which case it is appended in PGN document order).
+3. Ties in `[%at]` value are broken deterministically by **PGN document order** (the order in which nodes appear in `study.pgn` text, across games and inline RAVs), and then by tag order on the same node.
+4. **Primary visit vs. silent revisit**:
+   - The **earliest** timeline occurrence of a `nodeId` is its **primary visit** (`isRevisit` omitted). It plays the node's attached `[%audio]` clip (if any), sub-move `[%cue]` snapshots, subtitles, and `[%guess]` prompt.
+   - Every **subsequent** timeline occurrence of the same `nodeId` is a **silent revisit** (`isRevisit: true`). Its `audio` is **ALWAYS `null`** (never replays or attaches a second audio clip), it emits no subtitles, it does not re-trigger `[%guess]`, and its `cues` array contains only the single baseline `offsetMs: 0` snapshot of the node's `[%cal]`/`[%csl]` decorations.
+   - A revisit's pause duration resolves as: the occurrence's `dur=<time>` override if present, otherwise `manifest.compilation.defaultReturnPauseMs` (default `1000` ms).
+5. A node with `[%audio <clipId>]` and **no** `[%at]` tag is still playable in **Manual Mode**, and is omitted from the auto-play timeline unless `manifest.compilation.includeUnscheduledAudio` is `true` (in which case it is appended in PGN document order).
 
 #### `[%dur <seconds>]`
-Optional display duration (non-negative decimal seconds or `MM:SS(.mmm)`) for a **silent** node placed on the timeline (a node with `[%at]` and no `[%audio]`).
-- If omitted on a silent node, defaults to `manifest.compilation.defaultSilentDurationMs` (default `1500` ms).
-- The resolved duration of any timeline entry (or branch step) **MUST** be strictly greater than `0` ms (`ZERO_ENTRY_DURATION` error otherwise).
-- If `[%dur]` is placed on a node that also has `[%audio]`, the audio clip's trimmed duration takes precedence and the compiler emits an `IGNORED_DUR_TAG` warning.
+Optional display/delay duration (non-negative decimal seconds or `MM:SS(.mmm)`) for a **no-audio (silent) node** placed on the timeline (a node with `[%at]` and no `[%audio]`).
+- On a primary silent visit, duration resolves as: the `[%at]` tag's `dur=<time>` (if present) → `[%dur]` (if present) → `manifest.compilation.defaultSilentDurationMs` (default `1500` ms).
+- The resolved duration of any timeline entry (primary, revisit, or branch step) **MUST** be strictly greater than `0` ms (`ZERO_ENTRY_DURATION` error otherwise).
+- If `[%dur]` or `dur=<time>` is placed on a primary visit that also has `[%audio]`, the audio clip's trimmed duration takes precedence and the compiler emits an `IGNORED_DUR_TAG` warning. (A `dur=<time>` on a subsequent revisit `[%at]` tag of an audio node is honored and does **not** emit `IGNORED_DUR_TAG`.)
 
 #### `[%orient white|black]`
 Optional per-node board orientation override (case-insensitive exact tokens `white` or `black`). When omitted, the node inherits its game's `[Orientation "..."]` header (default `"white"`).
@@ -185,6 +194,7 @@ Examples:
   "compilation": {
     "timingMode": "flow",
     "defaultSilentDurationMs": 1500,
+    "defaultReturnPauseMs": 1000,
     "defaultGapMs": 0,
     "includeUnscheduledAudio": false
   },
@@ -209,7 +219,8 @@ Examples:
 - `timingMode`: `"flow"` (default) or `"strict"`. Any other value is a compiler error (`INVALID_COMPILATION_OPTIONS`).
   - **`flow`**: Entries are sorted by their `[%at]` key. For every entry `i > 0`, `startMs = max(declaredStartMs, previousEndMs + defaultGapMs)` (emitting a `TIMELINE_REFLOWED` warning when reflowed). For `#` ordinal and unscheduled entries, `startMs = 0` for `i = 0` and `previousEndMs + defaultGapMs` for `i > 0`.
   - **`strict`**: Entries with explicit timestamps are placed at their exact `declaredStartMs`; any overlap (`declaredStartMs < previousEndMs`) produces a `TIMELINE_OVERLAP` compiler error.
-- `defaultSilentDurationMs`: Finite number **strictly `> 0`** (default `1500`).
+- `defaultSilentDurationMs`: Finite number **strictly `> 0`** (default `1500`). Default display/delay time for no-audio (silent) moves placed on the timeline (and silent steps inside `[%guess]` `branchTimeline`s) when no `[%dur]` or `dur=` override is specified.
+- `defaultReturnPauseMs`: Finite number **strictly `> 0`** (default `1000`). Default silent pause duration when the timeline returns to a previously visited node (`isRevisit: true`) and no per-tag `dur=` override is specified on that revisit `[%at]` tag.
 - `defaultGapMs`: Finite number **`>= 0`** (default `0`).
 - `includeUnscheduledAudio`: Boolean (default `false`).
 
@@ -229,7 +240,8 @@ Examples:
 - Every entry has strictly positive duration (`endMs > startMs`).
 - `entries` is strictly sorted by `startMs` ascending (`entries[i].startMs > entries[i - 1].startMs`) and non-overlapping (`entries[i].startMs >= entries[i - 1].endMs`).
 - Every entry's `cues` array (both in `entries` and in every `branchTimeline` step) **MUST** begin with a baseline snapshot at `offsetMs: 0` (even when `arrows` and `highlights` are both empty `[]`), guaranteeing client binary-search logic always resolves a valid visual state.
-- `nodeIndex[nodeId].timelineIndex` is a scalar (`number | null`), enforcing at most one main-timeline entry per node.
+- `nodeIndex[nodeId].timelineIndices` lists all main-timeline entry indices for that node in ascending timeline order (`[]` if unscheduled). `nodeIndex[nodeId].timelineIndex` is the primary (earliest) entry index (`timelineIndices[0] ?? null`).
+- Silent return/revisit entries carry `isRevisit: true` and MUST have `audio: null`. Primary visits omit `isRevisit`.
 
 ### Compiled `[%guess]` Structures
 When a study contains one or more `[%guess]` nodes:
@@ -338,7 +350,8 @@ When a study contains one or more `[%guess]` nodes:
       "orientation": "white",
       "clipId": "clip-001",
       "subtitles": { "en": "subtitles/en/clip-001.vtt" },
-      "timelineIndex": 0
+      "timelineIndex": 0,
+      "timelineIndices": [0]
     }
   },
   "guesses": {
@@ -360,6 +373,7 @@ When a study contains one or more `[%guess]` nodes:
 - Each clip may declare zero or more language tracks in `manifest.json#clips[id].subtitles` (BCP 47 language keys like `"en"`, `"es"`).
 - Individual `.vtt` files use timestamps relative to the clip's un-trimmed `00:00.000`.
 - When compiling `subtitles/<lang>/timeline.vtt`:
+  - Silent entries (including silent revisits with `isRevisit: true`) emit no subtitle cues.
   - Cues completely outside `[trimStartMs, trimEndMs]` (`cue.endMs <= trimStartMs` or `cue.startMs >= trimEndMs`) are **dropped**.
   - Cues partially overlapping `[trimStartMs, trimEndMs]` are **clamped** to `[trimStartMs, trimEndMs]`.
   - Remaining cues are shifted by `entry.startMs - trimStartMs` into global timeline time.
@@ -372,12 +386,12 @@ A conformant PGNA player MUST support:
 
 ### 8.1 Timeline Auto-Play Mode
 - Binary-search `timeline.entries` by current `globalTimeMs`:
-  - **Active entry** (`entry.startMs <= globalTimeMs < entry.endMs`): render `entry.fen`, `entry.lastMove`, `entry.orientation`, latest `cue` with `cue.offsetMs <= globalTimeMs - entry.startMs`, active subtitle cue, and play `entry.audio` from `trimStartMs + (globalTimeMs - entry.startMs)` stopping strictly at `trimEndMs`.
+  - **Active entry** (`entry.startMs <= globalTimeMs < entry.endMs`): render `entry.fen`, `entry.lastMove`, `entry.orientation`, latest `cue` with `cue.offsetMs <= globalTimeMs - entry.startMs`, active subtitle cue, and play `entry.audio` from `trimStartMs + (globalTimeMs - entry.startMs)` stopping strictly at `trimEndMs`. For silent moves and silent revisit entries (`isRevisit: true`, where `entry.audio === null`), audio and subtitles **MUST** remain silent (`activeAudio: null`) while holding the position for the entry's duration (`defaultSilentDurationMs`, `defaultReturnPauseMs`, or explicit duration).
   - **Gap / pre-start / end** (`globalTimeMs < entries[0].startMs`, between `entries[i].endMs` and `entries[i + 1].startMs`, or `globalTimeMs >= totalDurationMs`): hold the preceding entry's final board/cue state (or `entries[0]`'s `offsetMs: 0` state before `entries[0].startMs`); audio and subtitles **MUST** be silent (`activeAudio: null`).
 
 ### 8.2 Manual Chess Mode
 - Allow navigating the PGN move tree freely without enforcing `timeline.entries` order.
-- When inspecting a node, clients MAY look up `nodeIndex[nodeId]` (or the parsed PGN node) to play that move's attached audio clip, sub-move `[%cue]` snapshots, and per-clip `.vtt` subtitles independently, or jump back into Timeline Mode at `nodeIndex[nodeId].timelineIndex`.
+- When inspecting a node, clients MAY look up `nodeIndex[nodeId]` (or the parsed PGN node) to play that move's attached audio clip, sub-move `[%cue]` snapshots, and per-clip `.vtt` subtitles independently, or jump back into Timeline Mode at `nodeIndex[nodeId].timelineIndex` (or any entry in `nodeIndex[nodeId].timelineIndices`).
 
 ### 8.3 Interactive `[%guess]` Playback Contract
 When interactive guesses are enabled:

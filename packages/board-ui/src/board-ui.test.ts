@@ -17,6 +17,7 @@ describe("@suite/board-ui", () => {
     expect(html).toContain('data-theme="projector-high-contrast"');
     expect(html).toContain('data-orientation="black"');
     expect(html).toContain("<svg");
+    expect(html).toContain("<polygon");
     expect(html).toContain("Square e4");
   });
 });
