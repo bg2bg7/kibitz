@@ -1,0 +1,46 @@
+{
+  "name": "@suite/chess-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./chess": {
+      "types": "./dist/chess.d.ts",
+      "import": "./dist/chess.js"
+    },
+    "./pgn": {
+      "types": "./dist/pgn.d.ts",
+      "import": "./dist/pgn.js"
+    },
+    "./pairings": {
+      "types": "./dist/pairings.d.ts",
+      "import": "./dist/pairings.js"
+    },
+    "./ratings": {
+      "types": "./dist/ratings.d.ts",
+      "import": "./dist/ratings.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "chess.js": "^1.4.0"
+  },
+  "devDependencies": {
+    "@suite/tsconfig": "workspace:*",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.1"
+  }
+}

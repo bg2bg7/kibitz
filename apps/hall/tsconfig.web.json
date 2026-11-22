@@ -1,0 +1,7 @@
+{
+  "extends": "@suite/tsconfig/react-app.json",
+  "compilerOptions": {
+    "types": ["vite/client"]
+  },
+  "include": ["src/web", "vite.config.ts"]
+}

@@ -1,0 +1,46 @@
+{
+  "name": "@suite/pgna",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./compiler": {
+      "types": "./dist/compiler.d.ts",
+      "import": "./dist/compiler.js"
+    },
+    "./validator": {
+      "types": "./dist/validator.d.ts",
+      "import": "./dist/validator.js"
+    },
+    "./player": {
+      "types": "./dist/player.d.ts",
+      "import": "./dist/player.js"
+    },
+    "./zip": {
+      "types": "./dist/zip.d.ts",
+      "import": "./dist/zip.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@suite/chess-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@suite/tsconfig": "workspace:*",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.1"
+  }
+}

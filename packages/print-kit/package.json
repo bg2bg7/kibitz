@@ -1,0 +1,38 @@
+{
+  "name": "@suite/print-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./diagram": {
+      "types": "./dist/diagram.d.ts",
+      "import": "./dist/diagram.js"
+    },
+    "./pdf": {
+      "types": "./dist/pdf.d.ts",
+      "import": "./dist/pdf.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@suite/chess-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@suite/tsconfig": "workspace:*",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.1"
+  }
+}

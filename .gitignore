@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+dist-server/
+dist-web/
+build/
+.turbo/
+*.tsbuildinfo
+
+# PWA generated service workers
+dev-dist/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs & OS artifacts
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Coverage & test artifacts
+coverage/
+.vitest/
+
+# Drizzle local state
+drizzle/meta/
