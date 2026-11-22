@@ -7,6 +7,10 @@ import {
   type PgnaTimeline,
   type PlaybackSnapshot,
 } from "@suite/pgna";
+import {
+  createTimelineAudioEngine,
+  type TimelineAudioEngine,
+} from "../local/audioPlaybackEngine";
 
 export interface PreviewPlayerProps {
   manifest: PgnaManifest;
@@ -63,33 +67,16 @@ export function PreviewPlayer({
   );
 
   const [guessesEnabled, setGuessesEnabled] = useState(true);
+  const audioEngineRef = useRef<TimelineAudioEngine | null>(null);
 
-  const audioElRef = useRef<HTMLAudioElement | null>(null);
-  const activeClipPathRef = useRef<string | null>(null);
-  const clipUrlMapRef = useRef<Map<string, string>>(new Map());
-
-  // Manage Blob URLs for audio clips
+  // Initialize Web Audio multi-clip engine and pre-decode all audio clips
   useEffect(() => {
-    const map = new Map<string, string>();
-    for (const [path, bytes] of Object.entries(audioByPath)) {
-      const clipDef = Object.values(manifest.clips).find((c) => c.path === path);
-      const copy = new Uint8Array(bytes.byteLength);
-      copy.set(bytes);
-      const url = URL.createObjectURL(
-        new Blob([copy], { type: clipDef?.mimeType ?? "audio/ogg" }),
-      );
-      map.set(path, url);
-    }
-    clipUrlMapRef.current = map;
-
+    const engine = createTimelineAudioEngine(audioByPath, manifest.clips);
+    audioEngineRef.current = engine;
     return () => {
-      if (audioElRef.current) {
-        audioElRef.current.pause();
-        audioElRef.current = null;
-      }
-      activeClipPathRef.current = null;
-      for (const url of map.values()) {
-        URL.revokeObjectURL(url);
+      engine.dispose();
+      if (audioEngineRef.current === engine) {
+        audioEngineRef.current = null;
       }
     };
   }, [audioByPath, manifest.clips]);
@@ -111,42 +98,19 @@ export function PreviewPlayer({
     return () => cancelAnimationFrame(rafId);
   }, [snapshot.isPlaying, player]);
 
-  // Sync browser HTMLAudioElement to snapshot.activeAudio & snapshot.audioTimeMs
+  // Sync Web Audio engine to snapshot.activeAudio & snapshot.audioTimeMs
   // Strictly silent whenever activeAudio === null (gaps, silent moves, and silent revisits!)
   useEffect(() => {
-    if (!snapshot.isPlaying || !snapshot.activeAudio || snapshot.audioTimeMs === null) {
-      if (audioElRef.current && !audioElRef.current.paused) {
-        audioElRef.current.pause();
-      }
-      return;
-    }
-
-    const clipPath = snapshot.activeAudio.path;
-    const url = clipUrlMapRef.current.get(clipPath);
-    if (!url) return;
-
-    if (!audioElRef.current) {
-      audioElRef.current = new Audio();
-    }
-
-    const el = audioElRef.current;
-    if (activeClipPathRef.current !== clipPath) {
-      activeClipPathRef.current = clipPath;
-      el.src = url;
-    }
-
-    const desiredSec = snapshot.audioTimeMs / 1000;
-    if (Math.abs(el.currentTime - desiredSec) > 0.25) {
-      el.currentTime = desiredSec;
-    }
-
-    if (el.paused) {
-      void el.play().catch(() => undefined);
-    }
+    audioEngineRef.current?.sync(
+      snapshot.isPlaying,
+      snapshot.activeAudio,
+      snapshot.audioTimeMs,
+    );
   }, [snapshot.isPlaying, snapshot.activeAudio, snapshot.audioTimeMs]);
 
   const handleBoardMove = (move: { from: string; to: string; promotion?: PromotionPiece }) => {
     if (snapshot.guessPhase === "awaiting") {
+      audioEngineRef.current?.unlock();
       player.submitGuessMove(move.from, move.to, move.promotion);
     }
   };
@@ -253,14 +217,20 @@ export function PreviewPlayer({
                   </button>
                   <button
                     type="button"
-                    onClick={() => player.replayGuessBranch()}
+                    onClick={() => {
+                      audioEngineRef.current?.unlock();
+                      player.replayGuessBranch();
+                    }}
                     className="rounded border border-violet-300 bg-white px-2 py-1 text-[11px] font-medium text-violet-900"
                   >
                     Replay
                   </button>
                   <button
                     type="button"
-                    onClick={() => player.continueAfterGuess()}
+                    onClick={() => {
+                      audioEngineRef.current?.unlock();
+                      player.continueAfterGuess();
+                    }}
                     className="rounded border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700"
                   >
                     Continue
@@ -277,7 +247,14 @@ export function PreviewPlayer({
             <button
               type="button"
               disabled={timeline.totalDurationMs === 0 && snapshot.mode === "timeline"}
-              onClick={() => (snapshot.isPlaying ? player.pause() : player.play())}
+              onClick={() => {
+                if (snapshot.isPlaying) {
+                  player.pause();
+                } else {
+                  audioEngineRef.current?.unlock();
+                  player.play();
+                }
+              }}
               className="rounded-md bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-40"
             >
               {snapshot.isPlaying ? "Pause" : "Play"}

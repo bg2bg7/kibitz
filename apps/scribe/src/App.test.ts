@@ -117,4 +117,142 @@ describe("@suite/scribe studio", () => {
     await deleteLocalDraft(demo.id);
     expect(await loadLocalDraft(demo.id)).toBeNull();
   });
+
+  it("transitions TimelineAudioEngine cleanly across clip 1 -> clip 2 -> silent revisit -> clip 3", async () => {
+    const started: Array<{ label: string; offset: number; duration: number; stopped: boolean }> = [];
+    let mockNowSec = 0;
+
+    class FakeAudioContext {
+      state: AudioContextState = "suspended";
+      destination = {};
+      get currentTime() {
+        return mockNowSec;
+      }
+      resume() {
+        this.state = "running";
+        return Promise.resolve();
+      }
+      close() {
+        return Promise.resolve();
+      }
+      decodeAudioData(buf: ArrayBuffer) {
+        const tag = new Uint8Array(buf)[0];
+        return Promise.resolve({ duration: 4.0, label: `clip-${tag}` } as unknown as AudioBuffer);
+      }
+      createBufferSource() {
+        let record: { label: string; offset: number; duration: number; stopped: boolean } | null =
+          null;
+        return {
+          buffer: null as unknown as { label: string } | null,
+          onended: null as (() => void) | null,
+          connect() {},
+          disconnect() {},
+          start(_when: number, offset: number, duration: number) {
+            record = {
+              label: this.buffer?.label ?? "unknown",
+              offset,
+              duration,
+              stopped: false,
+            };
+            started.push(record);
+          },
+          stop() {
+            if (record) record.stopped = true;
+          },
+        };
+      }
+    }
+
+    const origAudioCtx = (globalThis as Record<string, unknown>)["AudioContext"];
+    (globalThis as Record<string, unknown>)["AudioContext"] = FakeAudioContext;
+
+    try {
+      const { createTimelineAudioEngine } = await import("./local/audioPlaybackEngine");
+      const engine = createTimelineAudioEngine(
+        {
+          "audio/c1.ogg": new Uint8Array([1]),
+          "audio/c2.ogg": new Uint8Array([2]),
+          "audio/c3.ogg": new Uint8Array([3]),
+        },
+        {
+          c1: { id: "c1", path: "audio/c1.ogg", mimeType: "audio/ogg", durationMs: 2000 },
+          c2: { id: "c2", path: "audio/c2.ogg", mimeType: "audio/ogg", durationMs: 2500 },
+          c3: { id: "c3", path: "audio/c3.ogg", mimeType: "audio/ogg", durationMs: 1800 },
+        },
+      );
+
+      // Wait a microtask for eager pre-decoding
+      await Promise.resolve();
+      await Promise.resolve();
+
+      engine.unlock();
+
+      // Clip 1 starts at 0ms
+      const c1 = {
+        clipId: "c1",
+        path: "audio/c1.ogg",
+        mimeType: "audio/ogg",
+        durationMs: 2000,
+        trimStartMs: 0,
+        trimEndMs: 2000,
+      };
+      engine.sync(true, c1, 0);
+      mockNowSec = 0.5;
+      engine.sync(true, c1, 500);
+      expect(started).toHaveLength(1);
+      expect(started[0]).toMatchObject({ label: "clip-1", offset: 0, duration: 2, stopped: false });
+
+      // Seamless transition to Clip 2 (zero gap!)
+      const c2 = {
+        clipId: "c2",
+        path: "audio/c2.ogg",
+        mimeType: "audio/ogg",
+        durationMs: 2500,
+        trimStartMs: 200,
+        trimEndMs: 2500,
+      };
+      mockNowSec = 2.01;
+      engine.sync(true, c2, 210);
+      expect(started[0]?.stopped).toBe(true);
+      expect(started).toHaveLength(2);
+      expect(started[1]).toMatchObject({
+        label: "clip-2",
+        offset: 0.21,
+        stopped: false,
+      });
+
+      // Silent revisit pause -> stops Clip 2 and emits no new source
+      mockNowSec = 4.35;
+      engine.sync(true, null, null);
+      expect(started[1]?.stopped).toBe(true);
+      expect(started).toHaveLength(2);
+
+      // Transition to Clip 3 after silent revisit -> starts Clip 3 cleanly
+      const c3 = {
+        clipId: "c3",
+        path: "audio/c3.ogg",
+        mimeType: "audio/ogg",
+        durationMs: 1800,
+        trimStartMs: 0,
+        trimEndMs: 1800,
+      };
+      mockNowSec = 5.35;
+      engine.sync(true, c3, 15);
+      expect(started).toHaveLength(3);
+      expect(started[2]).toMatchObject({
+        label: "clip-3",
+        offset: 0.015,
+        stopped: false,
+      });
+
+      engine.dispose();
+      expect(started[2]?.stopped).toBe(true);
+    } finally {
+      if (origAudioCtx === undefined) {
+        delete (globalThis as Record<string, unknown>)["AudioContext"];
+      } else {
+        (globalThis as Record<string, unknown>)["AudioContext"] = origAudioCtx;
+      }
+    }
+  });
 });
