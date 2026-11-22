@@ -12,8 +12,11 @@ import {
 } from "./local/draftStore";
 import { createBlankDraft, createDemoItalianDraft } from "./local/draftWorkspace";
 import {
+  addNewGame,
   appendNodeToTimeline,
+  collectReferencedClipIds,
   deleteNodeSubtree,
+  detectStudyTimingMode,
   indexStudyGames,
   playMoveAtNode,
   promoteVariation,
@@ -22,6 +25,7 @@ import {
   toggleBoardHighlight,
   toggleNodeNag,
   updateAtTagDuration,
+  updateNodeTags,
 } from "./local/studyTree";
 
 describe("@suite/scribe studio", () => {
@@ -247,6 +251,130 @@ describe("@suite/scribe studio", () => {
 
       engine.dispose();
       expect(started[2]?.stopped).toBe(true);
+    } finally {
+      if (origAudioCtx === undefined) {
+        delete (globalThis as Record<string, unknown>)["AudioContext"];
+      } else {
+        (globalThis as Record<string, unknown>)["AudioContext"] = origAudioCtx;
+      }
+    }
+  });
+
+  it("preserves explicit-timestamp scheduling mode without MIXED_TIMELINE_MODES, preserves player headers, and tracks referenced clips", () => {
+    const draft = createBlankDraft("Timestamp Study");
+    let games = parsePgnGames('1. e4 { [%at 0] } 1... e5 { [%at 3.5] } 2. Nf3 *');
+    expect(detectStudyTimingMode(games)).toBe("timestamp");
+
+    games = appendNodeToTimeline(games, "g0/0.0.0", undefined, { nextTimestampMs: 5000 });
+    const compiled = compilePgna({
+      manifest: draft.manifest,
+      pgnText: serializePgnGames(games),
+    });
+    expect(compiled.diagnostics.filter((d) => d.severity === "error")).toHaveLength(0);
+    expect(compiled.timeline.entries).toHaveLength(3);
+    expect(compiled.timeline.entries[2]?.startMs).toBe(5000);
+
+    // addNewGame preserves White and Black player headers
+    const added = addNewGame(games, "Chapter 2", undefined, {
+      white: "Kasparov",
+      black: "Karpov",
+    });
+    expect(added.games[1]?.headers["White"]).toBe("Kasparov");
+    expect(added.games[1]?.headers["Black"]).toBe("Karpov");
+
+    // collectReferencedClipIds tracks audio references across games and drops deleted subtrees
+    let withAudio = updateNodeTags(added.games, "g0/0", (tags) => ({
+      ...tags,
+      audioClipId: "clip-001",
+    }));
+    withAudio = updateNodeTags(withAudio, "g0/0.0", (tags) => ({
+      ...tags,
+      audioClipId: "clip-002",
+    }));
+    expect([...collectReferencedClipIds(withAudio)].sort()).toEqual(["clip-001", "clip-002"]);
+
+    const deleted = deleteNodeSubtree(withAudio, "g0/0.0");
+    expect([...collectReferencedClipIds(deleted.games)]).toEqual(["clip-001"]);
+  });
+
+  it("restarts playback in TimelineAudioEngine when seeking backward after source.onended", async () => {
+    const sources: Array<{ offset: number; onended: (() => void) | null }> = [];
+    let mockNowSec = 0;
+
+    class FakeAudioContext {
+      state: AudioContextState = "running";
+      destination = {};
+      get currentTime() {
+        return mockNowSec;
+      }
+      resume() {
+        return Promise.resolve();
+      }
+      close() {
+        return Promise.resolve();
+      }
+      decodeAudioData() {
+        return Promise.resolve({ duration: 1.8 } as unknown as AudioBuffer);
+      }
+      createBufferSource() {
+        const src = {
+          buffer: null as unknown as AudioBuffer | null,
+          onended: null as (() => void) | null,
+          connect() {},
+          disconnect() {},
+          start(_when: number, offset: number) {
+            sources.push({
+              offset,
+              get onended() {
+                return src.onended;
+              },
+              set onended(fn) {
+                src.onended = fn;
+              },
+            });
+          },
+          stop() {},
+        };
+        return src;
+      }
+    }
+
+    const origAudioCtx = (globalThis as Record<string, unknown>)["AudioContext"];
+    (globalThis as Record<string, unknown>)["AudioContext"] = FakeAudioContext;
+
+    try {
+      const { createTimelineAudioEngine } = await import("./local/audioPlaybackEngine");
+      const engine = createTimelineAudioEngine(
+        { "audio/c1.ogg": new Uint8Array([1]) },
+        { c1: { id: "c1", path: "audio/c1.ogg", mimeType: "audio/ogg", durationMs: 2000 } },
+      );
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const c1 = {
+        clipId: "c1",
+        path: "audio/c1.ogg",
+        mimeType: "audio/ogg",
+        durationMs: 2000,
+        trimStartMs: 0,
+        trimEndMs: 2000,
+      };
+
+      engine.sync(true, c1, 0);
+      expect(sources).toHaveLength(1);
+
+      // Buffer finishes early (1.8s < 2.0s) and fires onended
+      mockNowSec = 1.8;
+      sources[0]?.onended?.();
+
+      // User scrubs backward to 0.2s within the same clip while still playing
+      mockNowSec = 1.85;
+      engine.sync(true, c1, 200);
+      expect(sources).toHaveLength(2);
+      expect(sources[1]?.offset).toBeCloseTo(0.2, 3);
+
+      engine.dispose();
     } finally {
       if (origAudioCtx === undefined) {
         delete (globalThis as Record<string, unknown>)["AudioContext"];

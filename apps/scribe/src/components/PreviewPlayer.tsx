@@ -69,6 +69,11 @@ export function PreviewPlayer({
   const [guessesEnabled, setGuessesEnabled] = useState(true);
   const audioEngineRef = useRef<TimelineAudioEngine | null>(null);
 
+  // Keep player's interactive guess toggle synchronized even if player instance recreates
+  useEffect(() => {
+    player.setInteractiveGuessesEnabled(guessesEnabled);
+  }, [player, guessesEnabled]);
+
   // Initialize Web Audio multi-clip engine and pre-decode all audio clips
   useEffect(() => {
     const engine = createTimelineAudioEngine(audioByPath, manifest.clips);
@@ -246,7 +251,11 @@ export function PreviewPlayer({
           <div className="flex items-center gap-3">
             <button
               type="button"
-              disabled={timeline.totalDurationMs === 0 && snapshot.mode === "timeline"}
+              disabled={
+                (timeline.totalDurationMs === 0 && snapshot.mode === "timeline") ||
+                snapshot.guessPhase === "awaiting" ||
+                snapshot.guessPhase === "branch_complete"
+              }
               onClick={() => {
                 if (snapshot.isPlaying) {
                   player.pause();
@@ -387,9 +396,44 @@ export function PreviewPlayer({
 
         {snapshot.mode === "manual" ? (
           <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-xs">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-              Manual Node Inspector ({allNodeIds.length} positions)
-            </h3>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Manual Node Inspector ({allNodeIds.length} positions)
+              </h3>
+              {snapshot.activeNodeId ? (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {(timeline.guesses?.[snapshot.activeNodeId]?.branches.length ?? 0) > 0 &&
+                  snapshot.guessPhase === "idle" ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        audioEngineRef.current?.unlock();
+                        player.enterGuessPrompt(snapshot.activeNodeId!);
+                      }}
+                      className="rounded border border-violet-300 bg-violet-50 px-2 py-0.5 text-[11px] font-semibold text-violet-900 hover:bg-violet-100"
+                    >
+                      Try Guess Prompt
+                    </button>
+                  ) : null}
+                  {(timeline.nodeIndex[snapshot.activeNodeId]?.timelineIndices ?? []).map(
+                    (entryIdx, occIdx) => (
+                      <button
+                        key={`jump-${snapshot.activeNodeId}-${entryIdx}`}
+                        type="button"
+                        onClick={() => {
+                          player.jumpToNodeOnTimeline(snapshot.activeNodeId!, occIdx);
+                        }}
+                        className="rounded border border-sky-200 bg-sky-50 px-2 py-0.5 text-[11px] font-medium text-sky-800 hover:bg-sky-100"
+                      >
+                        {occIdx === 0
+                          ? `Jump to Timeline #${entryIdx + 1}`
+                          : `Jump to ↩#${entryIdx + 1}`}
+                      </button>
+                    ),
+                  )}
+                </div>
+              ) : null}
+            </div>
             <div className="mt-2 flex flex-wrap gap-1.5">
               {allNodeIds.map((nid) => (
                 <button

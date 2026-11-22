@@ -7,6 +7,7 @@ import {
 } from "@suite/chess-core";
 import {
   formatNodeComment,
+  formatPgnaSeconds,
   parseNodeComments,
   type AnnotationColor,
   type BoardOrientation,
@@ -379,6 +380,41 @@ export function deleteNodeSubtree(
 }
 
 /**
+ * Detects whether a study uses timestamp `[%at]` scheduling (at least one timestamp tag and no
+ * ordinal tags) or ordinal `#N` scheduling.
+ */
+export function detectStudyTimingMode(
+  games: readonly PgnGameDocument[],
+): "ordinal" | "timestamp" {
+  const index = indexStudyGames(games);
+  let hasTimestamp = false;
+  let hasOrdinal = false;
+  for (const node of Object.values(index.nodesById)) {
+    for (const at of node.tags.atTags) {
+      if (at.mode === "timestamp") {
+        hasTimestamp = true;
+      } else if (at.mode === "ordinal") {
+        hasOrdinal = true;
+      }
+    }
+  }
+  return hasTimestamp && !hasOrdinal ? "timestamp" : "ordinal";
+}
+
+function getMaxTimelineTimestampMs(games: readonly PgnGameDocument[]): number {
+  const index = indexStudyGames(games);
+  let maxMs = 0;
+  for (const node of Object.values(index.nodesById)) {
+    for (const at of node.tags.atTags) {
+      if (at.mode === "timestamp" && at.value > maxMs) {
+        maxMs = at.value;
+      }
+    }
+  }
+  return maxMs;
+}
+
+/**
  * Finds the next available `#N` integer ordinal across all games.
  */
 export function getNextTimelineOrdinal(games: readonly PgnGameDocument[]): number {
@@ -395,14 +431,35 @@ export function getNextTimelineOrdinal(games: readonly PgnGameDocument[]): numbe
 }
 
 /**
- * Appends a new `[%at #N]` (or `[%at #N dur=...]`) tag to `nodeId`.
+ * Appends a new `[%at]` tag (ordinal `#N` or timestamp seconds matching the study's timing mode)
+ * with optional `dur=` override to `nodeId`.
  * Works both for initial scheduling AND for adding a silent return/revisit pause to an already-scheduled node!
  */
 export function appendNodeToTimeline(
   games: readonly PgnGameDocument[],
   nodeId: NodeId,
   durMs?: number,
+  options?: { nextTimestampMs?: number },
 ): PgnGameDocument[] {
+  if (detectStudyTimingMode(games) === "timestamp") {
+    const nextMs = Math.max(
+      0,
+      Math.round(options?.nextTimestampMs ?? getMaxTimelineTimestampMs(games) + 1500),
+    );
+    return updateNodeTags(games, nodeId, (tags) => ({
+      ...tags,
+      atTags: [
+        ...tags.atTags,
+        {
+          mode: "timestamp",
+          value: nextMs,
+          ...(durMs !== undefined ? { durMs } : {}),
+          rawSpec: formatPgnaSeconds(nextMs),
+        },
+      ],
+    }));
+  }
+
   const nextOrd = getNextTimelineOrdinal(games);
   return updateNodeTags(games, nodeId, (tags) => ({
     ...tags,
@@ -531,14 +588,15 @@ export function addNewGame(
   games: readonly PgnGameDocument[],
   title?: string,
   initialFen?: string,
+  players?: { white?: string; black?: string },
 ): { games: PgnGameDocument[]; rootNodeId: NodeId } {
   const cloned = cloneGames(games);
   const nextIdx = cloned.length;
   const headers: Record<string, string> = {
     Event: title?.trim() || `Chapter ${nextIdx + 1}`,
     Site: "Scribe Studio",
-    White: "White",
-    Black: "Black",
+    White: players?.white?.trim() || "White",
+    Black: players?.black?.trim() || "Black",
     Orientation: "white",
     Result: "*",
   };
@@ -566,4 +624,29 @@ export function deleteGame(
   cloned.splice(gameIndex, 1);
   const nextGameIdx = Math.max(0, Math.min(gameIndex, cloned.length - 1));
   return { games: cloned, fallbackNodeId: `g${nextGameIdx}` as NodeId };
+}
+
+/**
+ * Collects every audio clip ID currently referenced by `[%audio ...]` tags across all games,
+ * allowing callers to prune orphaned clips, audio bytes, and subtitles after node/game deletions.
+ */
+export function collectReferencedClipIds(games: readonly PgnGameDocument[]): Set<string> {
+  const referenced = new Set<string>();
+  const walk = (nodes: readonly PgnMoveNode[]) => {
+    for (const node of nodes) {
+      const { tags } = parseNodeComments(node.comments);
+      if (tags.audioClipId) {
+        referenced.add(tags.audioClipId);
+      }
+      walk(node.children);
+    }
+  };
+  for (const game of games) {
+    const { tags } = parseNodeComments(game.rootComments);
+    if (tags.audioClipId) {
+      referenced.add(tags.audioClipId);
+    }
+    walk(game.rootMoves);
+  }
+  return referenced;
 }

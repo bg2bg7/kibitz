@@ -1,7 +1,9 @@
 import type { TimelineEntry, WebVttCue } from "./types.js";
+import { isValidSubtitleLang } from "./validator.js";
 
 const VTT_TIMESTAMP_RE =
   /^(?:(\d{2,}):)?([0-5]\d):([0-5]\d)\.(\d{3})$/;
+const VTT_NON_CUE_BLOCK_RE = /^(?:WEBVTT|NOTE|STYLE|REGION)(?:$|\s)/;
 
 export function parseVttTimestampMs(raw: string): number | null {
   const match = VTT_TIMESTAMP_RE.exec(raw.trim());
@@ -40,7 +42,7 @@ export function parseWebVtt(vttText: string): WebVttCue[] {
     if (lines.length === 0) continue;
 
     const first = lines[0]!.trim();
-    if (first.startsWith("WEBVTT") || first.startsWith("NOTE") || first.startsWith("STYLE") || first.startsWith("REGION")) {
+    if (VTT_NON_CUE_BLOCK_RE.test(first)) {
       continue;
     }
 
@@ -110,6 +112,9 @@ export function mergeTimelineSubtitles(
     const shiftMs = entry.startMs - trimStartMs;
 
     for (const [lang, subPath] of Object.entries(entry.subtitles)) {
+      if (!isValidSubtitleLang(lang)) {
+        continue;
+      }
       const rawVtt = subtitlesByPath[subPath];
       if (rawVtt === undefined) {
         continue;
@@ -144,6 +149,9 @@ export function mergeTimelineSubtitles(
   const mergedSubtitlesVtt: Record<string, string> = {};
 
   for (const [lang, cues] of cuesByLang.entries()) {
+    if (!isValidSubtitleLang(lang)) {
+      continue;
+    }
     const outPath = `subtitles/${lang}/timeline.vtt`;
     mergedSubtitlesPaths[lang] = outPath;
     mergedSubtitlesVtt[outPath] = serializeWebVtt(cues);

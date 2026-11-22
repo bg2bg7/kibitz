@@ -43,13 +43,17 @@ export async function saveLocalDraft(draft: ScribeDraft): Promise<void> {
   }
 
   const db = await openDb();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    tx.objectStore(STORE_NAME).put(stamped);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error("Failed to save local draft."));
-  });
-  db.close();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).put(stamped);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("Failed to save local draft."));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted."));
+    });
+  } finally {
+    db.close();
+  }
 }
 
 export async function loadLocalDraft(id: string): Promise<ScribeDraft | null> {
@@ -58,14 +62,18 @@ export async function loadLocalDraft(id: string): Promise<ScribeDraft | null> {
   }
 
   const db = await openDb();
-  const result = await new Promise<ScribeDraft | null>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readonly");
-    const req = tx.objectStore(STORE_NAME).get(id);
-    req.onsuccess = () => resolve((req.result as ScribeDraft | undefined) ?? null);
-    req.onerror = () => reject(req.error ?? new Error("Failed to load local draft."));
-  });
-  db.close();
-  return result;
+  try {
+    return await new Promise<ScribeDraft | null>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readonly");
+      const req = tx.objectStore(STORE_NAME).get(id);
+      req.onsuccess = () => resolve((req.result as ScribeDraft | undefined) ?? null);
+      req.onerror = () => reject(req.error ?? new Error("Failed to load local draft."));
+      tx.onerror = () => reject(tx.error ?? new Error("Failed to load local draft."));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted."));
+    });
+  } finally {
+    db.close();
+  }
 }
 
 export async function listLocalDrafts(): Promise<DraftSummary[]> {
@@ -81,13 +89,19 @@ export async function listLocalDrafts(): Promise<DraftSummary[]> {
   }
 
   const db = await openDb();
-  const all = await new Promise<ScribeDraft[]>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readonly");
-    const req = tx.objectStore(STORE_NAME).getAll();
-    req.onsuccess = () => resolve((req.result as ScribeDraft[]) ?? []);
-    req.onerror = () => reject(req.error ?? new Error("Failed to list local drafts."));
-  });
-  db.close();
+  let all: ScribeDraft[];
+  try {
+    all = await new Promise<ScribeDraft[]>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readonly");
+      const req = tx.objectStore(STORE_NAME).getAll();
+      req.onsuccess = () => resolve((req.result as ScribeDraft[]) ?? []);
+      req.onerror = () => reject(req.error ?? new Error("Failed to list local drafts."));
+      tx.onerror = () => reject(tx.error ?? new Error("Failed to list local drafts."));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted."));
+    });
+  } finally {
+    db.close();
+  }
 
   return all
     .map((d) => ({
@@ -106,11 +120,15 @@ export async function deleteLocalDraft(id: string): Promise<void> {
   }
 
   const db = await openDb();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite");
-    tx.objectStore(STORE_NAME).delete(id);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error("Failed to delete local draft."));
-  });
-  db.close();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("Failed to delete local draft."));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted."));
+    });
+  } finally {
+    db.close();
+  }
 }

@@ -23,7 +23,11 @@ export interface BoardStageProps {
   onStepNext: () => void;
   onStepLast: () => void;
   onSelectGame: (gameIndex: number) => void;
-  onAddGame: (title: string, initialFen?: string) => void;
+  onAddGame: (
+    title: string,
+    initialFen?: string,
+    players?: { white?: string; black?: string },
+  ) => void;
   onUpdateGameHeaders: (gameIndex: number, headers: Record<string, string>) => void;
   onDeleteGame: (gameIndex: number) => void;
   activeNodeId: NodeId;
@@ -97,7 +101,14 @@ export function BoardStage({
     }
 
     if (editingGameModal === "new") {
-      onAddGame(eventInput.trim() || `Chapter ${games.length + 1}`, trimmedFen || undefined);
+      onAddGame(
+        eventInput.trim() || `Chapter ${games.length + 1}`,
+        trimmedFen || undefined,
+        {
+          white: whiteInput.trim() || "White",
+          black: blackInput.trim() || "Black",
+        },
+      );
     } else if (editingGameModal === "edit" && activeGame) {
       const nextHeaders: Record<string, string> = {
         ...activeGame.headers,

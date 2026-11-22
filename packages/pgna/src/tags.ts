@@ -33,7 +33,9 @@ export function parsePgnaTimeMs(raw: string): number | null {
 
   if (DECIMAL_SECONDS_PATTERN.test(token)) {
     const seconds = Number(token);
-    return Number.isFinite(seconds) ? Math.round(seconds * 1000) : null;
+    if (!Number.isFinite(seconds)) return null;
+    const ms = Math.round(seconds * 1000);
+    return Number.isFinite(ms) && Number.isSafeInteger(ms) ? ms : null;
   }
 
   const hms = HH_MM_SS_PATTERN.exec(token);
@@ -42,8 +44,9 @@ export function parsePgnaTimeMs(raw: string): number | null {
     const mins = Number(hms[2]);
     const secs = Number(hms[3]);
     const msStr = hms[4] ? hms[4].padEnd(3, "0") : "0";
-    const ms = Number(msStr);
-    return ((hours * 60 + mins) * 60 + secs) * 1000 + ms;
+    const frac = Number(msStr);
+    const ms = ((hours * 60 + mins) * 60 + secs) * 1000 + frac;
+    return Number.isFinite(ms) && Number.isSafeInteger(ms) ? ms : null;
   }
 
   const msMatch = MM_SS_PATTERN.exec(token);
@@ -52,7 +55,8 @@ export function parsePgnaTimeMs(raw: string): number | null {
     const secs = Number(msMatch[2]);
     const fracStr = msMatch[3] ? msMatch[3].padEnd(3, "0") : "0";
     const frac = Number(fracStr);
-    return (mins * 60 + secs) * 1000 + frac;
+    const ms = (mins * 60 + secs) * 1000 + frac;
+    return Number.isFinite(ms) && Number.isSafeInteger(ms) ? ms : null;
   }
 
   return null;
@@ -301,8 +305,18 @@ function parseAtTagBody(
 
   const ordMatch = ORDINAL_PATTERN.exec(rawSpec);
   if (ordMatch?.[1]) {
+    const parsedOrd = Number(ordMatch[1]);
+    if (!Number.isFinite(parsedOrd)) {
+      diagnostics.push({
+        code: "INVALID_AT_TAG",
+        severity: "error",
+        nodeId,
+        message: `Invalid [%at] ordinal "${rawSpec}".`,
+      });
+      return null;
+    }
     mode = "ordinal";
-    value = Number(ordMatch[1]);
+    value = parsedOrd;
   } else {
     const timeMs = parsePgnaTimeMs(rawSpec);
     if (timeMs === null) {
@@ -400,6 +414,15 @@ export function parseNodeComments(
 
         switch (name) {
           case "cal": {
+            if (body === "") {
+              diagnostics.push({
+                code: "INVALID_CAL_TAG",
+                severity: "warning",
+                nodeId,
+                message: "Empty [%cal] arrow annotation ignored.",
+              });
+              break;
+            }
             const parsed = parseArrowList(body);
             if (parsed === null) {
               diagnostics.push({
@@ -414,6 +437,15 @@ export function parseNodeComments(
             break;
           }
           case "csl": {
+            if (body === "") {
+              diagnostics.push({
+                code: "INVALID_CSL_TAG",
+                severity: "warning",
+                nodeId,
+                message: "Empty [%csl] square highlight ignored.",
+              });
+              break;
+            }
             const parsed = parseSquareList(body);
             if (parsed === null) {
               diagnostics.push({
@@ -567,8 +599,9 @@ export function parseNodeComments(
 export function formatNodeComment(tags: ParsedNodeTags): string {
   const tokens: string[] = [];
 
-  if (tags.prose.trim().length > 0) {
-    tokens.push(tags.prose.trim());
+  const sanitizedProse = tags.prose.replace(/[{}]/g, "").trim();
+  if (sanitizedProse.length > 0) {
+    tokens.push(sanitizedProse);
   }
 
   for (const preserved of tags.preservedTags) {

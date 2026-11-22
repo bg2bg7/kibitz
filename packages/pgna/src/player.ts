@@ -382,9 +382,12 @@ export function createPgnaPlayer(
 
     let activeSubtitle: string | null = null;
     if (hasAudio && entry && audioTimeMs !== null) {
-      activeSubtitle =
-        resolveMergedTimelineSubtitle(globalTimeMs) ??
-        resolveClipSubtitle(entry.subtitles, audioTimeMs);
+      const mergedPath = subtitleLang ? timeline.mergedSubtitles?.[subtitleLang] : undefined;
+      if (mergedPath && parsedVttByPath.has(mergedPath)) {
+        activeSubtitle = resolveMergedTimelineSubtitle(globalTimeMs);
+      } else {
+        activeSubtitle = resolveClipSubtitle(entry.subtitles, audioTimeMs);
+      }
     }
 
     return {
@@ -483,6 +486,9 @@ export function createPgnaPlayer(
     },
 
     tick(deltaMs) {
+      if (!Number.isFinite(deltaMs)) {
+        return getSnapshot();
+      }
       const dt = Math.max(0, deltaMs);
       if (!isPlaying || dt === 0) {
         return getSnapshot();
@@ -565,6 +571,9 @@ export function createPgnaPlayer(
     },
 
     seek(nextTimeMs) {
+      if (!Number.isFinite(nextTimeMs)) {
+        return;
+      }
       clearGuessSession();
       globalTimeMs = Math.max(0, Math.min(nextTimeMs, timeline.totalDurationMs));
       notify();
@@ -596,6 +605,9 @@ export function createPgnaPlayer(
     },
 
     setManualClipTime(clipTimeMs) {
+      if (!Number.isFinite(clipTimeMs)) {
+        return;
+      }
       manualClipTimeMs = Math.max(0, clipTimeMs);
       notify();
     },
@@ -646,9 +658,21 @@ export function createPgnaPlayer(
         return { status: "unlisted", matchedBranchNodeId: null };
       }
 
+      const extractSanPromotion = (san: string): string | undefined => {
+        const promoMatch = /=([QRBN])/i.exec(san);
+        return promoMatch?.[1]?.toLowerCase();
+      };
+
       const matched =
         activeGuess.branches.find((b) => b.san === applied.san) ??
-        activeGuess.branches.find((b) => b.from === applied.from && b.to === applied.to);
+        activeGuess.branches.find((b) => {
+          const branchPromo = extractSanPromotion(b.san);
+          return (
+            b.from === applied.from &&
+            b.to === applied.to &&
+            (branchPromo ?? undefined) === (applied.promotion ?? undefined)
+          );
+        });
 
       if (!matched) {
         const unlisted: GuessEvaluationResult = {

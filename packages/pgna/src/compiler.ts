@@ -26,8 +26,12 @@ import {
   type TimelineEntry,
   type TimelineGameMetadata,
 } from "./types.js";
-import { isSafeArchivePath, isValidClipId } from "./validator.js";
+import { isSafeArchivePath, isValidClipId, isValidSubtitleLang } from "./validator.js";
 import { mergeTimelineSubtitles } from "./vtt.js";
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 export interface CompilePgnaInput {
   manifest: PgnaManifest;
@@ -55,6 +59,7 @@ interface CompiledNode {
   nags: string[];
   tags: ParsedNodeTags;
   documentOrder: number;
+  siblingIndex: number;
   children: CompiledNode[];
 }
 
@@ -77,6 +82,21 @@ function resolveCompilationOptions(
   raw: Partial<CompilationOptions> | undefined,
   diagnostics: PgnaDiagnostic[],
 ): CompilationOptions {
+  if (raw !== undefined && !isPlainObject(raw)) {
+    diagnostics.push({
+      code: "INVALID_COMPILATION_OPTIONS",
+      severity: "error",
+      message: "Invalid manifest.compilation: expected an object.",
+    });
+    return {
+      timingMode: "flow",
+      defaultSilentDurationMs: DEFAULT_SILENT_DURATION_MS,
+      defaultReturnPauseMs: DEFAULT_RETURN_PAUSE_MS,
+      defaultGapMs: DEFAULT_GAP_MS,
+      includeUnscheduledAudio: false,
+    };
+  }
+
   const timingModeRaw = raw?.timingMode ?? "flow";
   let timingMode: "flow" | "strict" = "flow";
   if (timingModeRaw === "flow" || timingModeRaw === "strict") {
@@ -164,27 +184,55 @@ function validateManifestAndClips(
       message: `Unsupported manifest.version "${String(manifest.version)}": expected "${PGNA_FORMAT_VERSION}".`,
     });
   }
-  if (!isSafeArchivePath(manifest.pgnPath)) {
+
+  const rawPgnPath: unknown = manifest.pgnPath;
+  const effectivePgnPath = rawPgnPath === undefined ? "study.pgn" : rawPgnPath;
+  if (typeof effectivePgnPath !== "string") {
+    diagnostics.push({
+      code: "INVALID_MANIFEST",
+      severity: "error",
+      message: `Invalid manifest.pgnPath: expected a string, got ${typeof effectivePgnPath}.`,
+    });
+  } else if (!isSafeArchivePath(effectivePgnPath)) {
     diagnostics.push({
       code: "UNSAFE_ARCHIVE_PATH",
       severity: "error",
-      path: manifest.pgnPath,
-      message: `Unsafe manifest.pgnPath "${manifest.pgnPath}".`,
+      path: effectivePgnPath,
+      message: `Unsafe manifest.pgnPath "${effectivePgnPath}".`,
     });
   }
-  if (!isSafeArchivePath(manifest.timelinePath)) {
+
+  const rawTimelinePath: unknown = manifest.timelinePath;
+  const effectiveTimelinePath = rawTimelinePath === undefined ? "timeline.json" : rawTimelinePath;
+  if (typeof effectiveTimelinePath !== "string") {
+    diagnostics.push({
+      code: "INVALID_MANIFEST",
+      severity: "error",
+      message: `Invalid manifest.timelinePath: expected a string, got ${typeof effectiveTimelinePath}.`,
+    });
+  } else if (!isSafeArchivePath(effectiveTimelinePath)) {
     diagnostics.push({
       code: "UNSAFE_ARCHIVE_PATH",
       severity: "error",
-      path: manifest.timelinePath,
-      message: `Unsafe manifest.timelinePath "${manifest.timelinePath}".`,
+      path: effectiveTimelinePath,
+      message: `Unsafe manifest.timelinePath "${effectiveTimelinePath}".`,
     });
   }
 
   const resolvedClips = new Map<string, ResolvedClipAudio & { subtitles?: Record<string, string> }>();
-  const clips: Record<string, ClipDefinition> = manifest.clips ?? {};
+  const rawClips: unknown = manifest.clips;
+  if (rawClips !== undefined && !isPlainObject(rawClips)) {
+    diagnostics.push({
+      code: "INVALID_MANIFEST",
+      severity: "error",
+      message: "Invalid manifest.clips: expected a plain object.",
+    });
+    return resolvedClips;
+  }
 
-  for (const [clipId, clip] of Object.entries(clips)) {
+  const clips = (rawClips ?? {}) as Record<string, unknown>;
+
+  for (const [clipId, rawClip] of Object.entries(clips)) {
     if (!isValidClipId(clipId)) {
       diagnostics.push({
         code: "INVALID_CLIP_ID",
@@ -193,30 +241,78 @@ function validateManifestAndClips(
       });
       continue;
     }
+    if (!isPlainObject(rawClip)) {
+      diagnostics.push({
+        code: "INVALID_MANIFEST",
+        severity: "error",
+        message: `Invalid clip entry "${clipId}" in manifest.clips: expected an object.`,
+      });
+      continue;
+    }
+
+    const clip = rawClip as unknown as ClipDefinition;
     if (clip.id !== clipId) {
       diagnostics.push({
         code: "CLIP_ID_MISMATCH",
         severity: "error",
-        message: `Clip "${clipId}" has mismatched inner id "${clip.id}".`,
+        message: `Clip "${clipId}" has mismatched inner id "${String(clip.id)}".`,
       });
     }
-    if (!isSafeArchivePath(clip.path)) {
+
+    const clipPath: unknown = clip.path;
+    const validClipPath = typeof clipPath === "string" && isSafeArchivePath(clipPath);
+    if (typeof clipPath !== "string") {
+      diagnostics.push({
+        code: "INVALID_MANIFEST",
+        severity: "error",
+        message: `Clip "${clipId}" path must be a string.`,
+      });
+    } else if (!isSafeArchivePath(clipPath)) {
       diagnostics.push({
         code: "UNSAFE_ARCHIVE_PATH",
         severity: "error",
-        path: clip.path,
-        message: `Unsafe clip path "${clip.path}" for clip "${clipId}".`,
+        path: clipPath,
+        message: `Unsafe clip path "${clipPath}" for clip "${clipId}".`,
       });
     }
-    if (clip.subtitles) {
-      for (const subPath of Object.values(clip.subtitles)) {
-        if (!isSafeArchivePath(subPath)) {
-          diagnostics.push({
-            code: "UNSAFE_ARCHIVE_PATH",
-            severity: "error",
-            path: subPath,
-            message: `Unsafe subtitle path "${subPath}" for clip "${clipId}".`,
-          });
+
+    const validSubtitles: Record<string, string> = {};
+    const rawSubtitles: unknown = clip.subtitles;
+    if (rawSubtitles !== undefined) {
+      if (!isPlainObject(rawSubtitles)) {
+        diagnostics.push({
+          code: "INVALID_MANIFEST",
+          severity: "error",
+          message: `Clip "${clipId}" subtitles must be an object.`,
+        });
+      } else {
+        for (const [lang, subPath] of Object.entries(rawSubtitles)) {
+          if (!isValidSubtitleLang(lang)) {
+            diagnostics.push({
+              code: "INVALID_SUBTITLE_LANG",
+              severity: "error",
+              message: `Invalid subtitle language tag "${lang}" for clip "${clipId}".`,
+            });
+            continue;
+          }
+          if (typeof subPath !== "string") {
+            diagnostics.push({
+              code: "INVALID_MANIFEST",
+              severity: "error",
+              message: `Subtitle path for language "${lang}" on clip "${clipId}" must be a string.`,
+            });
+            continue;
+          }
+          if (!isSafeArchivePath(subPath)) {
+            diagnostics.push({
+              code: "UNSAFE_ARCHIVE_PATH",
+              severity: "error",
+              path: subPath,
+              message: `Unsafe subtitle path "${subPath}" for clip "${clipId}".`,
+            });
+            continue;
+          }
+          validSubtitles[lang] = subPath;
         }
       }
     }
@@ -225,15 +321,17 @@ function validateManifestAndClips(
       diagnostics.push({
         code: "INVALID_CLIP_DURATION",
         severity: "error",
-        path: clip.path,
+        ...(typeof clipPath === "string" ? { path: clipPath } : {}),
         message: `Clip "${clipId}" durationMs must be a finite number > 0.`,
       });
       continue;
     }
 
-    const trimStartMs = clip.trimStartMs ?? 0;
-    const trimEndMs = clip.trimEndMs ?? clip.durationMs;
+    const trimStartMs: unknown = clip.trimStartMs ?? 0;
+    const trimEndMs: unknown = clip.trimEndMs ?? clip.durationMs;
     if (
+      typeof trimStartMs !== "number" ||
+      typeof trimEndMs !== "number" ||
       !Number.isFinite(trimStartMs) ||
       !Number.isFinite(trimEndMs) ||
       trimStartMs < 0 ||
@@ -243,31 +341,44 @@ function validateManifestAndClips(
       diagnostics.push({
         code: "INVALID_CLIP_TRIM",
         severity: "error",
-        path: clip.path,
-        message: `Clip "${clipId}" has invalid trim bounds [${trimStartMs}, ${trimEndMs}] for durationMs ${clip.durationMs}.`,
+        ...(typeof clipPath === "string" ? { path: clipPath } : {}),
+        message: `Clip "${clipId}" has invalid trim bounds [${String(trimStartMs)}, ${String(trimEndMs)}] for durationMs ${clip.durationMs}.`,
       });
       continue;
     }
 
     resolvedClips.set(clipId, {
       clipId,
-      path: clip.path,
-      mimeType: clip.mimeType,
+      path: validClipPath ? clipPath : typeof clipPath === "string" ? clipPath : "",
+      mimeType: typeof clip.mimeType === "string" ? clip.mimeType : "",
       durationMs: clip.durationMs,
       trimStartMs,
       trimEndMs,
-      ...(clip.subtitles && Object.keys(clip.subtitles).length > 0
-        ? { subtitles: { ...clip.subtitles } }
-        : {}),
+      ...(Object.keys(validSubtitles).length > 0 ? { subtitles: validSubtitles } : {}),
     });
   }
 
   return resolvedClips;
 }
 
-function resolveGameOrientation(headers: Record<string, string>): BoardOrientation {
-  const raw = headers["Orientation"]?.trim().toLowerCase();
-  return raw === "black" ? "black" : "white";
+function resolveGameOrientation(
+  headers: Record<string, string>,
+  gameIndex: number,
+  diagnostics: PgnaDiagnostic[],
+): BoardOrientation {
+  const rawOriginal = headers["Orientation"];
+  const raw = rawOriginal?.trim().toLowerCase();
+  if (!raw) return "white";
+  if (raw === "white" || raw === "black") {
+    return raw;
+  }
+  diagnostics.push({
+    code: "INVALID_ORIENTATION_HEADER",
+    severity: "warning",
+    nodeId: `g${gameIndex}` as NodeId,
+    message: `Invalid [Orientation "${rawOriginal ?? ""}"] header in game ${gameIndex}; defaulting to "white".`,
+  });
+  return "white";
 }
 
 function makeChildNodeId(parentId: NodeId, childIndex: number): NodeId {
@@ -284,6 +395,7 @@ function compileCuesForEntry(
   trimEndMs: number,
   isRevisit: boolean,
   diagnostics: PgnaDiagnostic[],
+  emitCueDiagnostics = true,
 ): CueSnapshot[] {
   let state = {
     arrows: cloneArrows(node.tags.arrows),
@@ -327,12 +439,14 @@ function compileCuesForEntry(
       continue;
     }
     if (cue.offsetMs >= trimEndMs) {
-      diagnostics.push({
-        code: "CUE_OUT_OF_BOUNDS",
-        severity: "warning",
-        nodeId: node.nodeId,
-        message: `Cue at ${cue.offsetMs}ms on node ${node.nodeId} falls at or beyond trimEndMs (${trimEndMs}ms) and was omitted.`,
-      });
+      if (emitCueDiagnostics) {
+        diagnostics.push({
+          code: "CUE_OUT_OF_BOUNDS",
+          severity: "warning",
+          nodeId: node.nodeId,
+          message: `Cue at ${cue.offsetMs}ms on node ${node.nodeId} falls at or beyond trimEndMs (${trimEndMs}ms) and was omitted.`,
+        });
+      }
       continue;
     }
 
@@ -374,6 +488,14 @@ function classifyGuessOutcome(child: CompiledNode, isMainline: boolean): GuessOu
   return isMainline ? "success" : "fail";
 }
 
+function getPrimaryAtTagDurMs(node: CompiledNode): number | undefined {
+  if (node.tags.atTags.length === 0) return undefined;
+  const earliest = node.tags.atTags
+    .map((tag, idx) => ({ tag, idx }))
+    .sort((a, b) => a.tag.value - b.tag.value || a.idx - b.idx)[0];
+  return earliest?.tag.durMs;
+}
+
 function buildEntryFromNode(
   node: CompiledNode,
   index: number,
@@ -382,6 +504,7 @@ function buildEntryFromNode(
   resolvedClip: (ResolvedClipAudio & { subtitles?: Record<string, string> }) | null,
   isRevisit: boolean,
   diagnostics: PgnaDiagnostic[],
+  emitCueDiagnostics = true,
 ): TimelineEntry {
   const audio: ResolvedClipAudio | null =
     !isRevisit && resolvedClip
@@ -398,7 +521,15 @@ function buildEntryFromNode(
   const trimStartMs = audio ? audio.trimStartMs : 0;
   const trimEndMs = audio ? audio.trimEndMs : durationMs;
 
-  const cues = compileCuesForEntry(node, startMs, trimStartMs, trimEndMs, isRevisit, diagnostics);
+  const cues = compileCuesForEntry(
+    node,
+    startMs,
+    trimStartMs,
+    trimEndMs,
+    isRevisit,
+    diagnostics,
+    emitCueDiagnostics,
+  );
 
   const entry: TimelineEntry = {
     index,
@@ -488,6 +619,7 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
         nags: [...pgnNode.nags],
         tags,
         documentOrder: docOrderCounter++,
+        siblingIndex: childIndex,
         children: [],
       };
 
@@ -519,9 +651,25 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
 
   for (let gameIndex = 0; gameIndex < parsedGames.length; gameIndex++) {
     const game = parsedGames[gameIndex]!;
+
+    const rawVariant = game.headers["Variant"]?.trim();
+    if (
+      rawVariant !== undefined &&
+      rawVariant.length > 0 &&
+      rawVariant.toLowerCase() !== "standard"
+    ) {
+      diagnostics.push({
+        code: "UNSUPPORTED_VARIANT",
+        severity: "error",
+        nodeId: `g${gameIndex}` as NodeId,
+        message: `Unsupported [Variant "${rawVariant}"] in game ${gameIndex}: PGNA v1.0 only supports Standard chess.`,
+      });
+      continue;
+    }
+
     const rawFen = game.headers["FEN"]?.trim();
     const initialFen = rawFen && rawFen.length > 0 ? rawFen : INITIAL_FEN;
-    const gameOrientation = resolveGameOrientation(game.headers);
+    const gameOrientation = resolveGameOrientation(game.headers, gameIndex, diagnostics);
 
     if (!validateFen(initialFen)) {
       diagnostics.push({
@@ -558,6 +706,7 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
       nags: [],
       tags: rootTags,
       documentOrder: docOrderCounter++,
+      siblingIndex: 0,
       children: [],
     };
 
@@ -630,12 +779,12 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
   // Build main timeline entries
   const entries: TimelineEntry[] = [];
   const visitedNodes = new Set<NodeId>();
+  const cueDiagnosticsEmitted = new Set<NodeId>();
   const timelineIndicesByNode = new Map<NodeId, number[]>();
 
   for (const occ of allOccurrences) {
     const { node, atTag } = occ;
     const isRevisit = visitedNodes.has(node.nodeId);
-    visitedNodes.add(node.nodeId);
 
     const clipDef =
       !isRevisit && node.tags.audioClipId !== null
@@ -669,6 +818,8 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
       });
       continue;
     }
+
+    visitedNodes.add(node.nodeId);
 
     const prevEntry = entries[entries.length - 1];
     let startMs: number;
@@ -713,7 +864,11 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
       clipDef,
       isRevisit,
       diagnostics,
+      true,
     );
+    if (!isRevisit) {
+      cueDiagnosticsEmitted.add(node.nodeId);
+    }
     entries.push(entry);
 
     let list = timelineIndicesByNode.get(node.nodeId);
@@ -755,7 +910,7 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
       const child = node.children[childIdx]!;
       if (!child.san || !child.lastMove) continue;
 
-      const isMainline = childIdx === 0;
+      const isMainline = child.siblingIndex === 0;
       const outcome = classifyGuessOutcome(child, isMainline);
       const mainTimelineIndex = nodeIndex[child.nodeId]?.timelineIndex ?? null;
 
@@ -777,7 +932,7 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
           cur.tags.audioClipId !== null ? (resolvedClips.get(cur.tags.audioClipId) ?? null) : null;
         const stepDurationMs = stepClip
           ? stepClip.trimEndMs - stepClip.trimStartMs
-          : (cur.tags.durMs ?? options.defaultSilentDurationMs);
+          : (getPrimaryAtTagDurMs(cur) ?? cur.tags.durMs ?? options.defaultSilentDurationMs);
 
         if (stepDurationMs <= 0) {
           diagnostics.push({
@@ -789,6 +944,7 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
           break;
         }
 
+        const emitCueDiags = !cueDiagnosticsEmitted.has(cur.nodeId);
         const branchEntry = buildEntryFromNode(
           cur,
           branchTimeline.length,
@@ -797,10 +953,12 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
           stepClip,
           false,
           diagnostics,
+          emitCueDiags,
         );
+        cueDiagnosticsEmitted.add(cur.nodeId);
         branchTimeline.push(branchEntry);
         cursorMs = branchEntry.endMs + options.defaultGapMs;
-        cur = cur.children[0];
+        cur = cur.children.find((c) => c.siblingIndex === 0);
         stepIdx++;
       }
 

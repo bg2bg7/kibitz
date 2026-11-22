@@ -49,6 +49,8 @@ export function createTimelineAudioEngine(
   let currentSource: AudioBufferSourceNode | null = null;
   let currentStartOffsetSec = 0;
   let currentStartCtxTime = 0;
+  let sourceEnded = false;
+  let lastEndedOffsetSec = 0;
   let fallbackEl: HTMLAudioElement | null = null;
 
   // Latest desired state (used if an async decode finishes mid-clip)
@@ -133,6 +135,8 @@ export function createTimelineAudioEngine(
   const stopActivePlayback = () => {
     activeToken++;
     currentClipKey = null;
+    sourceEnded = false;
+    lastEndedOffsetSec = 0;
 
     if (currentSource) {
       try {
@@ -152,8 +156,7 @@ export function createTimelineAudioEngine(
     if (fallbackEl) {
       try {
         fallbackEl.pause();
-        fallbackEl.removeAttribute("src");
-        fallbackEl.load();
+        fallbackEl.src = "";
       } catch {
         // ignore
       }
@@ -210,7 +213,14 @@ export function createTimelineAudioEngine(
     const trimEndSec = Math.min(buffer.duration, audio.trimEndMs / 1000);
     const safeOffset = Math.max(0, Math.min(offsetSec, Math.max(0, trimEndSec - 0.005)));
     const remainingSec = trimEndSec - safeOffset;
-    if (remainingSec <= 0.005) return;
+    if (remainingSec <= 0.005) {
+      sourceEnded = true;
+      lastEndedOffsetSec = trimEndSec;
+      return;
+    }
+
+    sourceEnded = false;
+    lastEndedOffsetSec = 0;
 
     const source = ctx.createBufferSource();
     source.buffer = buffer;
@@ -218,6 +228,8 @@ export function createTimelineAudioEngine(
     source.onended = () => {
       if (currentSource === source) {
         currentSource = null;
+        sourceEnded = true;
+        lastEndedOffsetSec = trimEndSec;
       }
     };
 
@@ -311,6 +323,14 @@ export function createTimelineAudioEngine(
             // ignore
           }
         }
+      } else if (
+        currentSource === null &&
+        fallbackEl === null &&
+        !decodePromises.has(activeAudio.path) &&
+        sourceEnded &&
+        desiredSec < lastEndedOffsetSec - 0.1
+      ) {
+        beginClipPlayback(activeAudio, desiredSec);
       }
     },
 

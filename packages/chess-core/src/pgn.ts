@@ -65,7 +65,14 @@ function unescapeHeaderValue(raw: string): string {
 }
 
 function escapeHeaderValue(value: string): string {
-  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r\n|[\r\n]/g, " ");
+}
+
+function sanitizeBraceComment(comment: string): string {
+  return comment.replace(/[{}]/g, "").trim();
 }
 
 function normalizeSanAndInlineNags(rawWord: string): { san: string; inlineNags: string[] } | null {
@@ -235,7 +242,8 @@ function tokenizePgn(pgnText: string): PgnToken[] {
       input[i] !== "}" &&
       input[i] !== ";" &&
       input[i] !== "[" &&
-      input[i] !== "]"
+      input[i] !== "]" &&
+      input[i] !== "$"
     ) {
       i++;
     }
@@ -257,8 +265,8 @@ function tokenizePgn(pgnText: string): PgnToken[] {
       continue;
     }
 
-    // Move number attached directly to a move without space (e.g. "1.e4" or "1...e5")
-    const attachedMoveMatch = /^\d+\.+(.+)$/.exec(word);
+    // Move number or ellipsis attached directly to a move without space (e.g. "1.e4", "1...e5", "...e5")
+    const attachedMoveMatch = /^(?:\d+\.+|\.+)(.+)$/.exec(word);
     const candidate = attachedMoveMatch?.[1] ?? word;
 
     // Standalone symbolic NAG ("!", "??", etc.)
@@ -490,7 +498,8 @@ function serializeMoveBranch(
   }
 
   for (const comment of primary.comments) {
-    parts.push(`{ ${comment} }`);
+    const safe = sanitizeBraceComment(comment);
+    parts.push(safe.length > 0 ? `{ ${safe} }` : "{}");
   }
 
   let emittedInterrupter = primary.comments.length > 0;
@@ -528,7 +537,8 @@ export function serializePgnGames(games: readonly PgnGameDocument[]): string {
 
       const moveParts: string[] = [];
       for (const rootComment of game.rootComments) {
-        moveParts.push(`{ ${rootComment} }`);
+        const safe = sanitizeBraceComment(rootComment);
+        moveParts.push(safe.length > 0 ? `{ ${safe} }` : "{}");
       }
 
       const { turn, moveNumber } = getInitialTurnAndMoveNumber(game.headers);

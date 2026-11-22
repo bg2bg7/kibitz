@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BoardAnnotationColor, PromotionPiece } from "@suite/board-ui";
 import { parsePgnGames, serializePgnGames, type PgnGameDocument } from "@suite/chess-core";
 import {
   PGNA_MIME_TYPE,
   compilePgna,
+  isValidSubtitleLang,
   packPgnaArchive,
   unpackPgnaArchive,
+  validatePgnaPackage,
+  type BoardOrientation,
   type ClipDefinition,
   type NodeId,
   type ParsedNodeTags,
@@ -18,7 +21,7 @@ import { NodeInspector } from "./components/NodeInspector";
 import { PreviewPlayer } from "./components/PreviewPlayer";
 import { StudioHeader, type StudioMode } from "./components/StudioHeader";
 import { TimelineDock } from "./components/TimelineDock";
-import { decodeAudioMetadata } from "./local/audioStudio";
+import { decodeAudioMetadataBatch } from "./local/audioStudio";
 import {
   deleteLocalDraft,
   listLocalDrafts,
@@ -37,6 +40,7 @@ import {
   addNewGame,
   appendNodeToTimeline,
   cloneGames,
+  collectReferencedClipIds,
   deleteGame,
   deleteNodeSubtree,
   indexStudyGames,
@@ -51,6 +55,9 @@ import {
   updateNodeTags,
 } from "./local/studyTree";
 import { PublishModal } from "./publish/PublishModal";
+
+const MAX_PGNA_IMPORT_BYTES = 50 * 1024 * 1024; // 50 MB
+const MAX_PGN_IMPORT_BYTES = 5 * 1024 * 1024; // 5 MB
 
 function triggerBrowserDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
@@ -71,6 +78,56 @@ function slugifyFilename(title: string): string {
   return slug || "pgna-study";
 }
 
+function pruneUnreferencedClipAssets(
+  prev: ScribeDraft,
+  nextGames: readonly PgnGameDocument[],
+): {
+  clips: Record<string, ClipDefinition>;
+  audioByPath: Record<string, Uint8Array>;
+  subtitlesByPath: Record<string, string>;
+} {
+  const referenced = collectReferencedClipIds(nextGames);
+  const nextClips: Record<string, ClipDefinition> = {};
+  const nextAudioByPath: Record<string, Uint8Array> = { ...prev.audioByPath };
+  const nextSubtitlesByPath: Record<string, string> = { ...prev.subtitlesByPath };
+
+  const keptAudioPaths = new Set<string>();
+  const keptSubtitlePaths = new Set<string>();
+
+  for (const [clipId, clip] of Object.entries(prev.manifest.clips)) {
+    if (referenced.has(clipId)) {
+      nextClips[clipId] = clip;
+      keptAudioPaths.add(clip.path);
+      if (clip.subtitles) {
+        for (const subPath of Object.values(clip.subtitles)) {
+          keptSubtitlePaths.add(subPath);
+        }
+      }
+    }
+  }
+
+  for (const [clipId, clip] of Object.entries(prev.manifest.clips)) {
+    if (!referenced.has(clipId)) {
+      if (!keptAudioPaths.has(clip.path)) {
+        delete nextAudioByPath[clip.path];
+      }
+      if (clip.subtitles) {
+        for (const subPath of Object.values(clip.subtitles)) {
+          if (!keptSubtitlePaths.has(subPath)) {
+            delete nextSubtitlesByPath[subPath];
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    clips: nextClips,
+    audioByPath: nextAudioByPath,
+    subtitlesByPath: nextSubtitlesByPath,
+  };
+}
+
 export function App() {
   const [draft, setDraft] = useState<ScribeDraft>(() => createDemoItalianDraft());
   const [selectedNodeId, setSelectedNodeId] = useState<NodeId>("g0");
@@ -86,6 +143,42 @@ export function App() {
     text: string;
   } | null>(null);
   const [waveformPeaksByClipId, setWaveformPeaksByClipId] = useState<Record<string, number[]>>({});
+
+  // Dirty flag prevents startup auto-save from overwriting previously edited drafts in IndexedDB
+  const isDirtyRef = useRef(false);
+  const activeDraftIdRef = useRef(draft.id);
+  const waveformDecodeTokenRef = useRef(0);
+
+  useEffect(() => {
+    activeDraftIdRef.current = draft.id;
+  }, [draft.id]);
+
+  // Helper to batch-decode waveform peaks for a draft with stale-draft cancellation
+  const decodeWaveformsForDraft = useCallback(async (targetDraft: ScribeDraft) => {
+    const token = ++waveformDecodeTokenRef.current;
+    const items: Array<{ id: string; bytes: Uint8Array; fallbackDurationMs: number }> = [];
+    for (const clip of Object.values(targetDraft.manifest.clips ?? {})) {
+      const audioBytes = targetDraft.audioByPath[clip.path];
+      if (audioBytes) {
+        items.push({ id: clip.id, bytes: audioBytes, fallbackDurationMs: clip.durationMs });
+      }
+    }
+    if (items.length === 0) {
+      if (waveformDecodeTokenRef.current === token && activeDraftIdRef.current === targetDraft.id) {
+        setWaveformPeaksByClipId({});
+      }
+      return;
+    }
+    const decoded = await decodeAudioMetadataBatch(items);
+    if (waveformDecodeTokenRef.current !== token || activeDraftIdRef.current !== targetDraft.id) {
+      return;
+    }
+    const peakEntries: Record<string, number[]> = {};
+    for (const [id, meta] of Object.entries(decoded)) {
+      peakEntries[id] = meta.peaks;
+    }
+    setWaveformPeaksByClipId(peakEntries);
+  }, []);
 
   // Parse PGN AST & build node index
   const games = useMemo<PgnGameDocument[]>(() => {
@@ -107,6 +200,10 @@ export function App() {
     ? selectedNodeId
     : (studyIndex.rootIds[0] ?? "g0");
   const activeNode = studyIndex.nodesById[safeSelectedNodeId]!;
+  const activeGameOrientation: BoardOrientation =
+    games[activeNode.gameIndex]?.headers["Orientation"]?.trim().toLowerCase() === "black"
+      ? "black"
+      : "white";
 
   // Live PGNA v1.0 compilation
   const compiled = useMemo(
@@ -122,7 +219,7 @@ export function App() {
   const errorCount = compiled.diagnostics.filter((d) => d.severity === "error").length;
   const warningCount = compiled.diagnostics.filter((d) => d.severity === "warning").length;
 
-  // Refresh saved draft list on mount
+  // Refresh saved draft list
   const refreshDraftList = useCallback(async () => {
     try {
       const items = await listLocalDrafts();
@@ -132,22 +229,34 @@ export function App() {
     }
   }, []);
 
+  // On startup, list saved drafts and auto-open the most recently edited local draft if present
   useEffect(() => {
     let cancelled = false;
     void listLocalDrafts()
-      .then((items) => {
-        if (!cancelled) {
-          setDraftList(items);
+      .then(async (items) => {
+        if (cancelled) return;
+        setDraftList(items);
+        if (items.length > 0 && !isDirtyRef.current) {
+          const mostRecent = await loadLocalDraft(items[0]!.id);
+          if (!cancelled && mostRecent && !isDirtyRef.current) {
+            isDirtyRef.current = false;
+            activeDraftIdRef.current = mostRecent.id;
+            setDraft(mostRecent);
+            setSelectedNodeId("g0");
+            setSaveStatus("Loaded saved draft (IndexedDB)");
+            void decodeWaveformsForDraft(mostRecent);
+          }
         }
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [decodeWaveformsForDraft]);
 
-  // Debounced IndexedDB auto-save
+  // Debounced IndexedDB auto-save (only after user mutations)
   useEffect(() => {
+    if (!isDirtyRef.current) return;
     const timer = window.setTimeout(() => {
       void saveLocalDraft(draft)
         .then(() => {
@@ -162,18 +271,40 @@ export function App() {
   }, [draft, refreshDraftList]);
 
   // Commit updated games AST back into serialized PGN text
-  const commitGames = useCallback((nextGames: PgnGameDocument[], nextNodeId?: NodeId) => {
-    const nextPgn = serializePgnGames(nextGames);
-    setDraft((prev) => ({
-      ...prev,
-      pgnText: nextPgn,
-      manifest: { ...prev.manifest, updatedAt: new Date().toISOString() },
-      updatedAt: new Date().toISOString(),
-    }));
-    if (nextNodeId) {
-      setSelectedNodeId(nextNodeId);
-    }
-  }, []);
+  const commitGames = useCallback(
+    (
+      nextGames: PgnGameDocument[],
+      nextNodeId?: NodeId,
+      options?: { pruneOrphans?: boolean },
+    ) => {
+      const nextPgn = serializePgnGames(nextGames);
+      const now = new Date().toISOString();
+      isDirtyRef.current = true;
+      setDraft((prev) => {
+        if (options?.pruneOrphans) {
+          const pruned = pruneUnreferencedClipAssets(prev, nextGames);
+          return {
+            ...prev,
+            pgnText: nextPgn,
+            manifest: { ...prev.manifest, updatedAt: now, clips: pruned.clips },
+            audioByPath: pruned.audioByPath,
+            subtitlesByPath: pruned.subtitlesByPath,
+            updatedAt: now,
+          };
+        }
+        return {
+          ...prev,
+          pgnText: nextPgn,
+          manifest: { ...prev.manifest, updatedAt: now },
+          updatedAt: now,
+        };
+      });
+      if (nextNodeId) {
+        setSelectedNodeId(nextNodeId);
+      }
+    },
+    [],
+  );
 
   // Navigation helpers
   const stepFirst = useCallback(() => {
@@ -263,6 +394,15 @@ export function App() {
 
   const handleFlipBoard = () => {
     const nextOrient = activeNode.orientation === "white" ? "black" : "white";
+    if (activeNode.tags.orientation !== null) {
+      commitGames(
+        updateNodeTags(games, safeSelectedNodeId, (prev) => ({
+          ...prev,
+          orientation: nextOrient,
+        })),
+      );
+      return;
+    }
     const cloned = cloneGames(games);
     const g = cloned[activeNode.gameIndex];
     if (g) {
@@ -290,11 +430,16 @@ export function App() {
 
   const handleDeleteSubtree = (nodeId: NodeId) => {
     const res = deleteNodeSubtree(games, nodeId);
-    commitGames(res.games, res.fallbackNodeId);
+    commitGames(res.games, res.fallbackNodeId, { pruneOrphans: true });
   };
 
+  const nextTimestampMs =
+    compiled.timeline.entries.length > 0
+      ? compiled.timeline.totalDurationMs + (draft.manifest.compilation?.defaultGapMs ?? 0)
+      : 0;
+
   const handleScheduleNode = (nodeId: NodeId, durMs?: number) => {
-    commitGames(appendNodeToTimeline(games, nodeId, durMs));
+    commitGames(appendNodeToTimeline(games, nodeId, durMs, { nextTimestampMs }));
   };
 
   const handleRemoveAtTag = (nodeId: NodeId, atIndex: number) => {
@@ -320,35 +465,54 @@ export function App() {
     bytes: Uint8Array,
     peaks: number[],
   ) => {
-    const nextGames = updateNodeTags(games, nodeId, (prev) => ({
+    const existingNode = studyIndex.nodesById[nodeId];
+    const shouldAutoSchedule = (existingNode?.tags.atTags.length ?? 0) === 0;
+
+    let nextGames = updateNodeTags(games, nodeId, (prev) => ({
       ...prev,
       audioClipId: clip.id,
-      // Auto-schedule on timeline if node wasn't scheduled yet
-      atTags: prev.atTags.length > 0 ? prev.atTags : prev.atTags,
+      // Clear any stale silent [%dur] so attaching audio never leaves an IGNORED_DUR_TAG warning
+      durMs: null,
     }));
+    if (shouldAutoSchedule) {
+      nextGames = appendNodeToTimeline(nextGames, nodeId, undefined, { nextTimestampMs });
+    }
     const nextPgn = serializePgnGames(nextGames);
+    const now = new Date().toISOString();
 
+    isDirtyRef.current = true;
     setWaveformPeaksByClipId((prev) => ({ ...prev, [clip.id]: peaks }));
-    setDraft((prev) => ({
-      ...prev,
-      pgnText: nextPgn,
-      manifest: {
-        ...prev.manifest,
-        updatedAt: new Date().toISOString(),
-        clips: {
-          ...prev.manifest.clips,
-          [clip.id]: clip,
+    setDraft((prev) => {
+      const nextAudioByPath = { ...prev.audioByPath, [clip.path]: bytes };
+      const oldClip = prev.manifest.clips[clip.id];
+      if (oldClip && oldClip.path !== clip.path) {
+        const pathStillUsedByOtherClip = Object.entries(prev.manifest.clips).some(
+          ([otherId, otherClip]) => otherId !== clip.id && otherClip.path === oldClip.path,
+        );
+        if (!pathStillUsedByOtherClip) {
+          delete nextAudioByPath[oldClip.path];
+        }
+      }
+      return {
+        ...prev,
+        pgnText: nextPgn,
+        manifest: {
+          ...prev.manifest,
+          updatedAt: now,
+          clips: {
+            ...prev.manifest.clips,
+            [clip.id]: clip,
+          },
         },
-      },
-      audioByPath: {
-        ...prev.audioByPath,
-        [clip.path]: bytes,
-      },
-      updatedAt: new Date().toISOString(),
-    }));
+        audioByPath: nextAudioByPath,
+        updatedAt: now,
+      };
+    });
   };
 
   const handleUpdateClip = (clipId: string, updater: (prev: ClipDefinition) => ClipDefinition) => {
+    isDirtyRef.current = true;
+    const now = new Date().toISOString();
     setDraft((prev) => {
       const existing = prev.manifest.clips[clipId];
       if (!existing) return prev;
@@ -356,13 +520,13 @@ export function App() {
         ...prev,
         manifest: {
           ...prev.manifest,
-          updatedAt: new Date().toISOString(),
+          updatedAt: now,
           clips: {
             ...prev.manifest.clips,
             [clipId]: updater(existing),
           },
         },
-        updatedAt: new Date().toISOString(),
+        updatedAt: now,
       };
     });
   };
@@ -375,6 +539,7 @@ export function App() {
       audioClipId: null,
     }));
     const nextPgn = serializePgnGames(nextGames);
+    const now = new Date().toISOString();
 
     // Check whether any other node still references this clipId before removing from manifest
     const stillUsed =
@@ -384,14 +549,32 @@ export function App() {
         (n) => n.nodeId !== nodeId && n.tags.audioClipId === clipId,
       );
 
+    isDirtyRef.current = true;
     setDraft((prev) => {
       const nextClips = { ...prev.manifest.clips };
       const nextAudioByPath = { ...prev.audioByPath };
+      const nextSubtitlesByPath = { ...prev.subtitlesByPath };
       if (clipId && !stillUsed) {
         const oldClip = nextClips[clipId];
         if (oldClip) {
-          delete nextAudioByPath[oldClip.path];
           delete nextClips[clipId];
+          const remainingClips = Object.values(nextClips);
+          if (!remainingClips.some((c) => c.path === oldClip.path)) {
+            delete nextAudioByPath[oldClip.path];
+          }
+          if (oldClip.subtitles) {
+            const keptSubPaths = new Set<string>();
+            for (const c of remainingClips) {
+              for (const sp of Object.values(c.subtitles ?? {})) {
+                keptSubPaths.add(sp);
+              }
+            }
+            for (const subPath of Object.values(oldClip.subtitles)) {
+              if (!keptSubPaths.has(subPath)) {
+                delete nextSubtitlesByPath[subPath];
+              }
+            }
+          }
         }
       }
       return {
@@ -399,34 +582,41 @@ export function App() {
         pgnText: nextPgn,
         manifest: {
           ...prev.manifest,
-          updatedAt: new Date().toISOString(),
+          updatedAt: now,
           clips: nextClips,
         },
         audioByPath: nextAudioByPath,
-        updatedAt: new Date().toISOString(),
+        subtitlesByPath: nextSubtitlesByPath,
+        updatedAt: now,
       };
     });
   };
 
   const handleUpdateSubtitle = (clipId: string, lang: string, vttText: string) => {
-    const subPath = `subtitles/${lang}/${clipId}.vtt`;
+    const trimmedLang = lang.trim();
+    if (!isValidSubtitleLang(trimmedLang)) {
+      return;
+    }
+    const subPath = `subtitles/${trimmedLang}/${clipId}.vtt`;
+    const now = new Date().toISOString();
+    isDirtyRef.current = true;
     setDraft((prev) => {
       const clip = prev.manifest.clips[clipId];
       if (!clip) return prev;
       const nextSubtitles = { ...(clip.subtitles ?? {}) };
       const nextSubByPath = { ...prev.subtitlesByPath };
       if (vttText.trim() === "") {
-        delete nextSubtitles[lang];
+        delete nextSubtitles[trimmedLang];
         delete nextSubByPath[subPath];
       } else {
-        nextSubtitles[lang] = subPath;
+        nextSubtitles[trimmedLang] = subPath;
         nextSubByPath[subPath] = vttText;
       }
       return {
         ...prev,
         manifest: {
           ...prev.manifest,
-          updatedAt: new Date().toISOString(),
+          updatedAt: now,
           clips: {
             ...prev.manifest.clips,
             [clipId]: {
@@ -438,22 +628,28 @@ export function App() {
           },
         },
         subtitlesByPath: nextSubByPath,
-        updatedAt: new Date().toISOString(),
+        updatedAt: now,
       };
     });
   };
 
   const handleUpdateManifest = (updater: (prev: PgnaManifest) => PgnaManifest) => {
+    const now = new Date().toISOString();
+    isDirtyRef.current = true;
     setDraft((prev) => ({
       ...prev,
-      manifest: { ...updater(prev.manifest), updatedAt: new Date().toISOString() },
-      updatedAt: new Date().toISOString(),
+      manifest: { ...updater(prev.manifest), updatedAt: now },
+      updatedAt: now,
     }));
   };
 
   // Multi-game chapter mutations
-  const handleAddGame = (title: string, initialFen?: string) => {
-    const res = addNewGame(games, title, initialFen);
+  const handleAddGame = (
+    title: string,
+    initialFen?: string,
+    players?: { white?: string; black?: string },
+  ) => {
+    const res = addNewGame(games, title, initialFen, players);
     commitGames(res.games, res.rootNodeId);
   };
 
@@ -467,7 +663,7 @@ export function App() {
 
   const handleDeleteGame = (gameIndex: number) => {
     const res = deleteGame(games, gameIndex);
-    commitGames(res.games, res.fallbackNodeId);
+    commitGames(res.games, res.fallbackNodeId, { pruneOrphans: true });
   };
 
   // Import .pgna or .pgn
@@ -475,34 +671,81 @@ export function App() {
     setStatusBanner(null);
     try {
       if (file.name.toLowerCase().endsWith(".pgna")) {
+        if (file.size > MAX_PGNA_IMPORT_BYTES) {
+          setStatusBanner({
+            kind: "error",
+            text: `Import failed: "${file.name}" exceeds the 50 MB .pgna import limit.`,
+          });
+          return;
+        }
         const bytes = new Uint8Array(await file.arrayBuffer());
         const unpacked = await unpackPgnaArchive(bytes);
+        const validation = validatePgnaPackage(unpacked.entries);
+        const importErrors = validation.diagnostics.filter((d) => d.severity === "error");
+        const importWarnings = validation.diagnostics.filter((d) => d.severity === "warning");
+
+        // Strip compiler-generated merged timeline.vtt entries so re-export never duplicates them
+        const referencedSubPaths = new Set<string>();
+        for (const clip of Object.values(unpacked.manifest.clips ?? {})) {
+          for (const sp of Object.values(clip.subtitles ?? {})) {
+            referencedSubPaths.add(sp);
+          }
+        }
+        const mergedSubPaths = new Set<string>(
+          Object.values(unpacked.timeline.mergedSubtitles ?? {}),
+        );
+        const perClipSubtitles: Record<string, string> = {};
+        for (const [subPath, vtt] of Object.entries(unpacked.subtitlesByPath)) {
+          if (
+            referencedSubPaths.has(subPath) ||
+            (!mergedSubPaths.has(subPath) && !/^subtitles\/[^/]+\/timeline\.vtt$/.test(subPath))
+          ) {
+            perClipSubtitles[subPath] = vtt;
+          }
+        }
+
         const importedDraft: ScribeDraft = {
           id: createDraftId(),
           manifest: unpacked.manifest,
           pgnText: unpacked.pgnText,
           audioByPath: unpacked.audioByPath,
-          subtitlesByPath: unpacked.subtitlesByPath,
+          subtitlesByPath: perClipSubtitles,
           updatedAt: new Date().toISOString(),
         };
+        isDirtyRef.current = true;
+        activeDraftIdRef.current = importedDraft.id;
         setDraft(importedDraft);
         setSelectedNodeId("g0");
-        setStatusBanner({
-          kind: "info",
-          text: `Imported PGNA archive "${file.name}" (${Object.keys(unpacked.manifest.clips).length} audio clips).`,
-        });
+        setWaveformPeaksByClipId({});
 
-        // Decode waveform peaks in background
-        const peakEntries: Record<string, number[]> = {};
-        for (const clip of Object.values(unpacked.manifest.clips)) {
-          const audioBytes = unpacked.audioByPath[clip.path];
-          if (audioBytes) {
-            const meta = await decodeAudioMetadata(audioBytes, clip.durationMs);
-            peakEntries[clip.id] = meta.peaks;
-          }
+        const clipCount = Object.keys(unpacked.manifest.clips ?? {}).length;
+        if (importErrors.length > 0) {
+          setShowDiagnostics(true);
+          setStatusBanner({
+            kind: "error",
+            text: `Imported "${file.name}" (${clipCount} audio clips) with ${importErrors.length} validation error(s): ${importErrors[0]?.code ?? "INVALID"} — ${importErrors[0]?.message ?? ""}`,
+          });
+        } else if (importWarnings.length > 0) {
+          setStatusBanner({
+            kind: "info",
+            text: `Imported PGNA archive "${file.name}" (${clipCount} audio clips, ${importWarnings.length} warning(s)).`,
+          });
+        } else {
+          setStatusBanner({
+            kind: "info",
+            text: `Imported valid PGNA archive "${file.name}" (${clipCount} audio clips).`,
+          });
         }
-        setWaveformPeaksByClipId(peakEntries);
+
+        void decodeWaveformsForDraft(importedDraft);
       } else {
+        if (file.size > MAX_PGN_IMPORT_BYTES) {
+          setStatusBanner({
+            kind: "error",
+            text: `Import failed: "${file.name}" exceeds the 5 MB .pgn import limit.`,
+          });
+          return;
+        }
         const pgnText = await file.text();
         const title = file.name.replace(/\.pgn$/i, "") || "Imported PGN Study";
         const importedDraft: ScribeDraft = {
@@ -513,8 +756,12 @@ export function App() {
           subtitlesByPath: {},
           updatedAt: new Date().toISOString(),
         };
+        isDirtyRef.current = true;
+        activeDraftIdRef.current = importedDraft.id;
+        waveformDecodeTokenRef.current++;
         setDraft(importedDraft);
         setSelectedNodeId("g0");
+        setWaveformPeaksByClipId({});
         setStatusBanner({
           kind: "info",
           text: `Imported PGN "${file.name}".`,
@@ -578,23 +825,36 @@ export function App() {
 
   // Draft management
   const handleCreateBlankDraft = () => {
-    setDraft(createBlankDraft("Untitled PGNA Study"));
+    const blank = createBlankDraft("Untitled PGNA Study");
+    isDirtyRef.current = true;
+    activeDraftIdRef.current = blank.id;
+    waveformDecodeTokenRef.current++;
+    setDraft(blank);
     setSelectedNodeId("g0");
     setWaveformPeaksByClipId({});
   };
 
   const handleLoadDemo = () => {
-    setDraft(createDemoItalianDraft());
+    const demo = createDemoItalianDraft();
+    isDirtyRef.current = false;
+    activeDraftIdRef.current = demo.id;
+    waveformDecodeTokenRef.current++;
+    setDraft(demo);
     setSelectedNodeId("g0");
     setWaveformPeaksByClipId({});
+    setSaveStatus("Demo loaded · Edit to save");
   };
 
   const handleOpenDraft = async (id: string) => {
     const loaded = await loadLocalDraft(id);
     if (loaded) {
+      isDirtyRef.current = false;
+      activeDraftIdRef.current = loaded.id;
       setDraft(loaded);
       setSelectedNodeId("g0");
       setWaveformPeaksByClipId({});
+      setSaveStatus("Loaded saved draft (IndexedDB)");
+      void decodeWaveformsForDraft(loaded);
     }
   };
 
@@ -691,6 +951,7 @@ export function App() {
 
                 <NodeInspector
                   node={activeNode}
+                  gameOrientation={activeGameOrientation}
                   studyIndex={studyIndex}
                   manifest={draft.manifest}
                   timeline={compiled.timeline}
@@ -707,13 +968,16 @@ export function App() {
                   onDetachAudioClip={handleDetachAudioClip}
                   onUpdateSubtitle={handleUpdateSubtitle}
                   onUpdateManifest={handleUpdateManifest}
-                  onApplyRawPgn={(nextPgn) =>
+                  onApplyRawPgn={(nextPgn) => {
+                    const now = new Date().toISOString();
+                    isDirtyRef.current = true;
                     setDraft((prev) => ({
                       ...prev,
                       pgnText: nextPgn,
-                      updatedAt: new Date().toISOString(),
-                    }))
-                  }
+                      manifest: { ...prev.manifest, updatedAt: now },
+                      updatedAt: now,
+                    }));
+                  }}
                   waveformPeaksByClipId={waveformPeaksByClipId}
                 />
               </div>

@@ -110,5 +110,56 @@ describe("@suite/chess-core", () => {
     expect(games).toHaveLength(1);
     expect(games[0]?.rootMoves.map((m) => m.san)).toEqual(["e4"]);
   });
+
+  it("tokenizes numeric NAGs attached directly to SAN moves and leading ellipsis without move number", () => {
+    const games = parsePgnGames("1. e4$1 ...e5$6 ( ...c5$5 ) 2. Nf3$3 *");
+    expect(games).toHaveLength(1);
+    const e4 = games[0]!.rootMoves[0]!;
+    expect(e4.san).toBe("e4");
+    expect(e4.nags).toEqual(["$1"]);
+    expect(e4.children.map((c) => c.san)).toEqual(["e5", "c5"]);
+    expect(e4.children[0]?.nags).toEqual(["$6"]);
+    expect(e4.children[1]?.nags).toEqual(["$5"]);
+    expect(e4.children[0]?.children[0]?.san).toBe("Nf3");
+    expect(e4.children[0]?.children[0]?.nags).toEqual(["$3"]);
+  });
+
+  it("sanitizes brace characters in comments and strips newlines from header values on serialization", () => {
+    const serialized = serializePgnGames([
+      {
+        headers: {
+          Event: "Line 1\nLine 2\r\nLine 3\rEnd",
+          Result: "*",
+        },
+        rootComments: ["Intro {nested} } breakout"],
+        rootMoves: [
+          {
+            san: "e4",
+            nags: [],
+            comments: ["Move } 1. d4 { injected"],
+            children: [],
+          },
+        ],
+        result: "*",
+      },
+    ]);
+
+    expect(serialized).toContain('[Event "Line 1 Line 2 Line 3 End"]');
+    // No line breaks inside header tag lines
+    for (const line of serialized.split("\n")) {
+      if (line.startsWith("[")) {
+        expect(line.endsWith("]")).toBe(true);
+      }
+    }
+
+    const reparsed = parsePgnGames(serialized);
+    expect(reparsed).toHaveLength(1);
+    expect(reparsed[0]?.headers["Event"]).toBe("Line 1 Line 2 Line 3 End");
+    expect(reparsed[0]?.rootComments).toEqual(["Intro nested  breakout"]);
+    expect(reparsed[0]?.rootMoves).toHaveLength(1);
+    expect(reparsed[0]?.rootMoves[0]?.san).toBe("e4");
+    expect(reparsed[0]?.rootMoves[0]?.comments).toEqual(["Move  1. d4  injected"]);
+    expect(reparsed[0]?.rootMoves[0]?.children).toEqual([]);
+  });
 });
 

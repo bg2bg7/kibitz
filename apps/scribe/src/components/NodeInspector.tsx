@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
 import {
   DEFAULT_GAP_MS,
   DEFAULT_RETURN_PAUSE_MS,
   DEFAULT_SILENT_DURATION_MS,
   formatPgnaSeconds,
+  isValidSubtitleLang,
   type BoardOrientation,
   type ClipDefinition,
   type CompilationOptions,
@@ -28,6 +29,7 @@ export type InspectorTab = "move" | "audio" | "guess" | "study";
 
 export interface NodeInspectorProps {
   node: IndexedStudyNode;
+  gameOrientation: BoardOrientation;
   studyIndex: StudyIndex;
   manifest: PgnaManifest;
   timeline: PgnaTimeline;
@@ -64,6 +66,7 @@ const NAG_BUTTONS = [
 
 export function NodeInspector({
   node,
+  gameOrientation,
   studyIndex,
   manifest,
   timeline,
@@ -85,12 +88,19 @@ export function NodeInspector({
 }: NodeInspectorProps) {
   const [activeTab, setActiveTab] = useState<InspectorTab>("move");
 
-  // Audio recording state
+  // Audio recording state (bound to the node where recording started)
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingNodeId, setRecordingNodeId] = useState<NodeId | null>(null);
   const [recordMs, setRecordMs] = useState(0);
   const [micLevel, setMicLevel] = useState(0);
   const [audioError, setAudioError] = useState<string | null>(null);
   const recorderRef = useRef<ActiveRecordingSession | null>(null);
+  const recordingTargetRef = useRef<{
+    nodeId: NodeId;
+    san: string | null;
+    attachedClipId: string | null;
+    attachedSubtitles?: Record<string, string>;
+  } | null>(null);
   const recordTimerRef = useRef<number | null>(null);
 
   // Audio audition state
@@ -100,9 +110,27 @@ export function NodeInspector({
   const auditionUrlRef = useRef<string | null>(null);
   const auditionRafRef = useRef<number | null>(null);
 
-  // Cue & subtitle inputs
+  // Cue & subtitle inputs (synced when manifest.defaultSubtitleLang changes across drafts)
   const [newCueOffsetSec, setNewCueOffsetSec] = useState("1.0");
-  const [subLang, setSubLang] = useState(manifest.defaultSubtitleLang || "en");
+  const defaultSubLang = manifest.defaultSubtitleLang || "en";
+  const [subLangDraft, setSubLangDraft] = useState<{ base: string; value: string }>({
+    base: defaultSubLang,
+    value: defaultSubLang,
+  });
+  const subLangInput = subLangDraft.base === defaultSubLang ? subLangDraft.value : defaultSubLang;
+  const trimmedSubLang = subLangInput.trim();
+  const isSubLangValid = isValidSubtitleLang(trimmedSubLang);
+
+  const [defaultLangDraft, setDefaultLangDraft] = useState<{ base: string; value: string }>({
+    base: manifest.defaultSubtitleLang ?? "",
+    value: manifest.defaultSubtitleLang ?? "",
+  });
+  const displayedDefaultLang =
+    defaultLangDraft.base === (manifest.defaultSubtitleLang ?? "")
+      ? defaultLangDraft.value
+      : (manifest.defaultSubtitleLang ?? "");
+  const isDefaultLangValid =
+    displayedDefaultLang.trim() === "" || isValidSubtitleLang(displayedDefaultLang.trim());
 
   // Raw PGN draft state synced on explicit user focus/edit
   const [rawPgnDraft, setRawPgnDraft] = useState<{ base: string; value: string }>({
@@ -125,14 +153,15 @@ export function NodeInspector({
     includeUnscheduledAudio: manifest.compilation?.includeUnscheduledAudio ?? false,
   };
 
-  // Stop auditioning on unmount or node change
-  const stopAudition = () => {
+  // Stop auditioning helper
+  const stopAudition = useCallback(() => {
     if (auditionRafRef.current !== null) {
       cancelAnimationFrame(auditionRafRef.current);
       auditionRafRef.current = null;
     }
     if (auditionAudioRef.current) {
       auditionAudioRef.current.pause();
+      auditionAudioRef.current.src = "";
       auditionAudioRef.current = null;
     }
     if (auditionUrlRef.current) {
@@ -140,26 +169,41 @@ export function NodeInspector({
       auditionUrlRef.current = null;
     }
     setIsAuditioning(false);
-  };
+  }, []);
 
+  // Stop auditioning whenever the selected node changes
+  useEffect(() => {
+    return () => {
+      stopAudition();
+    };
+  }, [node.nodeId, stopAudition]);
+
+  // Cleanup active recording on unmount
   useEffect(() => {
     return () => {
       if (recordTimerRef.current !== null) {
         clearInterval(recordTimerRef.current);
       }
       recorderRef.current?.cancel();
-      stopAudition();
     };
   }, []);
 
   const handleStartRecording = async () => {
     setAudioError(null);
     stopAudition();
+    const target = {
+      nodeId: node.nodeId,
+      san: node.san,
+      attachedClipId,
+      attachedSubtitles: attachedClip?.subtitles ? { ...attachedClip.subtitles } : undefined,
+    };
     try {
       const session = await startMicRecording();
       recorderRef.current = session;
+      recordingTargetRef.current = target;
       const started = Date.now();
       setIsRecording(true);
+      setRecordingNodeId(target.nodeId);
       setRecordMs(0);
       recordTimerRef.current = window.setInterval(() => {
         setRecordMs(Date.now() - started);
@@ -177,13 +221,21 @@ export function NodeInspector({
       recordTimerRef.current = null;
     }
     const session = recorderRef.current;
+    const target = recordingTargetRef.current ?? {
+      nodeId: node.nodeId,
+      san: node.san,
+      attachedClipId,
+      attachedSubtitles: attachedClip?.subtitles ? { ...attachedClip.subtitles } : undefined,
+    };
     recorderRef.current = null;
+    recordingTargetRef.current = null;
     setIsRecording(false);
+    setRecordingNodeId(null);
     setMicLevel(0);
 
     try {
       const result = await session.stop();
-      const clipId = attachedClipId ?? generateClipId(Object.keys(manifest.clips));
+      const clipId = target.attachedClipId ?? generateClipId(Object.keys(manifest.clips));
       const clipPath = `audio/${clipId}.${result.extension}`;
       const clipDef: ClipDefinition = {
         id: clipId,
@@ -192,10 +244,10 @@ export function NodeInspector({
         durationMs: result.durationMs,
         trimStartMs: 0,
         trimEndMs: result.durationMs,
-        label: node.san ? `Narration for ${node.san}` : `Intro (${node.nodeId})`,
-        ...(attachedClip?.subtitles ? { subtitles: attachedClip.subtitles } : {}),
+        label: target.san ? `Narration for ${target.san}` : `Intro (${target.nodeId})`,
+        ...(target.attachedSubtitles ? { subtitles: target.attachedSubtitles } : {}),
       };
-      onAttachAudioClip(node.nodeId, clipDef, result.bytes, result.peaks);
+      onAttachAudioClip(target.nodeId, clipDef, result.bytes, result.peaks);
     } catch (err) {
       setAudioError(err instanceof Error ? err.message : "Failed to save recording.");
     }
@@ -208,7 +260,9 @@ export function NodeInspector({
     }
     recorderRef.current?.cancel();
     recorderRef.current = null;
+    recordingTargetRef.current = null;
     setIsRecording(false);
+    setRecordingNodeId(null);
     setMicLevel(0);
     setRecordMs(0);
   };
@@ -219,13 +273,16 @@ export function NodeInspector({
     if (!file) return;
     setAudioError(null);
     stopAudition();
+    const targetNodeId = node.nodeId;
+    const targetClipId = attachedClipId;
+    const targetSubtitles = attachedClip?.subtitles ? { ...attachedClip.subtitles } : undefined;
     try {
       const buf = await file.arrayBuffer();
       const bytes = new Uint8Array(buf);
       const mimeType = file.type || "audio/ogg";
       const ext = guessAudioExtension(mimeType, file.name);
       const meta = await decodeAudioMetadata(bytes, 3000);
-      const clipId = attachedClipId ?? generateClipId(Object.keys(manifest.clips));
+      const clipId = targetClipId ?? generateClipId(Object.keys(manifest.clips));
       const clipPath = `audio/${clipId}.${ext}`;
       const clipDef: ClipDefinition = {
         id: clipId,
@@ -235,9 +292,9 @@ export function NodeInspector({
         trimStartMs: 0,
         trimEndMs: meta.durationMs,
         label: file.name,
-        ...(attachedClip?.subtitles ? { subtitles: attachedClip.subtitles } : {}),
+        ...(targetSubtitles ? { subtitles: targetSubtitles } : {}),
       };
-      onAttachAudioClip(node.nodeId, clipDef, bytes, meta.peaks);
+      onAttachAudioClip(targetNodeId, clipDef, bytes, meta.peaks);
     } catch (err) {
       setAudioError(err instanceof Error ? err.message : "Failed to import audio file.");
     }
@@ -267,29 +324,48 @@ export function NodeInspector({
 
     const trimStart = attachedClip.trimStartMs ?? 0;
     const trimEnd = attachedClip.trimEndMs ?? attachedClip.durationMs;
-    audio.currentTime = trimStart / 1000;
 
     const tick = () => {
-      if (!auditionAudioRef.current) return;
-      const nowMs = Math.round(auditionAudioRef.current.currentTime * 1000);
+      if (auditionAudioRef.current !== audio) return;
+      const nowMs = Math.round(audio.currentTime * 1000);
       setAuditionTimeMs(nowMs);
-      if (nowMs >= trimEnd || auditionAudioRef.current.ended) {
+      if (nowMs >= trimEnd || audio.ended) {
         stopAudition();
         return;
       }
       auditionRafRef.current = requestAnimationFrame(tick);
     };
 
-    audio
-      .play()
-      .then(() => {
-        setIsAuditioning(true);
-        auditionRafRef.current = requestAnimationFrame(tick);
-      })
-      .catch(() => {
-        stopAudition();
-        setAudioError("Browser blocked audio playback or format is unsupported.");
-      });
+    const startPlayback = () => {
+      if (auditionAudioRef.current !== audio) return;
+      if (trimStart > 0) {
+        try {
+          audio.currentTime = trimStart / 1000;
+        } catch {
+          // ignore unseekable stream
+        }
+      }
+      audio
+        .play()
+        .then(() => {
+          if (auditionAudioRef.current !== audio) return;
+          setIsAuditioning(true);
+          auditionRafRef.current = requestAnimationFrame(tick);
+        })
+        .catch(() => {
+          if (auditionAudioRef.current === audio) {
+            stopAudition();
+            setAudioError("Browser blocked audio playback or format is unsupported.");
+          }
+        });
+    };
+
+    if (trimStart > 0 && audio.readyState < 1) {
+      audio.addEventListener("loadedmetadata", startPlayback, { once: true });
+      audio.load();
+    } else {
+      startPlayback();
+    }
   };
 
   const handleCaptureCue = (clearOnly = false) => {
@@ -321,9 +397,9 @@ export function NodeInspector({
   const handleImportVtt = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = "";
-    if (!file || !attachedClip) return;
+    if (!file || !attachedClip || !isSubLangValid) return;
     const text = await file.text();
-    onUpdateSubtitle(attachedClip.id, subLang, text);
+    onUpdateSubtitle(attachedClip.id, trimmedSubLang, text);
   };
 
   // Determine which [%at] tags are primary vs silent revisit using sorted value order
@@ -331,7 +407,7 @@ export function NodeInspector({
     .map((at, originalIndex) => ({ at, originalIndex }))
     .sort((a, b) => a.at.value - b.at.value || a.originalIndex - b.originalIndex);
 
-  const subPath = attachedClip?.subtitles?.[subLang];
+  const subPath = isSubLangValid ? attachedClip?.subtitles?.[trimmedSubLang] : undefined;
   const currentVtt = subPath ? (subtitlesByPath[subPath] ?? "") : "";
   const guessSpec = timeline.guesses?.[node.nodeId];
 
@@ -428,16 +504,29 @@ export function NodeInspector({
                   }}
                   className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs"
                 >
-                  <option value="">Inherit game ({node.orientation})</option>
+                  <option value="">Inherit game ({gameOrientation})</option>
                   <option value="white">White</option>
                   <option value="black">Black</option>
                 </select>
               </label>
 
               <label className="block">
-                <span className="font-medium text-slate-700">
-                  No-Audio Move Duration ([%dur] ms)
-                </span>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-medium text-slate-700">
+                    No-Audio Move Duration ([%dur] ms)
+                  </span>
+                  {attachedClip && node.tags.durMs !== null ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onUpdateNodeTags(node.nodeId, (prev) => ({ ...prev, durMs: null }))
+                      }
+                      className="text-[11px] font-medium text-amber-700 hover:underline"
+                    >
+                      Clear ignored [%dur]
+                    </button>
+                  ) : null}
+                </div>
                 <input
                   type="number"
                   min={100}
@@ -619,7 +708,9 @@ export function NodeInspector({
               {isRecording ? (
                 <div className="mt-3 flex items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 py-2">
                   <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-red-600" />
-                  <span className="font-semibold text-red-800">Recording…</span>
+                  <span className="font-semibold text-red-800">
+                    Recording{recordingNodeId ? ` (${recordingNodeId})` : ""}…
+                  </span>
                   <div className="h-2 flex-1 overflow-hidden rounded-full bg-red-200">
                     <div
                       className="h-full bg-red-600 transition-all"
@@ -664,70 +755,102 @@ export function NodeInspector({
                   </div>
 
                   {/* Waveform Preview with Trim Region */}
-                  <div className="relative flex h-12 items-end gap-0.5 overflow-hidden rounded bg-slate-100 px-1 py-1">
-                    {(
-                      waveformPeaksByClipId[attachedClip.id] ??
-                      Array.from({ length: 48 }, (_, i) => 0.25 + ((i * 7) % 10) * 0.06)
-                    ).map((peak, idx, arr) => {
-                      const ratio = idx / arr.length;
-                      const startRatio = (attachedClip.trimStartMs ?? 0) / attachedClip.durationMs;
-                      const endRatio =
-                        (attachedClip.trimEndMs ?? attachedClip.durationMs) / attachedClip.durationMs;
-                      const inTrim = ratio >= startRatio && ratio <= endRatio;
-                      return (
-                        <div
-                          key={idx}
-                          className={`flex-1 rounded-t-xs ${inTrim ? "bg-sky-600" : "bg-slate-300"}`}
-                          style={{ height: `${Math.max(12, Math.round(peak * 100))}%` }}
-                        />
-                      );
-                    })}
-                  </div>
+                  {(() => {
+                    const safeDurationMs = Math.max(1, attachedClip.durationMs);
+                    const safeTrimStart = Math.max(
+                      0,
+                      Math.min(attachedClip.trimStartMs ?? 0, safeDurationMs - 1),
+                    );
+                    const safeTrimEnd = Math.max(
+                      safeTrimStart + 1,
+                      Math.min(attachedClip.trimEndMs ?? safeDurationMs, safeDurationMs),
+                    );
+                    const minGap = Math.max(1, Math.min(100, Math.floor(safeDurationMs / 2)));
+                    const trimStep = safeDurationMs < 200 ? 1 : 50;
+                    const maxStart = Math.max(0, safeTrimEnd - minGap);
+                    const minEnd = Math.min(safeDurationMs, safeTrimStart + minGap);
 
-                  {/* Non-destructive trim sliders */}
-                  <div className="grid grid-cols-2 gap-3 text-[11px]">
-                    <label className="block">
-                      <span className="font-medium text-slate-700">
-                        Trim Start ({attachedClip.trimStartMs ?? 0} ms)
-                      </span>
-                      <input
-                        type="range"
-                        min={0}
-                        max={Math.max(0, (attachedClip.trimEndMs ?? attachedClip.durationMs) - 100)}
-                        step={50}
-                        value={attachedClip.trimStartMs ?? 0}
-                        onChange={(e) => {
-                          const nextStart = Number(e.target.value);
-                          onUpdateClip(attachedClip.id, (prev) => ({
-                            ...prev,
-                            trimStartMs: nextStart,
-                          }));
-                        }}
-                        className="mt-1 w-full accent-sky-600"
-                      />
-                    </label>
-                    <label className="block">
-                      <span className="font-medium text-slate-700">
-                        Trim End ({attachedClip.trimEndMs ?? attachedClip.durationMs} /{" "}
-                        {attachedClip.durationMs} ms)
-                      </span>
-                      <input
-                        type="range"
-                        min={(attachedClip.trimStartMs ?? 0) + 100}
-                        max={attachedClip.durationMs}
-                        step={50}
-                        value={attachedClip.trimEndMs ?? attachedClip.durationMs}
-                        onChange={(e) => {
-                          const nextEnd = Number(e.target.value);
-                          onUpdateClip(attachedClip.id, (prev) => ({
-                            ...prev,
-                            trimEndMs: nextEnd,
-                          }));
-                        }}
-                        className="mt-1 w-full accent-sky-600"
-                      />
-                    </label>
-                  </div>
+                    return (
+                      <>
+                        <div className="relative flex h-12 items-end gap-0.5 overflow-hidden rounded bg-slate-100 px-1 py-1">
+                          {(
+                            waveformPeaksByClipId[attachedClip.id] ??
+                            Array.from({ length: 48 }, (_, i) => 0.25 + ((i * 7) % 10) * 0.06)
+                          ).map((peak, idx, arr) => {
+                            const ratio = idx / arr.length;
+                            const startRatio = safeTrimStart / safeDurationMs;
+                            const endRatio = safeTrimEnd / safeDurationMs;
+                            const inTrim = ratio >= startRatio && ratio <= endRatio;
+                            return (
+                              <div
+                                key={idx}
+                                className={`flex-1 rounded-t-xs ${inTrim ? "bg-sky-600" : "bg-slate-300"}`}
+                                style={{ height: `${Math.max(12, Math.round(peak * 100))}%` }}
+                              />
+                            );
+                          })}
+                        </div>
+
+                        {/* Non-destructive trim sliders */}
+                        <div className="grid grid-cols-2 gap-3 text-[11px]">
+                          <label className="block">
+                            <span className="font-medium text-slate-700">
+                              Trim Start ({safeTrimStart} ms)
+                            </span>
+                            <input
+                              type="range"
+                              min={0}
+                              max={maxStart}
+                              step={trimStep}
+                              value={safeTrimStart}
+                              onChange={(e) => {
+                                const raw = Number(e.target.value);
+                                if (!Number.isFinite(raw)) return;
+                                onUpdateClip(attachedClip.id, (prev) => {
+                                  const dur = Math.max(1, prev.durationMs);
+                                  const curEnd = Math.min(dur, prev.trimEndMs ?? dur);
+                                  const gap = Math.max(1, Math.min(100, Math.floor(dur / 2)));
+                                  const clamped = Math.max(
+                                    0,
+                                    Math.min(Math.round(raw), Math.max(0, curEnd - gap)),
+                                  );
+                                  return { ...prev, trimStartMs: clamped };
+                                });
+                              }}
+                              className="mt-1 w-full accent-sky-600"
+                            />
+                          </label>
+                          <label className="block">
+                            <span className="font-medium text-slate-700">
+                              Trim End ({safeTrimEnd} / {attachedClip.durationMs} ms)
+                            </span>
+                            <input
+                              type="range"
+                              min={minEnd}
+                              max={safeDurationMs}
+                              step={trimStep}
+                              value={safeTrimEnd}
+                              onChange={(e) => {
+                                const raw = Number(e.target.value);
+                                if (!Number.isFinite(raw)) return;
+                                onUpdateClip(attachedClip.id, (prev) => {
+                                  const dur = Math.max(1, prev.durationMs);
+                                  const curStart = Math.max(0, prev.trimStartMs ?? 0);
+                                  const gap = Math.max(1, Math.min(100, Math.floor(dur / 2)));
+                                  const clamped = Math.min(
+                                    dur,
+                                    Math.max(Math.round(raw), Math.min(dur, curStart + gap)),
+                                  );
+                                  return { ...prev, trimEndMs: clamped };
+                                });
+                              }}
+                              className="mt-1 w-full accent-sky-600"
+                            />
+                          </label>
+                        </div>
+                      </>
+                    );
+                  })()}
                 </div>
               ) : (
                 <p className="mt-2 text-[11px] text-slate-400">
@@ -831,9 +954,15 @@ export function NodeInspector({
                     <input
                       type="text"
                       aria-label="Subtitle language code"
-                      value={subLang}
-                      onChange={(e) => setSubLang(e.target.value.trim() || "en")}
-                      className="w-14 rounded border border-slate-300 px-2 py-0.5 text-center text-xs"
+                      value={subLangInput}
+                      onChange={(e) =>
+                        setSubLangDraft({ base: defaultSubLang, value: e.target.value })
+                      }
+                      className={`w-16 rounded border px-2 py-0.5 text-center text-xs ${
+                        isSubLangValid
+                          ? "border-slate-300"
+                          : "border-red-400 bg-red-50 text-red-700"
+                      }`}
                     />
                     <input
                       ref={vttInputRef}
@@ -844,19 +973,31 @@ export function NodeInspector({
                     />
                     <button
                       type="button"
+                      disabled={!isSubLangValid}
                       onClick={() => vttInputRef.current?.click()}
-                      className="rounded border border-slate-200 px-2 py-0.5 text-[11px] hover:bg-slate-50"
+                      className="rounded border border-slate-200 px-2 py-0.5 text-[11px] hover:bg-slate-50 disabled:opacity-40"
                     >
                       Import .vtt
                     </button>
                   </div>
                 </div>
+                {!isSubLangValid ? (
+                  <p className="mt-1.5 text-[11px] text-red-600">
+                    Enter a valid BCP 47 language code (e.g. &ldquo;en&rdquo;, &ldquo;es&rdquo;,
+                    &ldquo;zh-Hans&rdquo;).
+                  </p>
+                ) : null}
                 <textarea
                   rows={4}
+                  disabled={!isSubLangValid}
                   value={currentVtt}
-                  onChange={(e) => onUpdateSubtitle(attachedClip.id, subLang, e.target.value)}
+                  onChange={(e) => {
+                    if (isSubLangValid) {
+                      onUpdateSubtitle(attachedClip.id, trimmedSubLang, e.target.value);
+                    }
+                  }}
                   placeholder={"WEBVTT\n\n00:00.000 --> 00:02.500\nNotice how the bishop eyes f7."}
-                  className="mt-2 w-full rounded-md border border-slate-300 p-2 font-mono text-[11px] focus:border-sky-500 focus:outline-none"
+                  className="mt-2 w-full rounded-md border border-slate-300 p-2 font-mono text-[11px] focus:border-sky-500 focus:outline-none disabled:bg-slate-100"
                 />
               </div>
             ) : null}
@@ -993,12 +1134,36 @@ export function NodeInspector({
                 <span className="font-medium text-slate-700">Default Subtitle Lang</span>
                 <input
                   type="text"
-                  value={manifest.defaultSubtitleLang ?? "en"}
-                  onChange={(e) =>
-                    onUpdateManifest((prev) => ({ ...prev, defaultSubtitleLang: e.target.value }))
-                  }
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-xs"
+                  value={displayedDefaultLang}
+                  onChange={(e) => {
+                    const nextVal = e.target.value;
+                    setDefaultLangDraft({
+                      base: manifest.defaultSubtitleLang ?? "",
+                      value: nextVal,
+                    });
+                    const trimmed = nextVal.trim();
+                    if (trimmed === "") {
+                      onUpdateManifest((prev) => {
+                        const next = { ...prev };
+                        delete next.defaultSubtitleLang;
+                        return next;
+                      });
+                    } else if (isValidSubtitleLang(trimmed)) {
+                      onUpdateManifest((prev) => ({ ...prev, defaultSubtitleLang: trimmed }));
+                    }
+                  }}
+                  placeholder="en"
+                  className={`mt-1 w-full rounded-md border px-2.5 py-1.5 text-xs ${
+                    isDefaultLangValid
+                      ? "border-slate-300"
+                      : "border-red-400 bg-red-50 text-red-700"
+                  }`}
                 />
+                {!isDefaultLangValid ? (
+                  <span className="mt-0.5 block text-[10px] text-red-600">
+                    Must be a valid BCP 47 tag (e.g. en, es, zh-Hans).
+                  </span>
+                ) : null}
               </label>
             </div>
 

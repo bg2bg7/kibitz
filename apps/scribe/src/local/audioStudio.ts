@@ -69,28 +69,31 @@ export function generateClipId(existingIds: Iterable<string>): string {
   return `clip-${Date.now().toString(36)}`;
 }
 
-/**
- * Decodes raw audio bytes via Web Audio API to extract authoritative `durationMs` and
- * a downsampled peak array (0..1) for waveform display.
- */
-export async function decodeAudioMetadata(
+function getAudioContextCtor(): typeof AudioContext | undefined {
+  return typeof AudioContext !== "undefined"
+    ? AudioContext
+    : (globalThis as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+}
+
+function makeFallbackMetadata(
+  fallbackDurationMs: number,
+  bucketCount: number,
+): { durationMs: number; peaks: number[] } {
+  return {
+    durationMs: Math.max(100, Math.round(fallbackDurationMs)),
+    peaks: Array.from({ length: bucketCount }, () => 0.35),
+  };
+}
+
+async function decodeWithContext(
+  ctx: AudioContext | null,
   bytes: Uint8Array,
-  fallbackDurationMs = 2000,
-  bucketCount = 64,
+  fallbackDurationMs: number,
+  bucketCount: number,
 ): Promise<{ durationMs: number; peaks: number[] }> {
-  const AudioCtx =
-    typeof AudioContext !== "undefined"
-      ? AudioContext
-      : (globalThis as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-
-  if (!AudioCtx) {
-    return {
-      durationMs: Math.max(100, Math.round(fallbackDurationMs)),
-      peaks: Array.from({ length: bucketCount }, () => 0.35),
-    };
+  if (!ctx) {
+    return makeFallbackMetadata(fallbackDurationMs, bucketCount);
   }
-
-  const ctx = new AudioCtx();
   try {
     const copy = new ArrayBuffer(bytes.byteLength);
     new Uint8Array(copy).set(bytes);
@@ -111,12 +114,74 @@ export async function decodeAudioMetadata(
     }
     return { durationMs, peaks };
   } catch {
-    return {
-      durationMs: Math.max(100, Math.round(fallbackDurationMs)),
-      peaks: Array.from({ length: bucketCount }, () => 0.35),
-    };
+    return makeFallbackMetadata(fallbackDurationMs, bucketCount);
+  }
+}
+
+/**
+ * Decodes raw audio bytes via Web Audio API to extract authoritative `durationMs` and
+ * a downsampled peak array (0..1) for waveform display.
+ */
+export async function decodeAudioMetadata(
+  bytes: Uint8Array,
+  fallbackDurationMs = 2000,
+  bucketCount = 64,
+): Promise<{ durationMs: number; peaks: number[] }> {
+  const AudioCtx = getAudioContextCtor();
+  if (!AudioCtx) {
+    return makeFallbackMetadata(fallbackDurationMs, bucketCount);
+  }
+
+  let ctx: AudioContext | null = null;
+  try {
+    ctx = new AudioCtx();
+    return await decodeWithContext(ctx, bytes, fallbackDurationMs, bucketCount);
+  } catch {
+    return makeFallbackMetadata(fallbackDurationMs, bucketCount);
   } finally {
-    void ctx.close().catch(() => undefined);
+    if (ctx) {
+      void ctx.close().catch(() => undefined);
+    }
+  }
+}
+
+/**
+ * Decodes a batch of audio clips reusing a single Web Audio `AudioContext` so opening
+ * multi-clip drafts/archives does not exhaust browser AudioContext limits.
+ */
+export async function decodeAudioMetadataBatch(
+  items: ReadonlyArray<{ id: string; bytes: Uint8Array; fallbackDurationMs?: number }>,
+  bucketCount = 64,
+): Promise<Record<string, { durationMs: number; peaks: number[] }>> {
+  const results: Record<string, { durationMs: number; peaks: number[] }> = {};
+  if (items.length === 0) {
+    return results;
+  }
+
+  const AudioCtx = getAudioContextCtor();
+  let ctx: AudioContext | null = null;
+  if (AudioCtx) {
+    try {
+      ctx = new AudioCtx();
+    } catch {
+      ctx = null;
+    }
+  }
+
+  try {
+    for (const item of items) {
+      results[item.id] = await decodeWithContext(
+        ctx,
+        item.bytes,
+        item.fallbackDurationMs ?? 2000,
+        bucketCount,
+      );
+    }
+    return results;
+  } finally {
+    if (ctx) {
+      void ctx.close().catch(() => undefined);
+    }
   }
 }
 
@@ -133,30 +198,13 @@ export async function startMicRecording(): Promise<ActiveRecordingSession> {
 
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   const chosenMime = pickSupportedRecordingMimeType();
-  const recorder = chosenMime
-    ? new MediaRecorder(stream, { mimeType: chosenMime })
-    : new MediaRecorder(stream);
 
   const chunks: Blob[] = [];
-  const startedAt = Date.now();
+  let startedAt = Date.now();
 
   let analyser: AnalyserNode | null = null;
   let audioCtx: AudioContext | null = null;
   let dataArray: Uint8Array<ArrayBuffer> | null = null;
-
-  if (typeof AudioContext !== "undefined") {
-    try {
-      audioCtx = new AudioContext();
-      const source = audioCtx.createMediaStreamSource(stream);
-      analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      dataArray = new Uint8Array(analyser.frequencyBinCount);
-    } catch {
-      audioCtx = null;
-      analyser = null;
-    }
-  }
 
   const cleanup = () => {
     for (const track of stream.getTracks()) {
@@ -168,13 +216,62 @@ export async function startMicRecording(): Promise<ActiveRecordingSession> {
     }
   };
 
-  recorder.ondataavailable = (ev) => {
-    if (ev.data.size > 0) {
-      chunks.push(ev.data);
-    }
-  };
+  let recorder: MediaRecorder;
+  try {
+    recorder = chosenMime
+      ? new MediaRecorder(stream, { mimeType: chosenMime })
+      : new MediaRecorder(stream);
 
-  recorder.start(100);
+    const AudioCtx = getAudioContextCtor();
+    if (AudioCtx) {
+      try {
+        audioCtx = new AudioCtx();
+        const source = audioCtx.createMediaStreamSource(stream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        dataArray = new Uint8Array(analyser.frequencyBinCount);
+      } catch {
+        if (audioCtx) {
+          void audioCtx.close().catch(() => undefined);
+        }
+        audioCtx = null;
+        analyser = null;
+      }
+    }
+
+    recorder.ondataavailable = (ev) => {
+      if (ev.data.size > 0) {
+        chunks.push(ev.data);
+      }
+    };
+
+    startedAt = Date.now();
+    recorder.start(100);
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
+
+  const finalizeRecording = async (): Promise<RecordedAudioResult> => {
+    const elapsedMs = Math.max(200, Date.now() - startedAt);
+    const finalMime = recorder.mimeType || chosenMime || "audio/webm";
+    const blob = new Blob(chunks, { type: finalMime });
+    cleanup();
+    const buf = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    if (bytes.byteLength === 0) {
+      throw new Error("Recorded audio was empty.");
+    }
+    const meta = await decodeAudioMetadata(bytes, elapsedMs);
+    return {
+      bytes,
+      mimeType: finalMime,
+      extension: guessAudioExtension(finalMime),
+      durationMs: meta.durationMs,
+      peaks: meta.peaks,
+    };
+  };
 
   return {
     getLevel(): number {
@@ -196,33 +293,23 @@ export async function startMicRecording(): Promise<ActiveRecordingSession> {
     },
 
     stop(): Promise<RecordedAudioResult> {
+      if (recorder.state === "inactive") {
+        return finalizeRecording();
+      }
+
       return new Promise((resolve, reject) => {
         recorder.onstop = () => {
-          const elapsedMs = Math.max(200, Date.now() - startedAt);
-          const finalMime = recorder.mimeType || chosenMime || "audio/webm";
-          const blob = new Blob(chunks, { type: finalMime });
-          cleanup();
-          blob
-            .arrayBuffer()
-            .then(async (buf) => {
-              const bytes = new Uint8Array(buf);
-              const meta = await decodeAudioMetadata(bytes, elapsedMs);
-              resolve({
-                bytes,
-                mimeType: finalMime,
-                extension: guessAudioExtension(finalMime),
-                durationMs: meta.durationMs,
-                peaks: meta.peaks,
-              });
-            })
-            .catch(reject);
+          finalizeRecording().then(resolve, reject);
         };
         recorder.onerror = () => {
           cleanup();
           reject(new Error("Audio recording failed."));
         };
-        if (recorder.state !== "inactive") {
+        try {
           recorder.stop();
+        } catch (err) {
+          cleanup();
+          reject(err instanceof Error ? err : new Error("Audio recording failed."));
         }
       });
     },

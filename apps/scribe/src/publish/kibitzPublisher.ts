@@ -21,6 +21,63 @@ export interface PublishToKibitzResult {
   message: string;
 }
 
+const LOCAL_DEV_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+
+export type KibitzApiUrlValidationResult =
+  | { ok: true; normalizedUrl: string }
+  | { ok: false; error: string };
+
+/**
+ * Validates that the Kibitz API base URL is safe to transmit credentials and archives to:
+ * - Rejects malformed URLs and embedded credentials (`user:pass@host`).
+ * - Allows `https:` for any host.
+ * - Allows `http:` ONLY for local loopback dev hosts (`localhost`, `127.0.0.1`, `[::1]`, `::1`).
+ * - Rejects all other schemes (`javascript:`, `file:`, remote cleartext `http://`, etc.).
+ */
+export function validateKibitzApiBaseUrl(rawUrl: string): KibitzApiUrlValidationResult {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    return { ok: false, error: "Kibitz API Base URL is required." };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { ok: false, error: `Invalid Kibitz API Base URL: "${trimmed}".` };
+  }
+
+  if (parsed.username || parsed.password) {
+    return {
+      ok: false,
+      error: "Kibitz API Base URL must not include embedded credentials (username/password).",
+    };
+  }
+
+  if (parsed.protocol === "https:") {
+    const normalizedPath = parsed.pathname.replace(/\/+$/, "");
+    return { ok: true, normalizedUrl: `${parsed.origin}${normalizedPath}` };
+  }
+
+  if (parsed.protocol === "http:") {
+    const host = parsed.hostname.toLowerCase();
+    if (!LOCAL_DEV_HOSTS.has(host)) {
+      return {
+        ok: false,
+        error:
+          "Remote Kibitz API Base URLs must use https:// (cleartext http:// is only permitted for localhost/loopback).",
+      };
+    }
+    const normalizedPath = parsed.pathname.replace(/\/+$/, "");
+    return { ok: true, normalizedUrl: `${parsed.origin}${normalizedPath}` };
+  }
+
+  return {
+    ok: false,
+    error: `Unsupported URL scheme "${parsed.protocol}". Only https:// (or local http://) is allowed.`,
+  };
+}
+
 /**
  * Isolated optional publishing module for apps/scribe.
  * ESLint boundary rules permit @suite/auth-core imports ONLY inside apps/scribe/src/publish/**.
@@ -28,6 +85,14 @@ export interface PublishToKibitzResult {
 export async function publishArchiveToKibitz(
   request: PublishToKibitzRequest,
 ): Promise<PublishToKibitzResult> {
+  const urlCheck = validateKibitzApiBaseUrl(request.kibitzApiBaseUrl);
+  if (!urlCheck.ok) {
+    return {
+      published: false,
+      message: urlCheck.error,
+    };
+  }
+
   if (request.session.role !== "coach" && request.session.role !== "admin") {
     return {
       published: false,
@@ -44,7 +109,7 @@ export async function publishArchiveToKibitz(
     };
   }
 
-  const endpoint = `${request.kibitzApiBaseUrl.replace(/\/+$/, "")}/api/studies`;
+  const endpoint = `${urlCheck.normalizedUrl}/api/studies`;
   const form = new FormData();
   const safeCopy = new Uint8Array(request.archiveBytes.byteLength);
   safeCopy.set(request.archiveBytes);
