@@ -12,7 +12,7 @@ Licensed under the **GNU Affero General Public License v3.0 (`AGPL-3.0-only`)**.
 
 - Node.js `>= 22`
 - `pnpm` (`>= 9`, pinned via `packageManager` in root `package.json`)
-- Docker & Docker Compose (for local PostgreSQL 16 + MinIO S3 storage)
+- Docker & Docker Compose (for local PostgreSQL 16 + RustFS S3-compatible storage)
 
 ### 1. Environment & Local Infrastructure
 
@@ -24,7 +24,7 @@ docker compose up -d
 This starts:
 
 - **PostgreSQL 16** on `localhost:5432` (`kibitz_suite`) — on first startup (empty volume), [`docker/postgres/init-db-and-admin.sh`](./docker/postgres/init-db-and-admin.sh) automatically applies all Drizzle migrations in `packages/db/drizzle/` and seeds the default `admin` account from `INITIAL_ADMIN_HANDLE` and `INITIAL_ADMIN_PASSWORD`.
-- **MinIO (S3-compatible `.pgna` storage)** on `localhost:9000` (Console: `http://localhost:9001`), auto-creating the `kibitz-pgna` bucket.
+- **RustFS (S3-compatible `.pgna` storage)** on `localhost:9000` (Console: `http://localhost:9001`), auto-creating the `kibitz-pgna` bucket.
 
 ### 2. Install Dependencies & Sync Database Migrations
 

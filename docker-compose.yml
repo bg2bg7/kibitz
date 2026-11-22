@@ -21,38 +21,46 @@ services:
       timeout: 5s
       retries: 10
 
-  minio:
-    image: minio/minio:latest
-    container_name: kibitz-minio
+  s3:
+    image: rustfs/rustfs:latest
+    container_name: kibitz-s3
     restart: unless-stopped
-    command: server /data --console-address ":9001"
+    command: ["/data"]
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-kibitz_minio_admin}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-kibitz_minio_dev_secret}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY_ID:-kibitz_s3_admin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:-kibitz_s3_dev_secret}
     ports:
       - "${S3_PORT:-9000}:9000"
       - "${S3_CONSOLE_PORT:-9001}:9001"
     volumes:
-      - kibitz_minio:/data
+      - kibitz_s3data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health/ready"]
       interval: 5s
       timeout: 5s
       retries: 10
 
-  minio-init:
-    image: minio/mc:latest
-    container_name: kibitz-minio-init
+  s3-init:
+    image: rustfs/rustfs:latest
+    container_name: kibitz-s3-init
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 ${S3_ACCESS_KEY_ID:-kibitz_minio_admin} ${S3_SECRET_ACCESS_KEY:-kibitz_minio_dev_secret};
-      mc mb --ignore-existing local/${S3_BUCKET:-kibitz-pgna};
-      exit 0;
-      "
+    environment:
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-kibitz_s3_admin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-kibitz_s3_dev_secret}
+      S3_BUCKET: ${S3_BUCKET:-kibitz-pgna}
+    entrypoint:
+      - /bin/sh
+      - -eu
+      - -c
+      - |
+        export RC_HOST_local="http://$${S3_ACCESS_KEY_ID}:$${S3_SECRET_ACCESS_KEY}@s3:9000"
+        /usr/bin/rc bucket create "local/$${S3_BUCKET}" --ignore-existing
 
 volumes:
   kibitz_pgdata:
-  kibitz_minio:
+  kibitz_s3data:
