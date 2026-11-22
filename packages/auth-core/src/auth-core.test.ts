@@ -3,7 +3,9 @@ import {
   canStudentReadStudy,
   computeEffectiveStudentAccess,
   evaluateDoubleBlindLinkTransition,
+  hashPassword,
   validateSessionPayload,
+  verifyPassword,
 } from "./index.js";
 
 describe("@suite/auth-core ACL & double-blind invariants", () => {
@@ -145,5 +147,13 @@ describe("@suite/auth-core ACL & double-blind invariants", () => {
     );
     expect(expired.valid).toBe(false);
     expect(expired.reason).toBe("expired");
+  });
+
+  it("hashes and verifies bcrypt passwords compatible with Postgres pgcrypto", async () => {
+    const hash = await hashPassword("correct-horse-battery-staple", 4);
+    expect(hash.startsWith("$2")).toBe(true);
+    expect(await verifyPassword("correct-horse-battery-staple", hash)).toBe(true);
+    expect(await verifyPassword("wrong-password", hash)).toBe(false);
+    expect(await verifyPassword("", hash)).toBe(false);
   });
 });

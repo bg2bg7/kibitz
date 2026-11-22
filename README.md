@@ -23,17 +23,14 @@ docker compose up -d
 
 This starts:
 
-- **PostgreSQL 16** on `localhost:5432` (`kibitz_suite`)
+- **PostgreSQL 16** on `localhost:5432` (`kibitz_suite`) — on first startup (empty volume), [`docker/postgres/init-db-and-admin.sh`](./docker/postgres/init-db-and-admin.sh) automatically applies all Drizzle migrations in `packages/db/drizzle/` and seeds the default `admin` account from `INITIAL_ADMIN_HANDLE` and `INITIAL_ADMIN_PASSWORD`.
 - **MinIO (S3-compatible `.pgna` storage)** on `localhost:9000` (Console: `http://localhost:9001`), auto-creating the `kibitz-pgna` bucket.
 
-### 2. Install Dependencies & Apply Database Schema
+### 2. Install Dependencies & Sync Database Migrations
 
 ```bash
 pnpm install
-pnpm db:push
-# Or generate & run versioned Drizzle SQL migrations:
-# pnpm db:generate
-# pnpm db:migrate
+pnpm db:migrate # Applies any newer Drizzle migrations added after initial volume creation
 ```
 
 ### 3. Run the Suite Locally

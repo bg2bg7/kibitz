@@ -8,3 +8,4 @@ coverage
 pnpm-lock.yaml
 LICENSE
 docs/PGNA-v1.0.md
+packages/db/drizzle

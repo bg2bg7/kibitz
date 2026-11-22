@@ -28,6 +28,3 @@ Thumbs.db
 # Coverage & test artifacts
 coverage/
 .vitest/
-
-# Drizzle local state
-drizzle/meta/

@@ -20,6 +20,10 @@
     "./jwt": {
       "types": "./dist/jwt.d.ts",
       "import": "./dist/jwt.js"
+    },
+    "./password": {
+      "types": "./dist/password.d.ts",
+      "import": "./dist/password.js"
     }
   },
   "files": [
@@ -32,6 +36,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "zod": "^4.6.7"
   },
   "devDependencies": {

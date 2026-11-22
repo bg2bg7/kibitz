@@ -7,10 +7,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-kibitz}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kibitz_dev_password}
       POSTGRES_DB: ${POSTGRES_DB:-kibitz_suite}
+      INITIAL_ADMIN_HANDLE: ${INITIAL_ADMIN_HANDLE:-admin}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-kibitz_dev_admin_password}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - kibitz_pgdata:/var/lib/postgresql/data
+      - ./packages/db/drizzle:/migrations:ro
+      - ./docker/postgres/init-db-and-admin.sh:/docker-entrypoint-initdb.d/01-init-db-and-admin.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kibitz} -d ${POSTGRES_DB:-kibitz_suite}"]
       interval: 5s
