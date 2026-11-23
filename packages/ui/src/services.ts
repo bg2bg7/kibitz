@@ -97,15 +97,27 @@ export const SUITE_SERVICES: readonly SuiteServiceInfo[] = [
     subdomain: "id",
     devPort: 5171,
     apiPort: 4001,
-    status: "coming-soon",
+    status: "available",
     privacyBadge: "Invite-Only · Double-Blind",
     envVar: "VITE_ID_URL",
   },
 ] as const;
 
+export type SuiteApiServiceId = "id" | "lecture" | "hall";
+
+const API_SERVICE_CONFIG: Record<SuiteApiServiceId, { port: number; envVar: string }> = {
+  id: { port: 4001, envVar: "VITE_ID_API_URL" },
+  lecture: { port: 4002, envVar: "VITE_LECTURE_API_URL" },
+  hall: { port: 4003, envVar: "VITE_HALL_API_URL" },
+};
+
 const KNOWN_SUBDOMAINS = new Set(["www", ...SUITE_SERVICES.map((service) => service.subdomain)]);
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const ALLOWED_DEV_PORTS = new Set([
+  String(KIBITZ_HOME_PORT),
+  ...SUITE_SERVICES.map((service) => String(service.devPort)),
+]);
 
 export interface ResolveServiceUrlOptions {
   env?: Record<string, string | undefined>;
@@ -134,8 +146,17 @@ function extractRootDomain(hostname: string): string {
   return hostname;
 }
 
+function resolveCurrentLocation(options: ResolveServiceUrlOptions) {
+  return (
+    options.location ??
+    (typeof window !== "undefined"
+      ? { protocol: window.location.protocol, hostname: window.location.hostname }
+      : undefined)
+  );
+}
+
 /**
- * Resolves the URL for a Kibitz suite service across local dev ports, production subdomains,
+ * Resolves the URL for a Kibitz suite web service across local dev ports, production subdomains,
  * and explicit `VITE_*_URL` environment overrides. SSR-safe.
  */
 export function resolveServiceUrl(
@@ -148,11 +169,7 @@ export function resolveServiceUrl(
     return override.replace(/\/+$/, "");
   }
 
-  const loc =
-    options.location ??
-    (typeof window !== "undefined"
-      ? { protocol: window.location.protocol, hostname: window.location.hostname }
-      : undefined);
+  const loc = resolveCurrentLocation(options);
 
   if (!loc || LOCAL_HOSTS.has(loc.hostname)) {
     const host = loc?.hostname ?? "localhost";
@@ -168,4 +185,83 @@ export function resolveServiceUrl(
   }
 
   return `${protocol}//${serviceId}.${rootDomain}`;
+}
+
+/**
+ * Resolves the backend API base URL for hybrid services (`id`, `lecture`, `hall`).
+ * Uses `VITE_*_API_URL` overrides first, localhost dev ports (`4001`–`4003`) locally,
+ * and `<service>.<rootDomain>` in production.
+ */
+export function resolveApiUrl(
+  serviceId: SuiteApiServiceId,
+  options: ResolveServiceUrlOptions = {},
+): string {
+  const cfg = API_SERVICE_CONFIG[serviceId];
+  const override = options.env?.[cfg.envVar]?.trim();
+  if (override) {
+    return override.replace(/\/+$/, "");
+  }
+
+  const loc = resolveCurrentLocation(options);
+
+  if (!loc || LOCAL_HOSTS.has(loc.hostname)) {
+    const host = loc?.hostname ?? "localhost";
+    const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+    return `http://${formattedHost}:${cfg.port}`;
+  }
+
+  const protocol = loc.protocol === "http:" ? "http:" : "https:";
+  const rootDomain = extractRootDomain(loc.hostname);
+  return `${protocol}//${serviceId}.${rootDomain}`;
+}
+
+/**
+ * Validates that a `returnTo` redirect URL points strictly to a Kibitz suite origin,
+ * preventing open redirects after login/registration.
+ */
+export function isAllowedSuiteUrl(
+  rawUrl: string | null | undefined,
+  options: ResolveServiceUrlOptions = {},
+): boolean {
+  if (!rawUrl) {
+    return false;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return false;
+  }
+
+  if (parsed.username || parsed.password) {
+    return false;
+  }
+
+  const targetHost = parsed.hostname.toLowerCase();
+  const loc = resolveCurrentLocation(options);
+
+  if (!loc || LOCAL_HOSTS.has(loc.hostname)) {
+    return LOCAL_HOSTS.has(targetHost) && ALLOWED_DEV_PORTS.has(parsed.port);
+  }
+
+  if (parsed.protocol !== "https:") {
+    return false;
+  }
+
+  const rootDomain = extractRootDomain(loc.hostname).toLowerCase();
+  if (targetHost === rootDomain) {
+    return true;
+  }
+
+  if (targetHost.endsWith(`.${rootDomain}`)) {
+    const sub = targetHost.slice(0, -(rootDomain.length + 1));
+    return KNOWN_SUBDOMAINS.has(sub);
+  }
+
+  return false;
 }

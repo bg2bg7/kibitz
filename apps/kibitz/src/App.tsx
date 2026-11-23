@@ -1,12 +1,13 @@
 import { KibitzLogo, SUITE_SERVICES, resolveServiceUrl, type SuiteServiceInfo } from "@suite/ui";
+import { AuthMenu } from "./components/AuthMenu";
 
 const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
 
 const SUITE_PILLARS = [
   {
     code: "01",
-    title: "Zero-PII Offline Tools",
-    body: "Arbiter and Seconds run 100% locally as offline PWAs. Rosters, pairings, and scoresheets never leave your device.",
+    title: "Zero-Upload Offline Tools",
+    body: "Arbiter and Seconds run offline as PWAs and may pull tournament data via Kibitz ID, while never uploading rosters or scoresheets.",
   },
   {
     code: "02",
@@ -22,6 +23,11 @@ const SUITE_PILLARS = [
 
 function ServiceCard({ service, href }: { service: SuiteServiceInfo; href: string }) {
   const isAvailable = service.status === "available";
+  const ctaLabel = isAvailable
+    ? service.id === "scribe"
+      ? "Launch Studio"
+      : "Open Service"
+    : "Open Page";
 
   return (
     <a
@@ -92,7 +98,7 @@ function ServiceCard({ service, href }: { service: SuiteServiceInfo; href: strin
             isAvailable ? "text-amber-300" : "text-slate-900"
           }`}
         >
-          {isAvailable ? "Launch Studio" : "Open Page"}
+          {ctaLabel}
           <span aria-hidden="true">→</span>
         </span>
       </div>
@@ -101,8 +107,9 @@ function ServiceCard({ service, href }: { service: SuiteServiceInfo; href: strin
 }
 
 export function App() {
-  const scribeService = SUITE_SERVICES.find((s) => s.id === "scribe")!;
-  const upcomingServices = SUITE_SERVICES.filter((s) => s.id !== "scribe");
+  const availableServices = SUITE_SERVICES.filter((s) => s.status === "available");
+  const upcomingServices = SUITE_SERVICES.filter((s) => s.status !== "available");
+  const orderedServices = [...availableServices, ...upcomingServices];
   const scribeUrl = resolveServiceUrl("scribe", { env: VITE_ENV });
 
   return (
@@ -117,7 +124,10 @@ export function App() {
             <KibitzLogo size="md" subtitle="Chess Suite" />
           </a>
 
-          <nav aria-label="Primary navigation" className="flex items-center gap-5">
+          <nav
+            aria-label="Primary navigation"
+            className="flex flex-wrap items-center gap-3 sm:gap-4"
+          >
             <a
               id="nav-services"
               href="#services"
@@ -125,6 +135,7 @@ export function App() {
             >
               Services
             </a>
+            <AuthMenu />
             <a
               id="nav-launch-scribe"
               href={scribeUrl}
@@ -213,18 +224,17 @@ export function App() {
                 Suite Services
               </h2>
               <p className="mt-2 max-w-2xl text-sm leading-relaxed text-slate-600">
-                Each service runs on its own subdomain with strict privacy boundaries. Scribe is
-                ready to use today; the remaining services are in active development.
+                Each service runs on its own subdomain with strict privacy boundaries. Scribe and
+                Kibitz ID are ready today; the remaining services are in active development.
               </p>
             </div>
             <span className="text-xs font-medium text-stone-500">
-              1 live · {upcomingServices.length} in development
+              {availableServices.length} live · {upcomingServices.length} in development
             </span>
           </div>
 
           <div className="mt-8 grid gap-5 md:grid-cols-2 lg:grid-cols-3">
-            <ServiceCard service={scribeService} href={scribeUrl} />
-            {upcomingServices.map((service) => (
+            {orderedServices.map((service) => (
               <ServiceCard
                 key={service.id}
                 service={service}
@@ -239,7 +249,7 @@ export function App() {
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-6 py-6 text-xs text-slate-500">
           <KibitzLogo size="sm" />
           <p>
-            Built around PGNA v1.0 · Zero-PII offline tools · Licensed under{" "}
+            Built around PGNA v1.0 · Zero-upload offline tools · Licensed under{" "}
             <span className="font-medium text-slate-700">AGPL-3.0-only</span>
           </p>
         </div>

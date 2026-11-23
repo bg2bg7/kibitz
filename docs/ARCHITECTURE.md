@@ -6,10 +6,11 @@ This document defines the workspace dependency graph, privacy invariants, ESLint
 
 ## 1. Non-Negotiable Privacy & Security Invariants
 
-1. **Zero-PII Offline Firewall (`apps/arbiter`, `apps/seconds`):**
-   - 100% client-side, offline-capable PWAs (`vite-plugin-pwa`, `registerType: "autoUpdate"`).
+1. **Zero-Upload Offline Firewall (`apps/arbiter`, `apps/seconds`):**
+   - Offline-first PWAs (`vite-plugin-pwa`, `registerType: "autoUpdate"`).
    - **MUST NEVER** import `@suite/auth-core`, `@suite/db`, or any analytics/telemetry library.
-   - **MUST NEVER** transmit club rosters, student names, or scoresheets to any server.
+   - **MUST NEVER** upload or transmit club rosters, student names, or scoresheets to any server.
+   - May perform optional **read-only `GET` pulls** (for example, pulling scheduled tournament data) using the browser's shared cross-subdomain KibitzID session cookie via `@suite/ui`'s `pullReadOnlyFromService`.
 2. **Invite-Only Identity (`apps/id`):**
    - Public open registration does not exist. All accounts are created via single-use or quota-limited invite codes.
    - The `users` schema avoids PII (pseudonymous case-insensitive unique handles only; no real names or student emails).
@@ -110,10 +111,10 @@ Each hybrid app lives in a single workspace package under `apps/<name>/`:
 
 | Workspace      | Production Subdomain | Vite Dev Port | Backend API / WS Port | Auth Required?            |
 | :------------- | :------------------- | :-----------: | :-------------------: | :------------------------ |
-| `apps/kibitz`  | `<domain>`           |    `5170`     |           —           | **NEVER** (Homepage)      |
-| `apps/id`      | `id.<domain>`        |    `5171`     |        `4001`         | Core Auth Service         |
-| `apps/lecture` | `lecture.<domain>`   |    `5172`     |        `4002`         | Optional (primers public) |
-| `apps/hall`    | `hall.<domain>`      |    `5173`     |        `4003`         | Yes / Seat Token          |
-| `apps/scribe`  | `scribe.<domain>`    |    `5174`     |           —           | Optional (publish only)   |
-| `apps/arbiter` | `arbiter.<domain>`   |    `5175`     |           —           | **NEVER**                 |
-| `apps/seconds` | `seconds.<domain>`   |    `5176`     |           —           | **NEVER**                 |
+| `apps/kibitz`  | `<domain>`           |    `5170`     |           —           | Optional (top-menu sign-in) |
+| `apps/id`      | `id.<domain>`        |    `5171`     |        `4001`         | Core Auth Service           |
+| `apps/lecture` | `lecture.<domain>`   |    `5172`     |        `4002`         | Optional (primers public)   |
+| `apps/hall`    | `hall.<domain>`      |    `5173`     |        `4003`         | Yes / Seat Token            |
+| `apps/scribe`  | `scribe.<domain>`    |    `5174`     |           —           | Optional (publish only)     |
+| `apps/arbiter` | `arbiter.<domain>`   |    `5175`     |           —           | Optional read-only pull     |
+| `apps/seconds` | `seconds.<domain>`   |    `5176`     |           —           | Optional read-only pull     |

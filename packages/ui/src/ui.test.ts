@@ -7,6 +7,10 @@ import {
   EmojiReactionBar,
   KibitzLogo,
   SUITE_SERVICES,
+  fetchKibitzSession,
+  isAllowedSuiteUrl,
+  pullReadOnlyFromService,
+  resolveApiUrl,
   resolveServiceUrl,
 } from "./index.js";
 
@@ -44,7 +48,7 @@ describe("@suite/ui", () => {
     expect(html).toContain("Chess Suite");
   });
 
-  it("resolves service URLs across localhost, deployed subdomains, and env overrides", () => {
+  it("resolves web and API URLs across localhost, deployed subdomains, and env overrides", () => {
     expect(SUITE_SERVICES.map((s) => s.id)).toEqual([
       "scribe",
       "lecture",
@@ -54,15 +58,25 @@ describe("@suite/ui", () => {
       "id",
     ]);
 
+    expect(SUITE_SERVICES.find((s) => s.id === "id")?.status).toBe("available");
+
     expect(resolveServiceUrl("kibitz")).toBe("http://localhost:5170");
     expect(resolveServiceUrl("scribe")).toBe("http://localhost:5174");
     expect(resolveServiceUrl("lecture")).toBe("http://localhost:5172");
+    expect(resolveApiUrl("id")).toBe("http://localhost:4001");
+    expect(resolveApiUrl("hall")).toBe("http://localhost:4003");
 
     expect(
       resolveServiceUrl("scribe", {
         location: { protocol: "https:", hostname: "kibitz.example.org" },
       }),
     ).toBe("https://scribe.kibitz.example.org");
+
+    expect(
+      resolveApiUrl("id", {
+        location: { protocol: "https:", hostname: "arbiter.kibitz.example.org" },
+      }),
+    ).toBe("https://id.kibitz.example.org");
 
     expect(
       resolveServiceUrl("kibitz", {
@@ -75,5 +89,55 @@ describe("@suite/ui", () => {
         env: { VITE_HALL_URL: "https://tournaments.club.org/" },
       }),
     ).toBe("https://tournaments.club.org");
+
+    expect(isAllowedSuiteUrl("http://localhost:5170/")).toBe(true);
+    expect(isAllowedSuiteUrl("http://localhost:5175/tournaments")).toBe(true);
+    expect(isAllowedSuiteUrl("https://evil.example.com")).toBe(false);
+    expect(
+      isAllowedSuiteUrl("https://arbiter.kibitz.org/round/1", {
+        location: { protocol: "https:", hostname: "id.kibitz.org" },
+      }),
+    ).toBe(true);
+    expect(
+      isAllowedSuiteUrl("https://evil.org/phish", {
+        location: { protocol: "https:", hostname: "id.kibitz.org" },
+      }),
+    ).toBe(false);
+  });
+
+  it("performs strictly read-only GET pulls with credentials: include and zero body", async () => {
+    const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const mockFetch: typeof fetch = async (input, init) => {
+      calls.push({ url: String(input), init });
+      return new Response(
+        JSON.stringify({
+          authenticated: true,
+          user: {
+            sub: "11111111-1111-4111-8111-111111111111",
+            handle: "arbiter_one",
+            role: "coach",
+            programIds: [],
+            iat: 100,
+            exp: 9999999999,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+
+    const session = await fetchKibitzSession({ fetchImpl: mockFetch });
+    expect(session.authenticated).toBe(true);
+    expect(session.user?.handle).toBe("arbiter_one");
+
+    const pull = await pullReadOnlyFromService<{ authenticated: boolean }>(
+      "hall",
+      "/api/tournaments",
+      { fetchImpl: mockFetch },
+    );
+    expect(pull.ok).toBe(true);
+    expect(calls[1]?.url).toBe("http://localhost:4003/api/tournaments");
+    expect(calls[1]?.init?.method).toBe("GET");
+    expect(calls[1]?.init?.credentials).toBe("include");
+    expect(calls[1]?.init?.body).toBeUndefined();
   });
 });

@@ -5,11 +5,14 @@ import { SUITE_SERVICES } from "@suite/ui";
 import { App } from "./App";
 
 describe("@suite/kibitz homepage", () => {
-  it("renders Kibitz branding and links to all six suite services", () => {
+  it("renders Kibitz branding, top-menu Sign in prompt, and links to all six suite services", () => {
     const html = renderToStaticMarkup(createElement(App));
 
     expect(html).toContain("Kibitz");
     expect(html).toContain("Privacy-first chess tools");
+    expect(html).toContain('id="nav-sign-in"');
+    expect(html).toContain("Sign in");
+    expect(html).toContain("2 live · 4 in development");
 
     for (const service of SUITE_SERVICES) {
       expect(html).toContain(service.name);

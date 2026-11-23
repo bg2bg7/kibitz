@@ -1,3 +1,10 @@
+import {
+  extractSessionToken,
+  isAllowedSuiteOrigin,
+  resolveAuthConfig,
+  verifySessionToken,
+  type SessionJwtConfig,
+} from "@suite/auth-core";
 import { ChessPosition, INITIAL_FEN } from "@suite/chess-core";
 import { Hono } from "hono";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -75,8 +82,29 @@ export function handleTournamentMoveMessage(
   };
 }
 
-export function createHallApp() {
+export interface CreateHallAppOptions {
+  authConfig?: SessionJwtConfig;
+}
+
+export function createHallApp(options: CreateHallAppOptions = {}) {
+  const authConfig = options.authConfig ?? resolveAuthConfig(process.env);
   const app = new Hono();
+
+  app.use("*", async (c, next) => {
+    const origin = c.req.header("origin");
+    const allowedOrigin = origin && isAllowedSuiteOrigin(origin, authConfig) ? origin : null;
+    if (allowedOrigin) {
+      c.header("Access-Control-Allow-Origin", allowedOrigin);
+      c.header("Access-Control-Allow-Credentials", "true");
+      c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+      c.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      c.header("Vary", "Origin");
+    }
+    if (c.req.method === "OPTIONS") {
+      return c.body(null, allowedOrigin ? 204 : 403);
+    }
+    await next();
+  });
 
   app.get("/health", (c) =>
     c.json({
@@ -87,6 +115,33 @@ export function createHallApp() {
       chatEnabled: false,
     }),
   );
+
+  /**
+   * Read-only tournament feed pullable via shared KibitzID session cookie (including by
+   * offline-first PWAs such as Arbiter, which pull tournament metadata without uploading PII).
+   */
+  app.get("/api/tournaments", async (c) => {
+    const token = extractSessionToken({
+      authorization: c.req.header("authorization"),
+      cookie: c.req.header("cookie"),
+    });
+    if (!token) {
+      return c.json({ error: "Kibitz ID sign-in required to pull scheduled tournaments." }, 401);
+    }
+    const verified = await verifySessionToken(token, authConfig);
+    if (!verified.valid || !verified.payload) {
+      return c.json({ error: "Invalid or expired Kibitz ID session." }, 401);
+    }
+    return c.json({
+      mode: "read_only_pull",
+      viewer: {
+        sub: verified.payload.sub,
+        handle: verified.payload.handle,
+        role: verified.payload.role,
+      },
+      items: [],
+    });
+  });
 
   return app;
 }
