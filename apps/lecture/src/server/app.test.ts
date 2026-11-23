@@ -74,6 +74,7 @@ describe("@suite/lecture server", () => {
 
     const coachId = "22222222-2222-4222-8222-222222222222";
     const studentId = "33333333-3333-4333-8333-333333333333";
+    repository.registerAccount({ id: coachId, handle: "coach_alice", role: "coach" });
     repository.registerAccount({ id: studentId, handle: "student_sam", role: "student" });
 
     const { token: coachToken } = await signSessionToken(
@@ -82,6 +83,15 @@ describe("@suite/lecture server", () => {
     );
     const { token: studentToken } = await signSessionToken(
       { sub: studentId, handle: "student_sam", role: "student", programIds: [] },
+      TEST_AUTH_CONFIG,
+    );
+    const { token: staleToken } = await signSessionToken(
+      {
+        sub: "99999999-9999-4999-8999-999999999999",
+        handle: "admin",
+        role: "admin",
+        programIds: [],
+      },
       TEST_AUTH_CONFIG,
     );
 
@@ -110,6 +120,15 @@ describe("@suite/lecture server", () => {
       body: makeForm({}),
     });
     expect(unauthPublish.status).toBe(401);
+
+    // Orphaned/stale session UUID not in users table -> 401 + clear cookie
+    const stalePublish = await app.request("/api/studies", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${staleToken}`, origin: "http://localhost:5174" },
+      body: makeForm({}),
+    });
+    expect(stalePublish.status).toBe(401);
+    expect(stalePublish.headers.get("set-cookie")).toContain("Max-Age=0");
 
     // Student publish -> 403
     const studentPublish = await app.request("/api/studies", {

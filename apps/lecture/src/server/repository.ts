@@ -84,6 +84,7 @@ export interface StudyRepository {
   getStudyById(studyId: string): Promise<StudyRecord | null>;
   listAllStudies(): Promise<StudyRecord[]>;
   listStudiesByOwnerId(ownerUserId: string): Promise<StudyRecord[]>;
+  findAccountById(userId: string): Promise<AccountProfile | null>;
   findAccountByHandle(handle: string): Promise<AccountProfile | null>;
   updateStudy(studyId: string, patch: UpdateStudyInput): Promise<StudyRecord | null>;
   deleteStudy(studyId: string): Promise<StudyRecord | null>;
@@ -235,6 +236,27 @@ export class PostgresStudyRepository implements StudyRepository {
       createdAt: toIso(row.study.createdAt),
       updatedAt: toIso(row.study.updatedAt),
     }));
+  }
+
+  async findAccountById(userId: string): Promise<AccountProfile | null> {
+    const [row] = await this.db
+      .select({
+        id: users.id,
+        handle: users.handle,
+        role: users.role,
+        createdAt: users.createdAt,
+      })
+      .from(users)
+      .where(eq(users.id, userId))
+      .limit(1);
+
+    if (!row) return null;
+    return {
+      id: row.id,
+      handle: row.handle,
+      role: row.role,
+      createdAt: toIso(row.createdAt),
+    };
   }
 
   async findAccountByHandle(handle: string): Promise<AccountProfile | null> {
@@ -405,6 +427,10 @@ export class InMemoryStudyRepository implements StudyRepository {
       .filter((s) => s.ownerUserId === ownerUserId)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       .map((s) => ({ ...s, tags: [...s.tags] }));
+  }
+
+  async findAccountById(userId: string): Promise<AccountProfile | null> {
+    return this.accountsById.get(userId) ?? null;
   }
 
   async findAccountByHandle(handle: string): Promise<AccountProfile | null> {

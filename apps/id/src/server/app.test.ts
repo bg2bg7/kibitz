@@ -1,4 +1,4 @@
-import { hashPassword, resolveAuthConfig } from "@suite/auth-core";
+import { hashPassword, resolveAuthConfig, signSessionToken } from "@suite/auth-core";
 import { describe, expect, it } from "vitest";
 import { createIdApp } from "./app.js";
 import { InMemoryIdentityRepository } from "./repository.js";
@@ -259,5 +259,32 @@ describe("@suite/id server", () => {
       await app.request("/links", { headers: { cookie: studentCookie } })
     ).json()) as { links: unknown[] };
     expect(studentLinksAfter.links).toHaveLength(0);
+  });
+
+  it("rejects and clears stale session cookies whose sub UUID no longer exists in users", async () => {
+    const { app, authConfig } = await setupTestIdApp();
+    const { token: staleToken } = await signSessionToken(
+      {
+        sub: "99999999-9999-4999-8999-999999999999",
+        handle: "admin",
+        role: "admin",
+        programIds: [],
+      },
+      authConfig,
+    );
+
+    const sessionRes = await app.request("/auth/session", {
+      headers: { cookie: `kibitz_session=${staleToken}` },
+    });
+    expect(sessionRes.status).toBe(200);
+    expect(await sessionRes.json()).toEqual({ authenticated: false, user: null });
+    expect(sessionRes.headers.get("set-cookie")).toContain("kibitz_session=");
+    expect(sessionRes.headers.get("set-cookie")).toContain("Max-Age=0");
+
+    const invitesRes = await app.request("/invites", {
+      headers: { cookie: `kibitz_session=${staleToken}` },
+    });
+    expect(invitesRes.status).toBe(401);
+    expect(invitesRes.headers.get("set-cookie")).toContain("Max-Age=0");
   });
 });

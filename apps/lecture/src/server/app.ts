@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  buildClearSessionCookieHeader,
   canStudentReadStudy,
   computeEffectiveStudentAccess,
   extractSessionToken,
@@ -241,7 +242,20 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
     if (!session) {
       return c.json({ error: "Sign in with Kibitz ID to publish a .pgna lecture." }, 401);
     }
-    if (!canPublishRole(session.role)) {
+
+    const ownerAccount = await repository.findAccountById(session.sub);
+    if (!ownerAccount) {
+      c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
+      return c.json(
+        {
+          error:
+            "Your Kibitz ID session is no longer valid (account not found). Please sign in again.",
+        },
+        401,
+      );
+    }
+
+    if (!canPublishRole(ownerAccount.role)) {
       return c.json(
         { error: "Only coach, moderator, or admin accounts may publish .pgna studies." },
         403,
@@ -311,7 +325,7 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
     const moderationStatus = visibility === "public_moderated" ? "approved" : "pending";
 
     const studyId = randomUUID();
-    const objectKey = `studies/${session.sub}/${studyId}.pgna`;
+    const objectKey = `studies/${ownerAccount.id}/${studyId}.pgna`;
 
     try {
       await objectStore.put(objectKey, bytes, PGNA_MIME_TYPE);
@@ -327,9 +341,9 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
     try {
       const created = await repository.createStudy({
         id: studyId,
-        ownerUserId: session.sub,
-        ownerHandle: session.handle,
-        ownerRole: session.role,
+        ownerUserId: ownerAccount.id,
+        ownerHandle: ownerAccount.handle,
+        ownerRole: ownerAccount.role,
         programId,
         title,
         description,
@@ -352,6 +366,20 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
       await objectStore.delete(objectKey).catch(() => undefined);
       console.error("[lecture] failed to save study metadata:", err);
       const cause = err instanceof Error ? (err as { cause?: unknown }).cause : undefined;
+      const pgCode =
+        typeof cause === "object" && cause !== null && "code" in cause
+          ? (cause as { code?: unknown }).code
+          : undefined;
+      if (pgCode === "23503") {
+        c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
+        return c.json(
+          {
+            error:
+              "Your Kibitz ID session is no longer valid (account not found). Please sign in again.",
+          },
+          401,
+        );
+      }
       const causeMsg =
         cause instanceof Error && cause.message
           ? ` (${cause.message})`

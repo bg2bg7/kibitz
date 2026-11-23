@@ -84,15 +84,37 @@ export function createIdApp(options: CreateIdAppOptions = {}) {
   });
 
   async function authenticateRequest(c: Context): Promise<SessionPayload | null> {
+    const cookieHeader = c.req.header("cookie");
     const token = extractSessionToken({
       authorization: c.req.header("authorization"),
-      cookie: c.req.header("cookie"),
+      cookie: cookieHeader,
     });
     if (!token) {
       return null;
     }
     const verified = await verifySessionToken(token, authConfig);
-    return verified.valid ? verified.payload : null;
+    if (!verified.valid || !verified.payload) {
+      if (cookieHeader) {
+        c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
+      }
+      return null;
+    }
+
+    const dbUser = await repository.findUserById(verified.payload.sub);
+    if (!dbUser) {
+      if (cookieHeader) {
+        c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
+      }
+      return null;
+    }
+
+    const programIds = await repository.getUserProgramIds(dbUser.id);
+    return {
+      ...verified.payload,
+      handle: dbUser.handle,
+      role: dbUser.role,
+      programIds,
+    };
   }
 
   app.get("/health", (c) =>

@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import { hashPassword, resolveAuthConfig } from "@suite/auth-core";
-import { createDbClient } from "@suite/db";
+import { createDbClient, runSuiteMigrations } from "@suite/db";
 import { createIdApp } from "./app.js";
 import {
   InMemoryIdentityRepository,
@@ -24,8 +24,9 @@ for (const envPath of [
 async function bootstrapRepository(): Promise<IdentityRepository> {
   const databaseUrl = process.env["DATABASE_URL"]?.trim();
   if (databaseUrl) {
-    const { db } = createDbClient(databaseUrl);
-    console.log("[id] connected to PostgreSQL via DATABASE_URL");
+    const { db, pool } = createDbClient(databaseUrl);
+    await runSuiteMigrations(pool);
+    console.log("[id] connected to PostgreSQL via DATABASE_URL (migrations up to date)");
     return new PostgresIdentityRepository(db);
   }
 

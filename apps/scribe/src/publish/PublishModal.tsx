@@ -208,6 +208,14 @@ function PublishModalContent({
         manifest,
         archiveBytes,
       });
+      if (!res.published && res.statusCode === 401) {
+        onSessionChange(null);
+        setLoginError(
+          "Your Kibitz ID session expired or is no longer valid. Please sign in again to publish.",
+        );
+        setResult(null);
+        return;
+      }
       setResult(res);
     } catch (err) {
       setResult({
