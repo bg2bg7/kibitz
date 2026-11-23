@@ -36,6 +36,8 @@ describe("@suite/scribe studio", () => {
     expect(html).toContain("Italian Game Essentials");
     expect(html).toContain("Compiled Linear Timeline");
     expect(html).toContain("↩ Return");
+    expect(html).toContain('id="nav-sign-in"');
+    expect(html).toContain("Lecture");
   });
 
   it("supports branching variations, promotion, annotations, silent return pauses, and timeline reordering", () => {

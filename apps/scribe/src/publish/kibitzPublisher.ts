@@ -3,11 +3,27 @@ import { PGNA_MIME_TYPE, validatePgnaZip, type PgnaManifest } from "@suite/pgna"
 
 export type StudyVisibility = "private" | "coach_students" | "program" | "public_moderated";
 
+export const SUGGESTED_STUDY_TAGS = [
+  "openings",
+  "tactics",
+  "endgames",
+  "strategy",
+  "annotated-games",
+  "beginner",
+] as const;
+
+export const MAX_PUBLISH_TAGS = 12;
+export const MAX_PUBLISH_TAG_LENGTH = 32;
+const TAG_VALID_PATTERN = /^[a-z0-9][a-z0-9 _-]{0,31}$/;
+
 export interface PublishToKibitzRequest {
   kibitzApiBaseUrl: string;
   session: SessionPayload;
   accessToken?: string;
   visibility?: StudyVisibility;
+  tags?: readonly string[];
+  title?: string;
+  description?: string;
   manifest: PgnaManifest;
   archiveBytes: Uint8Array;
   /** Optional fetch implementation override for testing. */
@@ -18,6 +34,8 @@ export interface PublishToKibitzResult {
   published: boolean;
   statusCode?: number;
   studyId?: string;
+  ownerHandle?: string;
+  tags?: string[];
   message: string;
 }
 
@@ -27,8 +45,49 @@ export type KibitzApiUrlValidationResult =
   | { ok: true; normalizedUrl: string }
   | { ok: false; error: string };
 
+export function canRolePublishStudies(role: SessionPayload["role"]): boolean {
+  return role === "coach" || role === "moderator" || role === "admin";
+}
+
+export function normalizePublishTag(raw: string): string | null {
+  const collapsed = raw.trim().replace(/\s+/g, " ").toLowerCase();
+  if (!collapsed || collapsed.length > MAX_PUBLISH_TAG_LENGTH) {
+    return null;
+  }
+  if (!TAG_VALID_PATTERN.test(collapsed)) {
+    return null;
+  }
+  return collapsed;
+}
+
+export function normalizePublishTags(rawTags: readonly string[]): {
+  tags: string[];
+  invalid: string[];
+} {
+  const tags: string[] = [];
+  const invalid: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of rawTags) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const normalized = normalizePublishTag(trimmed);
+    if (!normalized) {
+      invalid.push(trimmed);
+      continue;
+    }
+    if (seen.has(normalized) || tags.length >= MAX_PUBLISH_TAGS) {
+      continue;
+    }
+    seen.add(normalized);
+    tags.push(normalized);
+  }
+
+  return { tags, invalid };
+}
+
 /**
- * Validates that the Kibitz API base URL is safe to transmit credentials and archives to:
+ * Validates that the Kibitz Lecture API base URL is safe to transmit credentials and archives to:
  * - Rejects malformed URLs and embedded credentials (`user:pass@host`).
  * - Allows `https:` for any host.
  * - Allows `http:` ONLY for local loopback dev hosts (`localhost`, `127.0.0.1`, `[::1]`, `::1`).
@@ -79,6 +138,50 @@ export function validateKibitzApiBaseUrl(rawUrl: string): KibitzApiUrlValidation
 }
 
 /**
+ * Best-effort fetch of existing tags used by the signed-in account on Lecture,
+ * so authors can easily reuse consistent tags when publishing new PGNAs.
+ */
+export async function fetchAccountExistingTags(
+  kibitzApiBaseUrl: string,
+  handle: string,
+  fetchImpl?: typeof fetch,
+): Promise<string[]> {
+  const urlCheck = validateKibitzApiBaseUrl(kibitzApiBaseUrl);
+  if (!urlCheck.ok || !handle.trim()) {
+    return [];
+  }
+  const doFetch = fetchImpl ?? globalThis.fetch;
+  if (typeof doFetch !== "function") {
+    return [];
+  }
+
+  try {
+    const res = await doFetch(
+      `${urlCheck.normalizedUrl}/api/accounts/${encodeURIComponent(handle.trim())}/studies`,
+      {
+        method: "GET",
+        credentials: "include",
+        headers: { Accept: "application/json" },
+      },
+    );
+    if (!res.ok) {
+      return [];
+    }
+    const body = (await res.json().catch(() => null)) as {
+      tags?: Array<{ tag?: unknown }>;
+    } | null;
+    if (!body || !Array.isArray(body.tags)) {
+      return [];
+    }
+    return body.tags
+      .map((entry) => (typeof entry?.tag === "string" ? entry.tag : ""))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Isolated optional publishing module for apps/scribe.
  * ESLint boundary rules permit @suite/auth-core imports ONLY inside apps/scribe/src/publish/**.
  */
@@ -93,10 +196,18 @@ export async function publishArchiveToKibitz(
     };
   }
 
-  if (request.session.role !== "coach" && request.session.role !== "admin") {
+  if (!canRolePublishStudies(request.session.role)) {
     return {
       published: false,
-      message: "Only coach or admin accounts may publish .pgna studies to Kibitz.",
+      message: "Only coach, moderator, or admin accounts may publish .pgna studies to Kibitz.",
+    };
+  }
+
+  const tagCheck = normalizePublishTags(request.tags ?? []);
+  if (tagCheck.invalid.length > 0) {
+    return {
+      published: false,
+      message: `Invalid tag(s): ${tagCheck.invalid.join(", ")}. Use 1–32 letters, numbers, spaces, hyphens, or underscores.`,
     };
   }
 
@@ -109,11 +220,14 @@ export async function publishArchiveToKibitz(
     };
   }
 
+  const resolvedTitle = (request.title ?? request.manifest.title ?? "").trim() || "Untitled PGNA Study";
+  const resolvedDescription = request.description ?? request.manifest.description ?? "";
+
   const endpoint = `${urlCheck.normalizedUrl}/api/studies`;
   const form = new FormData();
   const safeCopy = new Uint8Array(request.archiveBytes.byteLength);
   safeCopy.set(request.archiveBytes);
-  const slug = (request.manifest.title || "study")
+  const slug = resolvedTitle
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
@@ -122,9 +236,10 @@ export async function publishArchiveToKibitz(
     new Blob([safeCopy], { type: PGNA_MIME_TYPE }),
     `${slug || "study"}.pgna`,
   );
-  form.append("title", request.manifest.title || "Untitled PGNA Study");
-  form.append("description", request.manifest.description || "");
-  form.append("visibility", request.visibility ?? "private");
+  form.append("title", resolvedTitle);
+  form.append("description", resolvedDescription);
+  form.append("visibility", request.visibility ?? "public_moderated");
+  form.append("tags", JSON.stringify(tagCheck.tags));
 
   const headers: Record<string, string> = {};
   if (request.accessToken) {
@@ -135,6 +250,7 @@ export async function publishArchiveToKibitz(
   try {
     const response = await doFetch(endpoint, {
       method: "POST",
+      credentials: "include",
       headers,
       body: form,
     });
@@ -155,9 +271,21 @@ export async function publishArchiveToKibitz(
     }
 
     let studyId: string | undefined;
+    let ownerHandle: string | undefined = request.session.handle;
+    let returnedTags: string[] = tagCheck.tags;
     try {
-      const payload = (await response.json()) as { id?: string; studyId?: string };
-      studyId = payload.studyId ?? payload.id;
+      const payload = (await response.json()) as {
+        id?: string;
+        studyId?: string;
+        study?: { id?: string; ownerHandle?: string; tags?: string[] };
+      };
+      studyId = payload.studyId ?? payload.id ?? payload.study?.id;
+      if (payload.study?.ownerHandle) {
+        ownerHandle = payload.study.ownerHandle;
+      }
+      if (Array.isArray(payload.study?.tags)) {
+        returnedTags = payload.study.tags;
+      }
     } catch {
       // ignore
     }
@@ -166,9 +294,11 @@ export async function publishArchiveToKibitz(
       published: true,
       statusCode: response.status,
       ...(studyId ? { studyId } : {}),
+      ...(ownerHandle ? { ownerHandle } : {}),
+      tags: returnedTags,
       message: studyId
-        ? `Published to Kibitz (study ID: ${studyId}).`
-        : "Published .pgna study to Kibitz.",
+        ? `Published to Lecture (ID: ${studyId}).`
+        : "Published .pgna study to Lecture.",
     };
   } catch (err) {
     return {

@@ -14,6 +14,7 @@ import {
   type ParsedNodeTags,
   type PgnaManifest,
 } from "@suite/pgna";
+import { fetchKibitzSession, type KibitzSessionUser } from "@suite/ui";
 import { BoardStage } from "./components/BoardStage";
 import { DraftsModal } from "./components/DraftsModal";
 import { MoveTreePanel } from "./components/MoveTreePanel";
@@ -128,6 +129,8 @@ function pruneUnreferencedClipAssets(
   };
 }
 
+const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
+
 export function App() {
   const [draft, setDraft] = useState<ScribeDraft>(() => createDemoItalianDraft());
   const [selectedNodeId, setSelectedNodeId] = useState<NodeId>("g0");
@@ -136,6 +139,7 @@ export function App() {
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [showDraftsModal, setShowDraftsModal] = useState(false);
   const [showPublishModal, setShowPublishModal] = useState(false);
+  const [sessionUser, setSessionUser] = useState<KibitzSessionUser | null>(null);
   const [draftList, setDraftList] = useState<DraftSummary[]>([]);
   const [saveStatus, setSaveStatus] = useState("Local-only · Ready");
   const [statusBanner, setStatusBanner] = useState<{
@@ -152,6 +156,36 @@ export function App() {
   useEffect(() => {
     activeDraftIdRef.current = draft.id;
   }, [draft.id]);
+
+  // Fetch active cross-service Kibitz ID session (non-blocking; authoring works offline/signed out)
+  useEffect(() => {
+    let mounted = true;
+    void fetchKibitzSession({ env: VITE_ENV }).then((session) => {
+      if (!mounted) return;
+      if (session.authenticated && session.user) {
+        setSessionUser(session.user);
+      }
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const handleSessionChange = useCallback((nextUser: KibitzSessionUser | null) => {
+    setSessionUser(nextUser);
+    if (nextUser) {
+      setDraft((prev) => {
+        if ((prev.manifest.author ?? "").trim() !== "") return prev;
+        return {
+          ...prev,
+          manifest: {
+            ...prev.manifest,
+            author: `@${nextUser.handle}`,
+          },
+        };
+      });
+    }
+  }, []);
 
   // Helper to batch-decode waveform peaks for a draft with stale-draft cancellation
   const decodeWaveformsForDraft = useCallback(async (targetDraft: ScribeDraft) => {
@@ -826,6 +860,9 @@ export function App() {
   // Draft management
   const handleCreateBlankDraft = () => {
     const blank = createBlankDraft("Untitled PGNA Study");
+    if (sessionUser) {
+      blank.manifest.author = `@${sessionUser.handle}`;
+    }
     isDirtyRef.current = true;
     activeDraftIdRef.current = blank.id;
     waveformDecodeTokenRef.current++;
@@ -875,6 +912,8 @@ export function App() {
         saveStatus={saveStatus}
         errorCount={errorCount}
         warningCount={warningCount}
+        sessionUser={sessionUser}
+        onSessionChange={handleSessionChange}
         onToggleDiagnostics={() => setShowDiagnostics((v) => !v)}
         onOpenDrafts={() => {
           void refreshDraftList();
@@ -1020,6 +1059,8 @@ export function App() {
       <PublishModal
         open={showPublishModal}
         manifest={draft.manifest}
+        sessionUser={sessionUser}
+        onSessionChange={handleSessionChange}
         onClose={() => setShowPublishModal(false)}
         onBuildArchive={buildArchiveBytes}
         onExportLocalPgna={() => void handleExportPgna()}

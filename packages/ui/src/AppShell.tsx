@@ -7,6 +7,7 @@ export interface AppShellProps {
   badge?: string;
   subtitle?: string;
   homeHref?: string;
+  headerRight?: ReactNode;
   children: ReactNode;
 }
 
@@ -19,6 +20,7 @@ export function AppShell({
   badge,
   subtitle,
   homeHref,
+  headerRight,
   children,
 }: AppShellProps) {
   return (
@@ -85,7 +87,7 @@ export function AppShell({
             </code>
           </div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "0.75rem" }}>
           {badge ? (
             <span
               style={{
@@ -101,6 +103,7 @@ export function AppShell({
               {badge}
             </span>
           ) : null}
+          {headerRight}
           {homeHref ? (
             <a
               href={homeHref}

@@ -33,6 +33,9 @@ describe("@suite/db schema blueprint", () => {
     expect(userCols).toEqual(["id", "handle", "passwordHash", "role", "createdAt"]);
     expect(userCols).not.toContain("email");
     expect(userCols).not.toContain("realName");
+
+    const studyCols = Object.keys(getTableColumns(studies));
+    expect(studyCols).toContain("tags");
   });
 
   it("restricts student assignment responses to the fixed curated emoji enum", () => {

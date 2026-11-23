@@ -5,6 +5,7 @@ import {
   AppShell,
   CURATED_STUDENT_EMOJIS,
   EmojiReactionBar,
+  KibitzAuthMenu,
   KibitzLogo,
   SUITE_SERVICES,
   fetchKibitzSession,
@@ -23,20 +24,46 @@ describe("@suite/ui", () => {
     expect(html).toContain('aria-pressed="true"');
   });
 
-  it("renders AppShell with subdomain, privacy badge, and optional Kibitz home link", () => {
+  it("renders AppShell with subdomain, privacy badge, headerRight, and optional Kibitz home link", () => {
     const html = renderToStaticMarkup(
       createElement(AppShell, {
         appName: "Arbiter",
         subdomain: "arbiter.kibitz.local",
         badge: "100% Offline PWA",
         homeHref: "http://localhost:5170",
+        headerRight: createElement("span", null, "CustomAction"),
         children: createElement("div", null, "Body"),
       }),
     );
     expect(html).toContain("Arbiter");
     expect(html).toContain("100% Offline PWA");
+    expect(html).toContain("CustomAction");
     expect(html).toContain('href="http://localhost:5170"');
     expect(html).toContain("Kibitz");
+  });
+
+  it("renders KibitzAuthMenu in both unauthenticated and authenticated states", () => {
+    const signedOutHtml = renderToStaticMarkup(createElement(KibitzAuthMenu, { user: null }));
+    expect(signedOutHtml).toContain('id="nav-sign-in"');
+    expect(signedOutHtml).toContain("Sign in");
+
+    const signedInHtml = renderToStaticMarkup(
+      createElement(KibitzAuthMenu, {
+        user: {
+          sub: "11111111-1111-4111-8111-111111111111",
+          handle: "coach_alice",
+          role: "coach",
+          programIds: [],
+          iat: 100,
+          exp: 9999999999,
+        },
+        accountHref: "http://localhost:5172/@coach_alice",
+      }),
+    );
+    expect(signedInHtml).toContain("@coach_alice");
+    expect(signedInHtml).toContain("coach");
+    expect(signedInHtml).toContain('id="nav-sign-out"');
+    expect(signedInHtml).toContain('href="http://localhost:5172/@coach_alice"');
   });
 
   it("renders KibitzLogo SVG emblem and wordmark", () => {
@@ -59,6 +86,7 @@ describe("@suite/ui", () => {
     ]);
 
     expect(SUITE_SERVICES.find((s) => s.id === "id")?.status).toBe("available");
+    expect(SUITE_SERVICES.find((s) => s.id === "lecture")?.status).toBe("available");
 
     expect(resolveServiceUrl("kibitz")).toBe("http://localhost:5170");
     expect(resolveServiceUrl("scribe")).toBe("http://localhost:5174");

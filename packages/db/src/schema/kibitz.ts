@@ -31,6 +31,7 @@ export const studies = pgTable("studies", {
   programId: uuid("program_id").references(() => programs.id, { onDelete: "set null" }),
   title: text("title").notNull(),
   description: text("description").notNull().default(""),
+  tags: jsonb("tags").$type<string[]>().notNull().default([]),
   pgnaObjectKey: text("pgna_object_key").notNull(),
   visibility: studyVisibilityEnum("visibility").notNull().default("private"),
   moderationStatus: moderationStatusEnum("moderation_status").notNull().default("pending"),

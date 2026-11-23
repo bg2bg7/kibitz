@@ -12,7 +12,7 @@ describe("@suite/kibitz homepage", () => {
     expect(html).toContain("Privacy-first chess tools");
     expect(html).toContain('id="nav-sign-in"');
     expect(html).toContain("Sign in");
-    expect(html).toContain("2 live · 4 in development");
+    expect(html).toContain("3 live · 3 in development");
 
     for (const service of SUITE_SERVICES) {
       expect(html).toContain(service.name);

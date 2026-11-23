@@ -1,5 +1,5 @@
 import { useRef, type ChangeEvent } from "react";
-import { resolveServiceUrl } from "@suite/ui";
+import { KibitzAuthMenu, resolveServiceUrl, type KibitzSessionUser } from "@suite/ui";
 
 const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
 
@@ -13,6 +13,8 @@ export interface StudioHeaderProps {
   saveStatus: string;
   errorCount: number;
   warningCount: number;
+  sessionUser: KibitzSessionUser | null;
+  onSessionChange: (user: KibitzSessionUser | null) => void;
   onToggleDiagnostics: () => void;
   onOpenDrafts: () => void;
   onImportFile: (file: File) => void;
@@ -29,6 +31,8 @@ export function StudioHeader({
   saveStatus,
   errorCount,
   warningCount,
+  sessionUser,
+  onSessionChange,
   onToggleDiagnostics,
   onOpenDrafts,
   onImportFile,
@@ -38,6 +42,16 @@ export function StudioHeader({
 }: StudioHeaderProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const kibitzHomeUrl = resolveServiceUrl("kibitz", { env: VITE_ENV });
+  const lectureUrl = resolveServiceUrl("lecture", { env: VITE_ENV });
+  const idUrl = resolveServiceUrl("id", { env: VITE_ENV });
+  const canHaveLecturePage =
+    sessionUser !== null &&
+    (sessionUser.role === "coach" ||
+      sessionUser.role === "moderator" ||
+      sessionUser.role === "admin");
+  const accountHref = canHaveLecturePage
+    ? `${lectureUrl}/@${encodeURIComponent(sessionUser.handle)}`
+    : idUrl;
 
   const handleFileSelected = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -179,6 +193,23 @@ export function StudioHeader({
           >
             Publish…
           </button>
+
+          <a
+            href={lectureUrl}
+            className="rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+          >
+            Lecture
+          </a>
+
+          <div className="h-5 w-px bg-slate-200" aria-hidden="true" />
+
+          <KibitzAuthMenu
+            env={VITE_ENV}
+            user={sessionUser}
+            onSessionChange={onSessionChange}
+            accountHref={accountHref}
+            compact
+          />
         </div>
       </div>
     </header>

@@ -224,8 +224,9 @@ export function App() {
                 Suite Services
               </h2>
               <p className="mt-2 max-w-2xl text-sm leading-relaxed text-slate-600">
-                Each service runs on its own subdomain with strict privacy boundaries. Scribe and
-                Kibitz ID are ready today; the remaining services are in active development.
+                Each service runs on its own subdomain with strict privacy boundaries. Scribe,
+                Lecture, and Kibitz ID are ready today; the remaining services are in active
+                development.
               </p>
             </div>
             <span className="text-xs font-medium text-stone-500">

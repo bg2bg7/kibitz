@@ -47,7 +47,7 @@ export const SUITE_SERVICES: readonly SuiteServiceInfo[] = [
     subdomain: "lecture",
     devPort: 5172,
     apiPort: 4002,
-    status: "coming-soon",
+    status: "available",
     privacyBadge: "Emoji-Only Feedback",
     envVar: "VITE_LECTURE_URL",
   },
