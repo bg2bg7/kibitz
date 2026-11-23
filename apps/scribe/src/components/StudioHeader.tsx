@@ -1,4 +1,7 @@
 import { useRef, type ChangeEvent } from "react";
+import { resolveServiceUrl } from "@suite/ui";
+
+const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
 
 export type StudioMode = "author" | "preview";
 
@@ -34,6 +37,7 @@ export function StudioHeader({
   onOpenPublish,
 }: StudioHeaderProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const kibitzHomeUrl = resolveServiceUrl("kibitz", { env: VITE_ENV });
 
   const handleFileSelected = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -48,9 +52,14 @@ export function StudioHeader({
       <div className="mx-auto flex max-w-[1600px] flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <div className="flex items-center gap-2">
-            <span className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900 text-sm font-bold text-amber-300">
+            <a
+              href={kibitzHomeUrl}
+              title="Back to Kibitz homepage"
+              aria-label="Back to Kibitz homepage"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg bg-slate-900 text-sm font-bold text-amber-300 transition hover:bg-slate-800"
+            >
               ♞
-            </span>
+            </a>
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-sm font-bold tracking-tight text-slate-900">Scribe</span>

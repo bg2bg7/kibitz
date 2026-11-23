@@ -1,20 +1,31 @@
-import { AppShell } from "@suite/ui";
+import { AppShell, resolveServiceUrl } from "@suite/ui";
+
+const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
 
 export function App() {
+  const homeUrl = resolveServiceUrl("kibitz", { env: VITE_ENV });
+
   return (
     <AppShell
       appName="Kibitz ID"
       subdomain="id.kibitz.local"
       badge="Invite-Only Identity · Double-Blind Linking"
-      subtitle="Shared cross-subdomain authentication, invite redemption, school/program ACLs, and double-blind coach-student linking."
+      homeHref={homeUrl}
     >
-      <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-xs">
-        <h2 className="text-base font-semibold text-slate-900">Identity Service Shell</h2>
-        <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-slate-600">
-          <li>Public open registration is disabled; accounts require a valid invite code.</li>
-          <li>Coach-student linking is strictly double-blind via POST /links/intent.</li>
-          <li>Zero PII required: pseudonymous handles only.</li>
-        </ul>
+      <section className="rounded-xl border border-slate-200 bg-white p-8 shadow-2xs">
+        <h1 className="text-2xl font-bold tracking-tight text-slate-900">Hello, World!</h1>
+        <p className="mt-2 text-sm text-slate-600">
+          Kibitz ID (invite-only identity, cross-subdomain sessions, and double-blind coach-student
+          linking) is currently under construction.
+        </p>
+        <div className="mt-6">
+          <a
+            href={homeUrl}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50"
+          >
+            <span aria-hidden="true">←</span> Back to Kibitz
+          </a>
+        </div>
       </section>
     </AppShell>
   );

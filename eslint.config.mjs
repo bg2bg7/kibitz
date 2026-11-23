@@ -4,7 +4,7 @@ import reactHooks from "eslint-plugin-react-hooks";
 import reactRefresh from "eslint-plugin-react-refresh";
 import tseslint from "typescript-eslint";
 
-const ALL_APP_NAMES = ["id", "kibitz", "scribe", "arbiter", "hall", "seconds"];
+const ALL_APP_NAMES = ["kibitz", "id", "lecture", "scribe", "arbiter", "hall", "seconds"];
 
 const DOM_GLOBALS = [
   { name: "window", message: "Pure isomorphic package must not access DOM global 'window'." },
@@ -133,6 +133,7 @@ export default tseslint.config(
   {
     name: "kibitz/react-frontend",
     files: [
+      "apps/kibitz/src/**/*.{ts,tsx}",
       "apps/arbiter/src/**/*.{ts,tsx}",
       "apps/seconds/src/**/*.{ts,tsx}",
       "apps/scribe/src/**/*.{ts,tsx}",
@@ -152,6 +153,38 @@ export default tseslint.config(
     rules: {
       ...reactHooks.configs.recommended.rules,
       "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
+    },
+  },
+
+  // ---------------------------------------------------------------------------
+  // HARD ARCHITECTURAL BOUNDARY 0: Static Suite Homepage (apps/kibitz)
+  // Must remain lightweight, auth-free, DB-free, telemetry-free, and isolated.
+  // ---------------------------------------------------------------------------
+  {
+    name: "kibitz/boundary-homepage-kibitz",
+    files: ["apps/kibitz/**/*.{ts,tsx,js,jsx,mjs,cjs}"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: ["@suite/auth-core", "@suite/auth-core/*"],
+              message:
+                "apps/kibitz homepage must remain auth-free and never import @suite/auth-core.",
+            },
+            {
+              group: ["@suite/db", "@suite/db/*"],
+              message: "apps/kibitz homepage is a static SPA and must never import @suite/db.",
+            },
+            {
+              group: ANALYTICS_PATTERNS,
+              message: "apps/kibitz homepage must never bundle analytics or telemetry.",
+            },
+            crossAppPatternsFor("kibitz"),
+          ],
+        },
+      ],
     },
   },
 
@@ -220,10 +253,10 @@ export default tseslint.config(
   },
 
   // ---------------------------------------------------------------------------
-  // HARD ARCHITECTURAL BOUNDARY 3: Hybrid Services (id, kibitz, hall)
+  // HARD ARCHITECTURAL BOUNDARY 3: Hybrid Services (id, lecture, hall)
   // Server code: no cross-app imports. Web code: no cross-app imports & no @suite/db.
   // ---------------------------------------------------------------------------
-  ...["id", "kibitz", "hall"].flatMap((appName) => [
+  ...["id", "lecture", "hall"].flatMap((appName) => [
     {
       name: `kibitz/boundary-hybrid-server-${appName}`,
       files: [`apps/${appName}/**/*.{ts,tsx,js,jsx,mjs,cjs}`],

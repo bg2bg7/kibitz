@@ -1,40 +1,32 @@
-import { useState } from "react";
-import { ChessBoard, type BoardTheme } from "@suite/board-ui";
-import { INITIAL_FEN } from "@suite/chess-core";
-import { AppShell } from "@suite/ui";
+import { AppShell, resolveServiceUrl } from "@suite/ui";
+
+const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
 
 export function App() {
-  const [theme, setTheme] = useState<BoardTheme>("projector-high-contrast");
+  const homeUrl = resolveServiceUrl("kibitz", { env: VITE_ENV });
 
   return (
     <AppShell
       appName="Seconds"
       subdomain="seconds.kibitz.local"
       badge="100% Offline PWA · Zero-PII"
-      subtitle="Parent & classroom utility kit: scoresheet-to-PGN helper, rating calculator, printable puzzle worksheets, and high-contrast classroom projector mode."
+      homeHref={homeUrl}
     >
-      <div className="grid gap-6 md:grid-cols-2">
-        <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-xs">
-          <h2 className="text-base font-semibold text-slate-900">Classroom Projector Mode</h2>
-          <p className="mt-2 text-sm text-slate-600">
-            Zero accounts, zero network calls, zero student data leaves this browser.
-          </p>
-          <button
-            type="button"
-            onClick={() =>
-              setTheme((prev) => (prev === "default" ? "projector-high-contrast" : "default"))
-            }
-            className="mt-4 rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700"
+      <section className="rounded-xl border border-slate-200 bg-white p-8 shadow-2xs">
+        <h1 className="text-2xl font-bold tracking-tight text-slate-900">Hello, World!</h1>
+        <p className="mt-2 text-sm text-slate-600">
+          Kibitz Seconds (100% offline Zero-PII parent &amp; classroom utility kit) is currently
+          under construction.
+        </p>
+        <div className="mt-6">
+          <a
+            href={homeUrl}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-800 transition hover:bg-slate-50"
           >
-            Toggle Board Theme ({theme})
-          </button>
-        </section>
-
-        <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-xs">
-          <h2 className="mb-3 text-base font-semibold text-slate-900">Demo Board</h2>
-          <ChessBoard fen={INITIAL_FEN} theme={theme} />
-        </section>
-      </div>
+            <span aria-hidden="true">←</span> Back to Kibitz
+          </a>
+        </div>
+      </section>
     </AppShell>
   );
 }

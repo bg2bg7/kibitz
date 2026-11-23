@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { createKibitzApp } from "./app.js";
+import { createLectureApp } from "./app.js";
 
-describe("@suite/kibitz server", () => {
+describe("@suite/lecture server", () => {
   it("exposes /health and open public primers while requiring auth for assignments", async () => {
-    const app = createKibitzApp();
+    const app = createLectureApp();
 
     const health = await app.request("/health");
     expect(health.status).toBe(200);
-    expect(await health.json()).toEqual({ status: "ok", service: "kibitz" });
+    expect(await health.json()).toEqual({ status: "ok", service: "lecture" });
 
     const primers = await app.request("/api/primers");
     expect(primers.status).toBe(200);

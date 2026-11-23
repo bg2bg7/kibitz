@@ -36,6 +36,11 @@ function getAllDependencyNames(pkg) {
 async function auditPackageManifests() {
   const rules = [
     {
+      workspace: "apps/kibitz",
+      forbidden: ["@suite/auth-core", "@suite/db"],
+      reason: "Static homepage SPA must remain auth/DB-free",
+    },
+    {
       workspace: "apps/arbiter",
       forbidden: ["@suite/auth-core", "@suite/db"],
       reason: "Zero-PII Offline Firewall",
@@ -94,6 +99,12 @@ async function verifyEslintGuardrails() {
 
   const expectedFailures = [
     {
+      name: "apps/kibitz homepage importing @suite/db",
+      filePath: path.join(REPO_ROOT, "apps/kibitz/src/__boundary_probe__.ts"),
+      code: 'import { studies } from "@suite/db";\nexport const s = studies;\n',
+      expectedRule: "no-restricted-imports",
+    },
+    {
       name: "apps/arbiter importing @suite/auth-core",
       filePath: path.join(REPO_ROOT, "apps/arbiter/src/__boundary_probe__.ts"),
       code: 'import type { SessionPayload } from "@suite/auth-core";\nexport type T = SessionPayload;\n',
@@ -148,14 +159,14 @@ async function verifyEslintGuardrails() {
       expectedRule: "no-restricted-globals",
     },
     {
-      name: "apps/kibitz importing sibling app apps/arbiter",
-      filePath: path.join(REPO_ROOT, "apps/kibitz/src/server/__boundary_probe__.ts"),
+      name: "apps/lecture importing sibling app apps/arbiter",
+      filePath: path.join(REPO_ROOT, "apps/lecture/src/server/__boundary_probe__.ts"),
       code: 'import something from "../../../arbiter/src/App";\nexport const s = something;\n',
       expectedRule: "no-restricted-imports",
     },
     {
-      name: "apps/kibitz web client importing @suite/db",
-      filePath: path.join(REPO_ROOT, "apps/kibitz/src/web/__boundary_probe__.ts"),
+      name: "apps/lecture web client importing @suite/db",
+      filePath: path.join(REPO_ROOT, "apps/lecture/src/web/__boundary_probe__.ts"),
       code: 'import { studies } from "@suite/db";\nexport const s = studies;\n',
       expectedRule: "no-restricted-imports",
     },

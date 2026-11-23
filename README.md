@@ -84,8 +84,9 @@ Keeping the exported entrypoints aligned with `packages/pgna/package.json`:
 
 ## Workspace Overview
 
+- `apps/kibitz` — Kibitz suite homepage & service directory (`:5170`)
 - `apps/id` — Invite-only identity, cross-subdomain JWT/sessions, double-blind linking (`:4001` / `:5171`)
-- `apps/kibitz` — Moderated `.pgna` lecture library, public primers, assignments (`:4002` / `:5172`)
+- `apps/lecture` — Moderated `.pgna` lecture library, public primers, assignments (`:4002` / `:5172`)
 - `apps/hall` — Private scheduled club tournament WS server + minimal client (`:4003` / `:5173`)
 - `apps/scribe` — Client-first PGNA v1.0 authoring studio (`:5174`)
 - `apps/arbiter` — 100% offline Zero-PII club & tournament manager PWA (`:5175`)

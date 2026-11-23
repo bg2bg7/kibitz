@@ -4,9 +4,10 @@ import { describe, expect, it } from "vitest";
 import { App } from "./App";
 
 describe("@suite/arbiter shell", () => {
-  it("renders offline PWA status and shared ChessBoard", () => {
+  it("renders Hello World placeholder with 100% Offline PWA badge and link back to Kibitz homepage", () => {
     const html = renderToStaticMarkup(createElement(App));
+    expect(html).toContain("Hello, World!");
     expect(html).toContain("100% Offline PWA");
-    expect(html).toContain('data-testid="chess-board"');
+    expect(html).toContain('href="http://localhost:5170"');
   });
 });

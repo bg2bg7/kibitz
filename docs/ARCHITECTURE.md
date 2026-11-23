@@ -17,7 +17,7 @@ This document defines the workspace dependency graph, privacy invariants, ESLint
    - Students may link to multiple coaches simultaneously.
    - `POST /links/intent` accepts a handle and **always** returns an identical HTTP `202` generic body regardless of whether the target handle exists or whether a mutual link activated. Zero notifications are emitted.
    - Effective student library access is the union of all active (non-revoked) coach links, school/program memberships, and public moderated studies.
-4. **Student Interaction Restrictions (`apps/kibitz`, `apps/hall`, `@suite/ui`):**
+4. **Student Interaction Restrictions (`apps/lecture`, `apps/hall`, `@suite/ui`):**
    - Student accounts have no free-text chat, no DMs, and no public profiles.
    - Student feedback is restricted to `<EmojiReactionBar />` (backed by the fixed `student_emoji` PostgreSQL enum).
 5. **No General Play on `apps/hall`:**
@@ -29,6 +29,10 @@ This document defines the workspace dependency graph, privacy invariants, ESLint
 
 ```mermaid
 flowchart TD
+    subgraph StaticHome["Static Suite Homepage"]
+        kibitz["apps/kibitz"]
+    end
+
     subgraph OfflinePWAs["100% Offline PWAs (Zero-PII Firewall)"]
         arbiter["apps/arbiter"]
         seconds["apps/seconds"]
@@ -41,7 +45,7 @@ flowchart TD
 
     subgraph HybridServices["Hybrid Web + API Services"]
         id["apps/id (server + web)"]
-        kibitz["apps/kibitz (server + web)"]
+        lecture["apps/lecture (server + web)"]
         hall["apps/hall (server + web)"]
     end
 
@@ -61,11 +65,12 @@ flowchart TD
         db["@suite/db"]
     end
 
+    kibitz --> ui
     arbiter --> chessCore & boardUi & printKit & ui
     seconds --> chessCore & boardUi & printKit & ui
     scribe --> chessCore & pgna & boardUi & ui
     scribePub --> authCore
-    kibitz --> chessCore & pgna & boardUi & ui & authCore & db
+    lecture --> chessCore & pgna & boardUi & ui & authCore & db
     hall --> chessCore & boardUi & ui & authCore & db
     id --> ui & authCore & db
     pgna --> chessCore
@@ -81,6 +86,7 @@ Boundaries are enforced in `eslint.config.mjs` and verified automatically in CI 
 
 | Workspace / Path                                  | Forbidden Imports / Globals                                                                                                                                                                                  |
 | :------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/kibitz/**`                                  | `@suite/auth-core`, `@suite/db`, analytics/telemetry packages, sibling apps                                                                                                                                  |
 | `apps/arbiter/**`, `apps/seconds/**`              | `@suite/auth-core`, `@suite/db`, analytics/telemetry packages, sibling apps                                                                                                                                  |
 | `apps/scribe/src/**` (excluding `src/publish/**`) | `@suite/auth-core`, `@suite/db`, sibling apps                                                                                                                                                                |
 | `apps/scribe/src/publish/**`                      | `@suite/db`, sibling apps (`@suite/auth-core` is explicitly permitted here)                                                                                                                                  |
@@ -90,7 +96,7 @@ Boundaries are enforced in `eslint.config.mjs` and verified automatically in CI 
 
 ---
 
-## 4. Hybrid App Convention (`id`, `kibitz`, `hall`)
+## 4. Hybrid App Convention (`id`, `lecture`, `hall`)
 
 Each hybrid app lives in a single workspace package under `apps/<name>/`:
 
@@ -104,8 +110,9 @@ Each hybrid app lives in a single workspace package under `apps/<name>/`:
 
 | Workspace      | Production Subdomain | Vite Dev Port | Backend API / WS Port | Auth Required?            |
 | :------------- | :------------------- | :-----------: | :-------------------: | :------------------------ |
+| `apps/kibitz`  | `<domain>`           |    `5170`     |           —           | **NEVER** (Homepage)      |
 | `apps/id`      | `id.<domain>`        |    `5171`     |        `4001`         | Core Auth Service         |
-| `apps/kibitz`  | `kibitz.<domain>`    |    `5172`     |        `4002`         | Optional (primers public) |
+| `apps/lecture` | `lecture.<domain>`   |    `5172`     |        `4002`         | Optional (primers public) |
 | `apps/hall`    | `hall.<domain>`      |    `5173`     |        `4003`         | Yes / Seat Token          |
 | `apps/scribe`  | `scribe.<domain>`    |    `5174`     |           —           | Optional (publish only)   |
 | `apps/arbiter` | `arbiter.<domain>`   |    `5175`     |           —           | **NEVER**                 |
