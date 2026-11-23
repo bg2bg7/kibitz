@@ -10,11 +10,14 @@ import {
   MAX_PUBLISH_TAGS,
   SUGGESTED_STUDY_TAGS,
   canRolePublishStudies,
+  canRolePublishToProgram,
   fetchAccountExistingTags,
+  fetchPublishablePrograms,
   normalizePublishTag,
   publishArchiveToKibitz,
   validateKibitzApiBaseUrl,
   type PublishToKibitzResult,
+  type PublishableProgram,
   type StudyVisibility,
 } from "./kibitzPublisher";
 
@@ -57,6 +60,11 @@ function PublishModalContent({
   const [title, setTitle] = useState(manifest.title ?? "");
   const [description, setDescription] = useState(manifest.description ?? "");
   const [visibility, setVisibility] = useState<StudyVisibility>("public_moderated");
+  const [programsQuery, setProgramsQuery] = useState<{
+    key: string;
+    programs: PublishableProgram[];
+  } | null>(null);
+  const [selectedProgramId, setSelectedProgramId] = useState("");
   const [tags, setTags] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState("");
   const [tagError, setTagError] = useState<string | null>(null);
@@ -69,6 +77,14 @@ function PublishModalContent({
   const [loginPassword, setLoginPassword] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
+
+  const urlValidation = useMemo(() => validateKibitzApiBaseUrl(apiUrl), [apiUrl]);
+  const hasPublishRole = sessionUser ? canRolePublishStudies(sessionUser.role) : false;
+  const canPublishToProgram = sessionUser ? canRolePublishToProgram(sessionUser.role) : false;
+  const programsRequestKey =
+    sessionUser && hasPublishRole && urlValidation.ok
+      ? `${sessionUser.sub}:${urlValidation.normalizedUrl}`
+      : null;
 
   useEffect(() => {
     if (!sessionUser) {
@@ -85,11 +101,44 @@ function PublishModalContent({
     };
   }, [sessionUser, apiUrl]);
 
-  const existingTags = sessionUser ? fetchedExistingTags : [];
-  const urlValidation = useMemo(() => validateKibitzApiBaseUrl(apiUrl), [apiUrl]);
+  useEffect(() => {
+    if (!programsRequestKey) {
+      return;
+    }
+    let cancelled = false;
+    void fetchPublishablePrograms(apiUrl).then((programs) => {
+      if (cancelled) {
+        return;
+      }
+      setProgramsQuery({ key: programsRequestKey, programs });
+      setSelectedProgramId((prev) => {
+        if (prev && programs.some((program) => program.id === prev)) {
+          return prev;
+        }
+        return programs[0]?.id ?? "";
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiUrl, programsRequestKey]);
 
-  const hasPublishRole = sessionUser ? canRolePublishStudies(sessionUser.role) : false;
-  const canPublish = !isBusy && Boolean(sessionUser) && hasPublishRole && urlValidation.ok;
+  const existingTags = sessionUser ? fetchedExistingTags : [];
+  const publishablePrograms =
+    programsRequestKey && programsQuery?.key === programsRequestKey ? programsQuery.programs : [];
+  const programsLoading = Boolean(programsRequestKey && programsQuery?.key !== programsRequestKey);
+  const effectiveSelectedProgramId =
+    canPublishToProgram && publishablePrograms.some((program) => program.id === selectedProgramId)
+      ? selectedProgramId
+      : canPublishToProgram
+        ? (publishablePrograms[0]?.id ?? "")
+        : "";
+
+  const hasValidProgramSelection =
+    visibility !== "program" ||
+    (canPublishToProgram && Boolean(effectiveSelectedProgramId.trim()));
+  const canPublish =
+    !isBusy && Boolean(sessionUser) && hasPublishRole && urlValidation.ok && hasValidProgramSelection;
 
   const addTag = (raw: string): boolean => {
     const trimmed = raw.trim();
@@ -202,6 +251,7 @@ function PublishModalContent({
         kibitzApiBaseUrl: apiUrl,
         session: sessionUser,
         visibility,
+        programId: visibility === "program" ? effectiveSelectedProgramId : null,
         tags: finalTags,
         title: title.trim() || manifest.title || "Untitled PGNA Study",
         description,
@@ -491,6 +541,44 @@ function PublishModalContent({
                     <option value="private">Private (only me)</option>
                   </select>
                 </label>
+
+                {visibility === "program" ? (
+                  !canPublishToProgram ? (
+                    <div
+                      role="alert"
+                      className="rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-[11px] text-amber-900"
+                    >
+                      Only <strong>coach</strong> or <strong>admin</strong> accounts may publish to
+                      a program. No eligible programs are available for this account.
+                    </div>
+                  ) : programsLoading ? (
+                    <p className="text-[11px] text-slate-500">Loading eligible programs…</p>
+                  ) : publishablePrograms.length === 0 ? (
+                    <div
+                      role="alert"
+                      className="rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-[11px] text-amber-900"
+                    >
+                      No eligible programs are available for this account. Ask an administrator to
+                      assign your account to a program, or choose another visibility option.
+                    </div>
+                  ) : (
+                    <label className="block">
+                      <span className="font-semibold text-slate-700">Target Program</span>
+                      <select
+                        id="publish-program-select"
+                        value={effectiveSelectedProgramId}
+                        onChange={(e) => setSelectedProgramId(e.target.value)}
+                        className="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs text-slate-900 focus:border-sky-600 focus:outline-none"
+                      >
+                        {publishablePrograms.map((program) => (
+                          <option key={program.id} value={program.id}>
+                            {program.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )
+                ) : null}
 
                 <div>
                   <button

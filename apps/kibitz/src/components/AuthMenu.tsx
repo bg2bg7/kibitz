@@ -4,23 +4,36 @@ import {
   fetchKibitzSession,
   loginWithKibitzId,
   logoutKibitzSession,
+  performKibitzSignOut,
   resolveServiceUrl,
   type KibitzSessionUser,
 } from "@suite/ui";
 
 const VITE_ENV = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
 
-export function AuthMenu() {
+export interface AuthMenuProps {
+  /** Optional initial user state (primarily for SSR / tests). */
+  initialUser?: KibitzSessionUser | null;
+  /** Optional initial sign-out error banner message (primarily for SSR / tests). */
+  initialSignOutError?: string | null;
+}
+
+export function AuthMenu({
+  initialUser = null,
+  initialSignOutError = null,
+}: AuthMenuProps) {
   const idUrl = resolveServiceUrl("id", { env: VITE_ENV });
   const homeUrl = resolveServiceUrl("kibitz", { env: VITE_ENV });
   const registerUrl = `${idUrl}/?mode=register&returnTo=${encodeURIComponent(homeUrl)}`;
 
-  const [user, setUser] = useState<KibitzSessionUser | null>(null);
+  const [user, setUser] = useState<KibitzSessionUser | null>(initialUser);
   const [modalOpen, setModalOpen] = useState(false);
   const [handle, setHandle] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(initialSignOutError);
 
   useEffect(() => {
     let mounted = true;
@@ -57,19 +70,36 @@ export function AuthMenu() {
       return;
     }
 
+    setSignOutError(null);
     setUser(result.user);
     setPassword("");
     setModalOpen(false);
   };
 
   const handleSignOut = async () => {
-    await logoutKibitzSession({ env: VITE_ENV });
-    setUser(null);
+    if (signingOut) return;
+    await performKibitzSignOut({
+      logout: () => logoutKibitzSession({ env: VITE_ENV }),
+      onStart: () => {
+        setSigningOut(true);
+        setSignOutError(null);
+      },
+      onSuccess: () => {
+        setSignOutError(null);
+        setUser(null);
+      },
+      onFailure: (message) => {
+        setSignOutError(message);
+      },
+      onFinally: () => {
+        setSigningOut(false);
+      },
+    });
   };
 
   if (user) {
     return (
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <a
           id="nav-account-link"
           href={idUrl}
@@ -83,11 +113,29 @@ export function AuthMenu() {
         <button
           id="nav-sign-out"
           type="button"
+          disabled={signingOut}
           onClick={() => void handleSignOut()}
-          className="rounded-lg px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-stone-200/60 hover:text-slate-900"
+          className="rounded-lg px-2.5 py-1.5 text-sm font-medium text-slate-600 transition hover:bg-stone-200/60 hover:text-slate-900 disabled:cursor-wait disabled:opacity-60"
         >
-          Sign out
+          {signingOut ? "Signing out…" : "Sign out"}
         </button>
+        {signOutError ? (
+          <div
+            role="alert"
+            className="inline-flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 text-xs font-medium text-red-700"
+          >
+            <span>{signOutError}</span>
+            <button
+              id="nav-sign-out-retry"
+              type="button"
+              disabled={signingOut}
+              onClick={() => void handleSignOut()}
+              className="rounded border border-red-300 bg-white px-2 py-0.5 text-[11px] font-semibold text-red-800 transition hover:bg-red-100 disabled:cursor-wait disabled:opacity-60"
+            >
+              Retry
+            </button>
+          </div>
+        ) : null}
       </div>
     );
   }

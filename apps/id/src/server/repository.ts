@@ -1,5 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { normalizeHandle, type UserRole } from "@suite/auth-core";
+import {
+  canIssueProgramInvite,
+  normalizeHandle,
+  type ProgramMembershipRecord,
+  type ProgramRole,
+  type UserRole,
+} from "@suite/auth-core";
 import {
   and,
   coachStudentLinks,
@@ -12,6 +18,7 @@ import {
   lt,
   or,
   programMemberships,
+  programs,
   sql,
   users,
   type SuiteDatabase,
@@ -22,6 +29,13 @@ export interface UserRecord {
   handle: string;
   passwordHash: string;
   role: UserRole;
+  createdAt: string;
+}
+
+export interface ProgramRecord {
+  id: string;
+  name: string;
+  ownerUserId: string;
   createdAt: string;
 }
 
@@ -44,6 +58,13 @@ export interface ActiveLinkRecord {
   createdAt: string;
 }
 
+export type InviteEligibilityResult =
+  | { ok: true }
+  | {
+      ok: false;
+      code: "invalid_invite" | "invite_exhausted" | "invite_expired";
+    };
+
 export type RedeemInviteResult =
   | { ok: true; user: UserRecord; programIds: string[] }
   | {
@@ -56,6 +77,8 @@ export interface IdentityRepository {
   findUserByHandle(handle: string): Promise<UserRecord | null>;
   findUserById(userId: string): Promise<UserRecord | null>;
   getUserProgramIds(userId: string): Promise<string[]>;
+  getUserProgramMemberships(userId: string): Promise<ProgramMembershipRecord[]>;
+  programExists(programId: string): Promise<boolean>;
   createInvite(input: {
     createdByUserId: string;
     assignedRole: UserRole;
@@ -64,6 +87,7 @@ export interface IdentityRepository {
     expiresAt?: Date | null;
   }): Promise<InviteRecord>;
   listInvites(filter?: { createdByUserId?: string }): Promise<InviteRecord[]>;
+  checkInviteEligibility(inviteCode: string): Promise<InviteEligibilityResult>;
   redeemInviteAndCreateUser(input: {
     inviteCode: string;
     handle: string;
@@ -76,6 +100,38 @@ export interface IdentityRepository {
   }): Promise<"pending_unilateral" | "active">;
   listActiveLinks(userId: string): Promise<ActiveLinkRecord[]>;
   revokeActiveLink(userId: string, peerUserId: string): Promise<boolean>;
+}
+
+class HandleTakenAbortError extends Error {
+  constructor() {
+    super("Handle already taken");
+    this.name = "HandleTakenAbortError";
+  }
+}
+
+function isPostgresUniqueViolation(err: unknown): boolean {
+  if (!err || typeof err !== "object") {
+    return false;
+  }
+  const obj = err as { code?: unknown; cause?: unknown };
+  if (obj.code === "23505") {
+    return true;
+  }
+  if (obj.cause && typeof obj.cause === "object") {
+    return (obj.cause as { code?: unknown }).code === "23505";
+  }
+  return false;
+}
+
+function toProgramRole(role: UserRole): ProgramRole {
+  if (role === "student") return "student";
+  if (role === "coach") return "coach";
+  return "director";
+}
+
+function canonicalHandlePairLockKey(handleA: string, handleB: string): string {
+  const [first, second] = [normalizeHandle(handleA), normalizeHandle(handleB)].sort();
+  return `${first}\0${second}`;
 }
 
 function generateInviteCode(): string {
@@ -149,6 +205,31 @@ export class PostgresIdentityRepository implements IdentityRepository {
     return rows.map((row) => row.programId);
   }
 
+  async getUserProgramMemberships(userId: string): Promise<ProgramMembershipRecord[]> {
+    const rows = await this.db
+      .select({
+        programId: programMemberships.programId,
+        userId: programMemberships.userId,
+        role: programMemberships.role,
+      })
+      .from(programMemberships)
+      .where(eq(programMemberships.userId, userId));
+    return rows.map((row) => ({
+      programId: row.programId,
+      userId: row.userId,
+      role: row.role,
+    }));
+  }
+
+  async programExists(programId: string): Promise<boolean> {
+    const [row] = await this.db
+      .select({ id: programs.id })
+      .from(programs)
+      .where(eq(programs.id, programId))
+      .limit(1);
+    return Boolean(row);
+  }
+
   async createInvite(input: {
     createdByUserId: string;
     assignedRole: UserRole;
@@ -206,6 +287,42 @@ export class PostgresIdentityRepository implements IdentityRepository {
     }));
   }
 
+  async checkInviteEligibility(inviteCode: string): Promise<InviteEligibilityResult> {
+    const code = inviteCode.trim();
+    const [invite] = await this.db.select().from(invites).where(eq(invites.code, code)).limit(1);
+    if (!invite) {
+      return { ok: false, code: "invalid_invite" };
+    }
+
+    const now = new Date();
+    if (invite.expiresAt && invite.expiresAt <= now) {
+      return { ok: false, code: "invite_expired" };
+    }
+    if (invite.usedCount >= invite.maxUses) {
+      return { ok: false, code: "invite_exhausted" };
+    }
+
+    if (invite.programId) {
+      const issuer = await this.findUserById(invite.createdByUserId);
+      if (!issuer) {
+        return { ok: false, code: "invalid_invite" };
+      }
+      const issuerMemberships = await this.getUserProgramMemberships(issuer.id);
+      if (
+        !canIssueProgramInvite(
+          { id: issuer.id, role: issuer.role },
+          invite.programId,
+          invite.assignedRole,
+          issuerMemberships,
+        )
+      ) {
+        return { ok: false, code: "invalid_invite" };
+      }
+    }
+
+    return { ok: true };
+  }
+
   async redeemInviteAndCreateUser(input: {
     inviteCode: string;
     handle: string;
@@ -215,91 +332,132 @@ export class PostgresIdentityRepository implements IdentityRepository {
     const cleanHandle = input.handle.trim();
     const normalized = normalizeHandle(cleanHandle);
 
-    return this.db.transaction(async (tx) => {
-      const [existingUser] = await tx
-        .select({ id: users.id })
-        .from(users)
-        .where(sql`lower(${users.handle}) = ${normalized}`)
-        .limit(1);
+    try {
+      return await this.db.transaction(async (tx) => {
+        // Check invite existence, expiry, quota, and issuer program authority BEFORE handle checks.
+        const [invite] = await tx.select().from(invites).where(eq(invites.code, code)).limit(1);
+        if (!invite) {
+          return { ok: false, code: "invalid_invite" } as const;
+        }
 
-      if (existingUser) {
-        return { ok: false, code: "handle_taken" } as const;
+        const now = new Date();
+        if (invite.expiresAt && invite.expiresAt <= now) {
+          return { ok: false, code: "invite_expired" } as const;
+        }
+        if (invite.usedCount >= invite.maxUses) {
+          return { ok: false, code: "invite_exhausted" } as const;
+        }
+
+        if (invite.programId) {
+          const [issuer] = await tx
+            .select({ id: users.id, role: users.role })
+            .from(users)
+            .where(eq(users.id, invite.createdByUserId))
+            .limit(1);
+          if (!issuer) {
+            return { ok: false, code: "invalid_invite" } as const;
+          }
+          const issuerMemberships = await tx
+            .select({
+              programId: programMemberships.programId,
+              userId: programMemberships.userId,
+              role: programMemberships.role,
+            })
+            .from(programMemberships)
+            .where(eq(programMemberships.userId, issuer.id));
+
+          if (
+            !canIssueProgramInvite(
+              { id: issuer.id, role: issuer.role },
+              invite.programId,
+              invite.assignedRole,
+              issuerMemberships,
+            )
+          ) {
+            return { ok: false, code: "invalid_invite" } as const;
+          }
+        }
+
+        const [existingUser] = await tx
+          .select({ id: users.id })
+          .from(users)
+          .where(sql`lower(${users.handle}) = ${normalized}`)
+          .limit(1);
+
+        if (existingUser) {
+          return { ok: false, code: "handle_taken" } as const;
+        }
+
+        // Atomic conditional increment prevents concurrent over-redemption.
+        const [updatedInvite] = await tx
+          .update(invites)
+          .set({ usedCount: sql`${invites.usedCount} + 1` })
+          .where(
+            and(
+              eq(invites.code, code),
+              lt(invites.usedCount, invites.maxUses),
+              or(isNull(invites.expiresAt), gt(invites.expiresAt, now)),
+            ),
+          )
+          .returning();
+
+        if (!updatedInvite) {
+          return { ok: false, code: "invite_exhausted" } as const;
+        }
+
+        let created: typeof users.$inferSelect | undefined;
+        try {
+          [created] = await tx
+            .insert(users)
+            .values({
+              handle: cleanHandle,
+              passwordHash: input.passwordHash,
+              role: updatedInvite.assignedRole,
+            })
+            .returning();
+        } catch (err) {
+          if (isPostgresUniqueViolation(err)) {
+            throw new HandleTakenAbortError();
+          }
+          throw err;
+        }
+
+        if (!created) {
+          throw new Error("Failed to create user record.");
+        }
+
+        const programIds: string[] = [];
+        if (updatedInvite.programId) {
+          const programRole = toProgramRole(updatedInvite.assignedRole);
+          await tx
+            .insert(programMemberships)
+            .values({
+              programId: updatedInvite.programId,
+              userId: created.id,
+              role: programRole,
+            })
+            .onConflictDoNothing();
+          programIds.push(updatedInvite.programId);
+        }
+
+        return {
+          ok: true,
+          user: {
+            id: created.id,
+            handle: created.handle,
+            passwordHash: created.passwordHash,
+            role: created.role,
+            createdAt: created.createdAt.toISOString(),
+          },
+          programIds,
+        } as const;
+      });
+    } catch (err) {
+      if (err instanceof HandleTakenAbortError) {
+        return { ok: false, code: "handle_taken" };
       }
-
-      const [invite] = await tx.select().from(invites).where(eq(invites.code, code)).limit(1);
-      if (!invite) {
-        return { ok: false, code: "invalid_invite" } as const;
-      }
-
-      const now = new Date();
-      if (invite.expiresAt && invite.expiresAt <= now) {
-        return { ok: false, code: "invite_expired" } as const;
-      }
-      if (invite.usedCount >= invite.maxUses) {
-        return { ok: false, code: "invite_exhausted" } as const;
-      }
-
-      // Atomic conditional increment prevents concurrent over-redemption.
-      const [updatedInvite] = await tx
-        .update(invites)
-        .set({ usedCount: sql`${invites.usedCount} + 1` })
-        .where(
-          and(
-            eq(invites.code, code),
-            lt(invites.usedCount, invites.maxUses),
-            or(isNull(invites.expiresAt), gt(invites.expiresAt, now)),
-          ),
-        )
-        .returning();
-
-      if (!updatedInvite) {
-        return { ok: false, code: "invite_exhausted" } as const;
-      }
-
-      const [created] = await tx
-        .insert(users)
-        .values({
-          handle: cleanHandle,
-          passwordHash: input.passwordHash,
-          role: updatedInvite.assignedRole,
-        })
-        .returning();
-
-      if (!created) {
-        throw new Error("Failed to create user record.");
-      }
-
-      const programIds: string[] = [];
-      if (updatedInvite.programId) {
-        const programRole =
-          updatedInvite.assignedRole === "student"
-            ? "student"
-            : updatedInvite.assignedRole === "coach"
-              ? "coach"
-              : "director";
-        await tx
-          .insert(programMemberships)
-          .values({
-            programId: updatedInvite.programId,
-            userId: created.id,
-            role: programRole,
-          })
-          .onConflictDoNothing();
-        programIds.push(updatedInvite.programId);
-      }
-
-      return {
-        ok: true,
-        user: {
-          id: created.id,
-          handle: created.handle,
-          passwordHash: created.passwordHash,
-          role: created.role,
-          createdAt: created.createdAt.toISOString(),
-        },
-        programIds,
-      } as const;
-    });
+      throw err;
+    }
   }
 
   async submitDoubleBlindLinkIntent(input: {
@@ -314,7 +472,11 @@ export class PostgresIdentityRepository implements IdentityRepository {
       return "pending_unilateral";
     }
 
+    const lockKey = canonicalHandlePairLockKey(normalizedInitiator, normalizedTarget);
+
     return this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+
       const [initiator] = await tx
         .select()
         .from(users)
@@ -328,47 +490,79 @@ export class PostgresIdentityRepository implements IdentityRepository {
         .limit(1);
 
       if (initiator && target && initiator.id !== target.id) {
-        const [reciprocal] = await tx
-          .select()
-          .from(linkIntents)
-          .where(
-            and(
-              eq(linkIntents.initiatorUserId, target.id),
-              eq(linkIntents.targetHandle, normalizedInitiator),
-            ),
-          )
-          .limit(1);
-
         const pair = resolveCoachStudentPair(initiator, target);
-        if (reciprocal && pair) {
-          await tx
-            .insert(coachStudentLinks)
-            .values({
-              coachUserId: pair.coachUserId,
-              studentUserId: pair.studentUserId,
-              revokedAt: null,
-            })
-            .onConflictDoUpdate({
-              target: [coachStudentLinks.coachUserId, coachStudentLinks.studentUserId],
-              set: { revokedAt: null },
-            });
-
-          await tx
-            .delete(linkIntents)
+        if (pair) {
+          const [activeLink] = await tx
+            .select({ coachUserId: coachStudentLinks.coachUserId })
+            .from(coachStudentLinks)
             .where(
-              or(
-                and(
-                  eq(linkIntents.initiatorUserId, target.id),
-                  eq(linkIntents.targetHandle, normalizedInitiator),
-                ),
-                and(
-                  eq(linkIntents.initiatorUserId, initiator.id),
-                  eq(linkIntents.targetHandle, normalizedTarget),
-                ),
+              and(
+                eq(coachStudentLinks.coachUserId, pair.coachUserId),
+                eq(coachStudentLinks.studentUserId, pair.studentUserId),
+                isNull(coachStudentLinks.revokedAt),
               ),
-            );
+            )
+            .limit(1);
 
-          return "active";
+          if (activeLink) {
+            await tx
+              .delete(linkIntents)
+              .where(
+                or(
+                  and(
+                    eq(linkIntents.initiatorUserId, target.id),
+                    eq(linkIntents.targetHandle, normalizedInitiator),
+                  ),
+                  and(
+                    eq(linkIntents.initiatorUserId, initiator.id),
+                    eq(linkIntents.targetHandle, normalizedTarget),
+                  ),
+                ),
+              );
+            return "active";
+          }
+
+          const [reciprocal] = await tx
+            .select()
+            .from(linkIntents)
+            .where(
+              and(
+                eq(linkIntents.initiatorUserId, target.id),
+                eq(linkIntents.targetHandle, normalizedInitiator),
+              ),
+            )
+            .limit(1);
+
+          if (reciprocal) {
+            await tx
+              .insert(coachStudentLinks)
+              .values({
+                coachUserId: pair.coachUserId,
+                studentUserId: pair.studentUserId,
+                revokedAt: null,
+              })
+              .onConflictDoUpdate({
+                target: [coachStudentLinks.coachUserId, coachStudentLinks.studentUserId],
+                set: { revokedAt: null },
+              });
+
+            await tx
+              .delete(linkIntents)
+              .where(
+                or(
+                  and(
+                    eq(linkIntents.initiatorUserId, target.id),
+                    eq(linkIntents.targetHandle, normalizedInitiator),
+                  ),
+                  and(
+                    eq(linkIntents.initiatorUserId, initiator.id),
+                    eq(linkIntents.targetHandle, normalizedTarget),
+                  ),
+                ),
+              );
+
+            return "active";
+          }
         }
       }
 
@@ -416,27 +610,56 @@ export class PostgresIdentityRepository implements IdentityRepository {
   }
 
   async revokeActiveLink(userId: string, peerUserId: string): Promise<boolean> {
-    const updated = await this.db
-      .update(coachStudentLinks)
-      .set({ revokedAt: new Date() })
-      .where(
-        and(
-          isNull(coachStudentLinks.revokedAt),
-          or(
-            and(
-              eq(coachStudentLinks.coachUserId, userId),
-              eq(coachStudentLinks.studentUserId, peerUserId),
-            ),
-            and(
-              eq(coachStudentLinks.coachUserId, peerUserId),
-              eq(coachStudentLinks.studentUserId, userId),
+    return this.db.transaction(async (tx) => {
+      const [user] = await tx.select().from(users).where(eq(users.id, userId)).limit(1);
+      const [peer] = await tx.select().from(users).where(eq(users.id, peerUserId)).limit(1);
+
+      if (user && peer) {
+        const lockKey = canonicalHandlePairLockKey(user.handle, peer.handle);
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      }
+
+      const updated = await tx
+        .update(coachStudentLinks)
+        .set({ revokedAt: new Date() })
+        .where(
+          and(
+            isNull(coachStudentLinks.revokedAt),
+            or(
+              and(
+                eq(coachStudentLinks.coachUserId, userId),
+                eq(coachStudentLinks.studentUserId, peerUserId),
+              ),
+              and(
+                eq(coachStudentLinks.coachUserId, peerUserId),
+                eq(coachStudentLinks.studentUserId, userId),
+              ),
             ),
           ),
-        ),
-      )
-      .returning();
+        )
+        .returning();
 
-    return updated.length > 0;
+      if (user && peer) {
+        const normalizedUser = normalizeHandle(user.handle);
+        const normalizedPeer = normalizeHandle(peer.handle);
+        await tx
+          .delete(linkIntents)
+          .where(
+            or(
+              and(
+                eq(linkIntents.initiatorUserId, user.id),
+                eq(linkIntents.targetHandle, normalizedPeer),
+              ),
+              and(
+                eq(linkIntents.initiatorUserId, peer.id),
+                eq(linkIntents.targetHandle, normalizedUser),
+              ),
+            ),
+          );
+      }
+
+      return updated.length > 0;
+    });
   }
 }
 
@@ -446,13 +669,45 @@ export class PostgresIdentityRepository implements IdentityRepository {
 export class InMemoryIdentityRepository implements IdentityRepository {
   readonly storageKind = "memory" as const;
   private readonly usersById = new Map<string, UserRecord>();
-  private readonly programIdsByUser = new Map<string, Set<string>>();
+  private readonly programsById = new Map<string, ProgramRecord>();
+  private readonly programMembershipsByUser = new Map<string, Map<string, ProgramMembershipRecord>>();
   private readonly invitesByCode = new Map<string, InviteRecord>();
   private readonly pendingIntents = new Set<string>();
   private readonly links = new Map<
     string,
     { coachUserId: string; studentUserId: string; createdAt: string; revokedAt: string | null }
   >();
+
+  seedProgram(input: { id?: string; name: string; ownerUserId: string }): ProgramRecord {
+    const record: ProgramRecord = {
+      id: input.id ?? randomUUID(),
+      name: input.name.trim(),
+      ownerUserId: input.ownerUserId,
+      createdAt: new Date().toISOString(),
+    };
+    this.programsById.set(record.id, record);
+    return { ...record };
+  }
+
+  addProgramMembership(membership: ProgramMembershipRecord): void {
+    let byProgram = this.programMembershipsByUser.get(membership.userId);
+    if (!byProgram) {
+      byProgram = new Map<string, ProgramMembershipRecord>();
+      this.programMembershipsByUser.set(membership.userId, byProgram);
+    }
+    byProgram.set(membership.programId, { ...membership });
+  }
+
+  removeProgramMembership(userId: string, programId: string): void {
+    this.programMembershipsByUser.get(userId)?.delete(programId);
+  }
+
+  updateUserRole(userId: string, role: UserRole): void {
+    const user = this.usersById.get(userId);
+    if (user) {
+      user.role = role;
+    }
+  }
 
   seedUser(input: {
     id?: string;
@@ -470,7 +725,14 @@ export class InMemoryIdentityRepository implements IdentityRepository {
     };
     this.usersById.set(record.id, record);
     if (input.programIds?.length) {
-      this.programIdsByUser.set(record.id, new Set(input.programIds));
+      const programRole = toProgramRole(record.role);
+      for (const programId of input.programIds) {
+        this.addProgramMembership({
+          programId,
+          userId: record.id,
+          role: programRole,
+        });
+      }
     }
     return record;
   }
@@ -490,7 +752,19 @@ export class InMemoryIdentityRepository implements IdentityRepository {
   }
 
   async getUserProgramIds(userId: string): Promise<string[]> {
-    return [...(this.programIdsByUser.get(userId) ?? [])];
+    return [...(this.programMembershipsByUser.get(userId)?.keys() ?? [])];
+  }
+
+  async getUserProgramMemberships(userId: string): Promise<ProgramMembershipRecord[]> {
+    const byProgram = this.programMembershipsByUser.get(userId);
+    if (!byProgram) {
+      return [];
+    }
+    return [...byProgram.values()].map((membership) => ({ ...membership }));
+  }
+
+  async programExists(programId: string): Promise<boolean> {
+    return this.programsById.has(programId);
   }
 
   async createInvite(input: {
@@ -524,17 +798,8 @@ export class InMemoryIdentityRepository implements IdentityRepository {
       .map((inv) => ({ ...inv }));
   }
 
-  async redeemInviteAndCreateUser(input: {
-    inviteCode: string;
-    handle: string;
-    passwordHash: string;
-  }): Promise<RedeemInviteResult> {
-    const existing = await this.findUserByHandle(input.handle);
-    if (existing) {
-      return { ok: false, code: "handle_taken" };
-    }
-
-    const invite = this.invitesByCode.get(input.inviteCode.trim());
+  private checkInviteEligibilitySync(inviteCode: string): InviteEligibilityResult {
+    const invite = this.invitesByCode.get(inviteCode.trim());
     if (!invite) {
       return { ok: false, code: "invalid_invite" };
     }
@@ -543,6 +808,54 @@ export class InMemoryIdentityRepository implements IdentityRepository {
     }
     if (invite.usedCount >= invite.maxUses) {
       return { ok: false, code: "invite_exhausted" };
+    }
+    if (invite.programId) {
+      const issuer = this.usersById.get(invite.createdByUserId);
+      if (!issuer) {
+        return { ok: false, code: "invalid_invite" };
+      }
+      const issuerMemberships = [
+        ...(this.programMembershipsByUser.get(issuer.id)?.values() ?? []),
+      ];
+      if (
+        !canIssueProgramInvite(
+          { id: issuer.id, role: issuer.role },
+          invite.programId,
+          invite.assignedRole,
+          issuerMemberships,
+        )
+      ) {
+        return { ok: false, code: "invalid_invite" };
+      }
+    }
+    return { ok: true };
+  }
+
+  async checkInviteEligibility(inviteCode: string): Promise<InviteEligibilityResult> {
+    return this.checkInviteEligibilitySync(inviteCode);
+  }
+
+  async redeemInviteAndCreateUser(input: {
+    inviteCode: string;
+    handle: string;
+    passwordHash: string;
+  }): Promise<RedeemInviteResult> {
+    // Check invite eligibility (including issuer program authority) BEFORE handle uniqueness.
+    const eligibility = this.checkInviteEligibilitySync(input.inviteCode);
+    if (!eligibility.ok) {
+      return eligibility;
+    }
+
+    const normalized = normalizeHandle(input.handle);
+    for (const user of this.usersById.values()) {
+      if (normalizeHandle(user.handle) === normalized) {
+        return { ok: false, code: "handle_taken" };
+      }
+    }
+
+    const invite = this.invitesByCode.get(input.inviteCode.trim());
+    if (!invite) {
+      return { ok: false, code: "invalid_invite" };
     }
 
     invite.usedCount += 1;
@@ -568,23 +881,38 @@ export class InMemoryIdentityRepository implements IdentityRepository {
       return "pending_unilateral";
     }
 
-    const initiator = await this.findUserById(input.initiatorUserId);
-    const target = await this.findUserByHandle(normalizedTarget);
+    const initiator = this.usersById.get(input.initiatorUserId) ?? null;
+    let target: UserRecord | null = null;
+    for (const user of this.usersById.values()) {
+      if (normalizeHandle(user.handle) === normalizedTarget) {
+        target = user;
+        break;
+      }
+    }
 
     if (initiator && target && initiator.id !== target.id) {
-      const reciprocalKey = `${target.id}::${normalizedInitiator}`;
       const pair = resolveCoachStudentPair(initiator, target);
-      if (this.pendingIntents.has(reciprocalKey) && pair) {
-        this.pendingIntents.delete(reciprocalKey);
-        this.pendingIntents.delete(`${initiator.id}::${normalizedTarget}`);
+      if (pair) {
         const linkKey = `${pair.coachUserId}::${pair.studentUserId}`;
-        this.links.set(linkKey, {
-          coachUserId: pair.coachUserId,
-          studentUserId: pair.studentUserId,
-          createdAt: new Date().toISOString(),
-          revokedAt: null,
-        });
-        return "active";
+        const existingLink = this.links.get(linkKey);
+        if (existingLink && existingLink.revokedAt === null) {
+          this.pendingIntents.delete(`${target.id}::${normalizedInitiator}`);
+          this.pendingIntents.delete(`${initiator.id}::${normalizedTarget}`);
+          return "active";
+        }
+
+        const reciprocalKey = `${target.id}::${normalizedInitiator}`;
+        if (this.pendingIntents.has(reciprocalKey)) {
+          this.pendingIntents.delete(reciprocalKey);
+          this.pendingIntents.delete(`${initiator.id}::${normalizedTarget}`);
+          this.links.set(linkKey, {
+            coachUserId: pair.coachUserId,
+            studentUserId: pair.studentUserId,
+            createdAt: new Date().toISOString(),
+            revokedAt: null,
+          });
+          return "active";
+        }
       }
     }
 
@@ -613,6 +941,13 @@ export class InMemoryIdentityRepository implements IdentityRepository {
   }
 
   async revokeActiveLink(userId: string, peerUserId: string): Promise<boolean> {
+    const user = this.usersById.get(userId);
+    const peer = this.usersById.get(peerUserId);
+    if (user && peer) {
+      this.pendingIntents.delete(`${user.id}::${normalizeHandle(peer.handle)}`);
+      this.pendingIntents.delete(`${peer.id}::${normalizeHandle(user.handle)}`);
+    }
+
     for (const link of this.links.values()) {
       if (link.revokedAt !== null) continue;
       const matches =

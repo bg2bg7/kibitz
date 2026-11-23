@@ -3,6 +3,7 @@ import {
   normalizeHandle,
   type DoubleBlindLinkStatus,
   type OpaqueLinkIntentResponse,
+  type UserRole,
 } from "./types.js";
 
 export interface CoachStudentLinkRecord {
@@ -138,3 +139,68 @@ export function evaluateDoubleBlindLinkTransition(
     publicResponse: OPAQUE_LINK_INTENT_RESPONSE,
   };
 }
+
+/**
+ * Returns true if the user holds a staff (`director` or `coach`) membership in the given program.
+ */
+export function hasProgramStaffMembership(
+  userId: string,
+  programId: string,
+  memberships: readonly ProgramMembershipRecord[],
+): boolean {
+  return memberships.some(
+    (membership) =>
+      membership.userId === userId &&
+      membership.programId === programId &&
+      (membership.role === "director" || membership.role === "coach"),
+  );
+}
+
+/**
+ * Shared program-invitation authority policy (ID-01).
+ * - Global `admin`: may issue invites (any role) for an existing program.
+ * - Global `coach`: may issue ONLY `student` invites, and ONLY for programs where they hold
+ *   a `director` or `coach` membership.
+ * - `moderator` and `student`: cannot issue program invites.
+ */
+export function canIssueProgramInvite(
+  actor: { id: string; role: UserRole },
+  programId: string,
+  assignedRole: UserRole,
+  memberships: readonly ProgramMembershipRecord[],
+): boolean {
+  if (!programId) {
+    return false;
+  }
+  if (actor.role === "admin") {
+    return true;
+  }
+  if (actor.role === "coach") {
+    return assignedRole === "student" && hasProgramStaffMembership(actor.id, programId, memberships);
+  }
+  return false;
+}
+
+/**
+ * Shared program-content publishing authority policy (LEC-02).
+ * - Global `admin`: may publish to any existing program.
+ * - Global `coach`: may publish ONLY to programs where they hold a `director` or `coach` membership.
+ * - `moderator` and `student`: cannot publish into a program.
+ */
+export function canPublishToProgram(
+  actor: { id: string; role: UserRole },
+  programId: string,
+  memberships: readonly ProgramMembershipRecord[],
+): boolean {
+  if (!programId) {
+    return false;
+  }
+  if (actor.role === "admin") {
+    return true;
+  }
+  if (actor.role === "coach") {
+    return hasProgramStaffMembership(actor.id, programId, memberships);
+  }
+  return false;
+}
+

@@ -16,11 +16,17 @@ export const MAX_PUBLISH_TAGS = 12;
 export const MAX_PUBLISH_TAG_LENGTH = 32;
 const TAG_VALID_PATTERN = /^[a-z0-9][a-z0-9 _-]{0,31}$/;
 
+export interface PublishableProgram {
+  id: string;
+  name: string;
+}
+
 export interface PublishToKibitzRequest {
   kibitzApiBaseUrl: string;
   session: SessionPayload;
   accessToken?: string;
   visibility?: StudyVisibility;
+  programId?: string | null;
   tags?: readonly string[];
   title?: string;
   description?: string;
@@ -47,6 +53,10 @@ export type KibitzApiUrlValidationResult =
 
 export function canRolePublishStudies(role: SessionPayload["role"]): boolean {
   return role === "coach" || role === "moderator" || role === "admin";
+}
+
+export function canRolePublishToProgram(role: SessionPayload["role"]): boolean {
+  return role === "coach" || role === "admin";
 }
 
 export function normalizePublishTag(raw: string): string | null {
@@ -182,6 +192,51 @@ export async function fetchAccountExistingTags(
 }
 
 /**
+ * Fetches the list of programs that the currently signed-in account is authorized to publish to.
+ */
+export async function fetchPublishablePrograms(
+  kibitzApiBaseUrl: string,
+  fetchImpl?: typeof fetch,
+): Promise<PublishableProgram[]> {
+  const urlCheck = validateKibitzApiBaseUrl(kibitzApiBaseUrl);
+  if (!urlCheck.ok) {
+    return [];
+  }
+  const doFetch = fetchImpl ?? globalThis.fetch;
+  if (typeof doFetch !== "function") {
+    return [];
+  }
+
+  try {
+    const res = await doFetch(`${urlCheck.normalizedUrl}/api/programs/publishable`, {
+      method: "GET",
+      credentials: "include",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) {
+      return [];
+    }
+    const body = (await res.json().catch(() => null)) as {
+      programs?: Array<{ id?: unknown; name?: unknown }>;
+    } | null;
+    if (!body || !Array.isArray(body.programs)) {
+      return [];
+    }
+    const programs: PublishableProgram[] = [];
+    for (const entry of body.programs) {
+      const id = typeof entry?.id === "string" ? entry.id.trim() : "";
+      const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+      if (id && name) {
+        programs.push({ id, name });
+      }
+    }
+    return programs;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Isolated optional publishing module for apps/scribe.
  * ESLint boundary rules permit @suite/auth-core imports ONLY inside apps/scribe/src/publish/**.
  */
@@ -201,6 +256,24 @@ export async function publishArchiveToKibitz(
       published: false,
       message: "Only coach, moderator, or admin accounts may publish .pgna studies to Kibitz.",
     };
+  }
+
+  const resolvedVisibility: StudyVisibility = request.visibility ?? "public_moderated";
+  const normalizedProgramId = typeof request.programId === "string" ? request.programId.trim() : "";
+
+  if (resolvedVisibility === "program") {
+    if (!canRolePublishToProgram(request.session.role)) {
+      return {
+        published: false,
+        message: "Only coach or admin accounts may publish to a program.",
+      };
+    }
+    if (!normalizedProgramId) {
+      return {
+        published: false,
+        message: "Select a target program before publishing with program visibility.",
+      };
+    }
   }
 
   const tagCheck = normalizePublishTags(request.tags ?? []);
@@ -238,7 +311,10 @@ export async function publishArchiveToKibitz(
   );
   form.append("title", resolvedTitle);
   form.append("description", resolvedDescription);
-  form.append("visibility", request.visibility ?? "public_moderated");
+  form.append("visibility", resolvedVisibility);
+  if (resolvedVisibility === "program") {
+    form.append("programId", normalizedProgramId);
+  }
   form.append("tags", JSON.stringify(tagCheck.tags));
 
   const headers: Record<string, string> = {};

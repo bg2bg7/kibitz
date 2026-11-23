@@ -23,6 +23,94 @@ export interface KibitzAuthMenuProps {
   compact?: boolean;
 }
 
+export const SIGN_OUT_ERROR_MESSAGE = "Sign out failed — you are still signed in.";
+
+export interface PerformKibitzSignOutOptions {
+  logout: () => Promise<boolean>;
+  onStart?: () => void;
+  onSuccess: () => void;
+  onFailure: (message: string) => void;
+  onFinally?: () => void;
+}
+
+/**
+ * Executes a sign-out request and invokes `onSuccess` ONLY when logout confirms `true`.
+ * When logout returns `false` or throws, preserves the active session and reports an error via `onFailure`.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export async function performKibitzSignOut(
+  options: PerformKibitzSignOutOptions,
+): Promise<boolean> {
+  options.onStart?.();
+  try {
+    const ok = await options.logout();
+    if (!ok) {
+      options.onFailure(SIGN_OUT_ERROR_MESSAGE);
+      return false;
+    }
+    options.onSuccess();
+    return true;
+  } catch {
+    options.onFailure(SIGN_OUT_ERROR_MESSAGE);
+    return false;
+  } finally {
+    options.onFinally?.();
+  }
+}
+
+export interface KibitzSignOutErrorBannerProps {
+  message: string;
+  onRetry: () => void;
+  retrying?: boolean;
+  compact?: boolean;
+}
+
+export function KibitzSignOutErrorBanner({
+  message,
+  onRetry,
+  retrying = false,
+  compact = false,
+}: KibitzSignOutErrorBannerProps) {
+  return (
+    <div
+      role="alert"
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: "0.4rem",
+        borderRadius: "0.5rem",
+        border: "1px solid #fecaca",
+        backgroundColor: "#fef2f2",
+        padding: compact ? "0.2rem 0.5rem" : "0.25rem 0.6rem",
+        fontSize: "0.75rem",
+        fontWeight: 500,
+        color: "#b91c1c",
+      }}
+    >
+      <span>{message}</span>
+      <button
+        id="nav-sign-out-retry"
+        type="button"
+        disabled={retrying}
+        onClick={onRetry}
+        style={{
+          borderRadius: "0.375rem",
+          border: "1px solid #fca5a5",
+          backgroundColor: "#ffffff",
+          padding: "0.1rem 0.45rem",
+          fontSize: "0.7rem",
+          fontWeight: 600,
+          color: "#991b1b",
+          cursor: retrying ? "wait" : "pointer",
+          opacity: retrying ? 0.65 : 1,
+        }}
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
 /**
  * Shared cross-service Kibitz ID authentication menu & sign-in modal.
  * Uses inline styles so it renders consistently across all apps regardless of Tailwind scanning.
@@ -43,6 +131,8 @@ export function KibitzAuthMenu({
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
 
   const user = isControlled ? controlledUser : internalUser;
 
@@ -89,6 +179,7 @@ export function KibitzAuthMenu({
       return;
     }
 
+    setSignOutError(null);
     if (!isControlled) {
       setInternalUser(result.user);
     }
@@ -98,16 +189,32 @@ export function KibitzAuthMenu({
   };
 
   const handleSignOut = async () => {
-    await logoutKibitzSession({ env });
-    if (!isControlled) {
-      setInternalUser(null);
-    }
-    onSessionChange?.(null);
+    if (signingOut) return;
+    await performKibitzSignOut({
+      logout: () => logoutKibitzSession({ env }),
+      onStart: () => {
+        setSigningOut(true);
+        setSignOutError(null);
+      },
+      onSuccess: () => {
+        setSignOutError(null);
+        if (!isControlled) {
+          setInternalUser(null);
+        }
+        onSessionChange?.(null);
+      },
+      onFailure: (message) => {
+        setSignOutError(message);
+      },
+      onFinally: () => {
+        setSigningOut(false);
+      },
+    });
   };
 
   if (user) {
     return (
-      <div style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem" }}>
+      <div style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem", flexWrap: "wrap" }}>
         <a
           id="nav-account-link"
           href={accountHref ?? idUrl}
@@ -144,6 +251,7 @@ export function KibitzAuthMenu({
         <button
           id="nav-sign-out"
           type="button"
+          disabled={signingOut}
           onClick={() => void handleSignOut()}
           style={{
             borderRadius: "0.5rem",
@@ -153,11 +261,20 @@ export function KibitzAuthMenu({
             fontSize: compact ? "0.75rem" : "0.875rem",
             fontWeight: 500,
             color: "#475569",
-            cursor: "pointer",
+            cursor: signingOut ? "wait" : "pointer",
+            opacity: signingOut ? 0.6 : 1,
           }}
         >
-          Sign out
+          {signingOut ? "Signing out…" : "Sign out"}
         </button>
+        {signOutError ? (
+          <KibitzSignOutErrorBanner
+            message={signOutError}
+            retrying={signingOut}
+            compact={compact}
+            onRetry={() => void handleSignOut()}
+          />
+        ) : null}
       </div>
     );
   }

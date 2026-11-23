@@ -9,7 +9,9 @@ import {
   coachStudentLinks,
   desc,
   eq,
+  or,
   programMemberships,
+  programs,
   sql,
   studies,
   users,
@@ -51,6 +53,11 @@ export interface AccountProfile {
   createdAt: string;
 }
 
+export interface ProgramSummary {
+  id: string;
+  name: string;
+}
+
 export interface CreateStudyInput {
   id?: string;
   ownerUserId: string;
@@ -70,6 +77,7 @@ export interface UpdateStudyInput {
   description?: string;
   tags?: string[];
   visibility?: StudyVisibility;
+  programId?: string | null;
   moderationStatus?: ModerationStatus;
 }
 
@@ -89,6 +97,9 @@ export interface StudyRepository {
   updateStudy(studyId: string, patch: UpdateStudyInput): Promise<StudyRecord | null>;
   deleteStudy(studyId: string): Promise<StudyRecord | null>;
   getViewerAccessContext(userId: string): Promise<ViewerAccessContext>;
+  programExists(programId: string): Promise<boolean>;
+  listAllPrograms(): Promise<ProgramSummary[]>;
+  listProgramsByIds(programIds: readonly string[]): Promise<ProgramSummary[]>;
 }
 
 function toIso(date: Date | string): string {
@@ -293,6 +304,7 @@ export class PostgresStudyRepository implements StudyRepository {
         ...(patch.description !== undefined ? { description: patch.description } : {}),
         ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
         ...(patch.visibility !== undefined ? { visibility: patch.visibility } : {}),
+        ...(patch.programId !== undefined ? { programId: patch.programId } : {}),
         ...(patch.moderationStatus !== undefined
           ? { moderationStatus: patch.moderationStatus }
           : {}),
@@ -305,6 +317,7 @@ export class PostgresStudyRepository implements StudyRepository {
 
     return {
       ...existing,
+      programId: updated.programId,
       title: updated.title,
       description: updated.description,
       tags: parseTagsArray(updated.tags),
@@ -346,6 +359,40 @@ export class PostgresStudyRepository implements StudyRepository {
       })),
     };
   }
+
+  async programExists(programId: string): Promise<boolean> {
+    const [row] = await this.db
+      .select({ id: programs.id })
+      .from(programs)
+      .where(eq(programs.id, programId))
+      .limit(1);
+    return Boolean(row);
+  }
+
+  async listAllPrograms(): Promise<ProgramSummary[]> {
+    const rows = await this.db
+      .select({ id: programs.id, name: programs.name })
+      .from(programs)
+      .orderBy(programs.name);
+    return rows.map((row) => ({ id: row.id, name: row.name }));
+  }
+
+  async listProgramsByIds(programIds: readonly string[]): Promise<ProgramSummary[]> {
+    const uniqueIds = [...new Set(programIds.filter(Boolean))];
+    if (uniqueIds.length === 0) {
+      return [];
+    }
+    const condition =
+      uniqueIds.length === 1
+        ? eq(programs.id, uniqueIds[0]!)
+        : or(...uniqueIds.map((id) => eq(programs.id, id)));
+    const rows = await this.db
+      .select({ id: programs.id, name: programs.name })
+      .from(programs)
+      .where(condition)
+      .orderBy(programs.name);
+    return rows.map((row) => ({ id: row.id, name: row.name }));
+  }
 }
 
 /**
@@ -357,6 +404,7 @@ export class InMemoryStudyRepository implements StudyRepository {
   private readonly accountsById = new Map<string, AccountProfile>();
   private readonly accountsByLowerHandle = new Map<string, string>();
   private readonly studiesById = new Map<string, StudyRecord>();
+  private readonly programsById = new Map<string, ProgramSummary>();
   private readonly coachLinks: CoachStudentLinkRecord[] = [];
   private readonly memberships: ProgramMembershipRecord[] = [];
 
@@ -374,6 +422,37 @@ export class InMemoryStudyRepository implements StudyRepository {
     this.accountsById.set(record.id, record);
     this.accountsByLowerHandle.set(normalizeHandle(record.handle), record.id);
     return record;
+  }
+
+  updateAccountRole(userId: string, role: UserRole): AccountProfile | null {
+    const existing = this.accountsById.get(userId);
+    if (!existing) {
+      return null;
+    }
+    const updated: AccountProfile = { ...existing, role };
+    this.accountsById.set(userId, updated);
+    for (const [studyId, study] of this.studiesById.entries()) {
+      if (study.ownerUserId === userId) {
+        this.studiesById.set(studyId, { ...study, ownerRole: role });
+      }
+    }
+    return { ...updated };
+  }
+
+  deleteAccount(userId: string): boolean {
+    const existing = this.accountsById.get(userId);
+    if (!existing) {
+      return false;
+    }
+    this.accountsById.delete(userId);
+    this.accountsByLowerHandle.delete(normalizeHandle(existing.handle));
+    return true;
+  }
+
+  registerProgram(program: ProgramSummary): ProgramSummary {
+    const record: ProgramSummary = { id: program.id, name: program.name };
+    this.programsById.set(record.id, record);
+    return { ...record };
   }
 
   addCoachStudentLink(link: CoachStudentLinkRecord): void {
@@ -448,6 +527,7 @@ export class InMemoryStudyRepository implements StudyRepository {
       ...(patch.description !== undefined ? { description: patch.description } : {}),
       ...(patch.tags !== undefined ? { tags: [...patch.tags] } : {}),
       ...(patch.visibility !== undefined ? { visibility: patch.visibility } : {}),
+      ...(patch.programId !== undefined ? { programId: patch.programId } : {}),
       ...(patch.moderationStatus !== undefined ? { moderationStatus: patch.moderationStatus } : {}),
       updatedAt: new Date().toISOString(),
     };
@@ -467,6 +547,24 @@ export class InMemoryStudyRepository implements StudyRepository {
       coachLinks: this.coachLinks.filter((l) => l.studentUserId === userId),
       programMemberships: this.memberships.filter((m) => m.userId === userId),
     };
+  }
+
+  async programExists(programId: string): Promise<boolean> {
+    return this.programsById.has(programId);
+  }
+
+  async listAllPrograms(): Promise<ProgramSummary[]> {
+    return [...this.programsById.values()]
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((p) => ({ ...p }));
+  }
+
+  async listProgramsByIds(programIds: readonly string[]): Promise<ProgramSummary[]> {
+    const wanted = new Set(programIds);
+    return [...this.programsById.values()]
+      .filter((p) => wanted.has(p.id))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((p) => ({ ...p }));
   }
 }
 

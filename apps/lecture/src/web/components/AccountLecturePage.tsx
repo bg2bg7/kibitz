@@ -3,9 +3,11 @@ import { resolveServiceUrl, type KibitzSessionUser } from "@suite/ui";
 import {
   deleteStudyById,
   fetchAccountLecturePage,
+  fetchPublishablePrograms,
   updateStudyMetadata,
   type AccountLectureResponse,
   type LectureStudy,
+  type PublishableProgram,
   type StudyVisibility,
 } from "../api";
 import { StudyCard } from "./StudyCard";
@@ -37,6 +39,10 @@ export function AccountLecturePage({
   const [editTags, setEditTags] = useState<string[]>([]);
   const [editTagInput, setEditTagInput] = useState("");
   const [editVisibility, setEditVisibility] = useState<StudyVisibility>("public_moderated");
+  const [editProgramId, setEditProgramId] = useState<string>("");
+  const [publishablePrograms, setPublishablePrograms] = useState<PublishableProgram[]>([]);
+  const [programsLoading, setProgramsLoading] = useState(false);
+  const [programsError, setProgramsError] = useState<string | null>(null);
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
 
@@ -77,12 +83,44 @@ export function AccountLecturePage({
 
   const canManage = Boolean(data?.isOwner || sessionUser?.role === "admin");
 
+  useEffect(() => {
+    if (!editingStudy) return;
+    let cancelled = false;
+    void fetchPublishablePrograms()
+      .then((programs) => {
+        if (cancelled) return;
+        setPublishablePrograms(programs);
+        setProgramsError(null);
+        setEditProgramId((current) => {
+          if (current && programs.some((p) => p.id === current)) {
+            return current;
+          }
+          return programs[0]?.id ?? "";
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setPublishablePrograms([]);
+        setEditProgramId("");
+        setProgramsError(err instanceof Error ? err.message : "Failed to load eligible programs.");
+      })
+      .finally(() => {
+        if (!cancelled) setProgramsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editingStudy]);
+
   const openTagEditor = (study: LectureStudy) => {
     setEditingStudy(study);
     setEditTags([...study.tags]);
     setEditTagInput("");
     setEditVisibility(study.visibility);
+    setEditProgramId(study.programId ?? "");
     setEditError(null);
+    setProgramsLoading(true);
+    setProgramsError(null);
   };
 
   const commitEditTagInput = () => {
@@ -115,6 +153,11 @@ export function AccountLecturePage({
 
   const handleSaveEdit = async () => {
     if (!editingStudy) return;
+    if (editVisibility === "program" && !editProgramId) {
+      setEditError("Select an eligible program before saving with School / Program visibility.");
+      return;
+    }
+
     let finalTags = [...editTags];
     if (editTagInput.trim()) {
       const extra = editTagInput
@@ -134,6 +177,7 @@ export function AccountLecturePage({
       await updateStudyMetadata(editingStudy.id, {
         tags: finalTags,
         visibility: editVisibility,
+        programId: editVisibility === "program" ? editProgramId : null,
       });
       setEditingStudy(null);
       await loadAccount();
@@ -480,6 +524,38 @@ export function AccountLecturePage({
                 </select>
               </label>
 
+              {editVisibility === "program" ? (
+                <div>
+                  {programsLoading ? (
+                    <p className="text-slate-500">Loading eligible programs…</p>
+                  ) : programsError ? (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-amber-800">
+                      {programsError}
+                    </div>
+                  ) : publishablePrograms.length === 0 ? (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-amber-800">
+                      No eligible programs found. Only admins and coaches assigned to a program may
+                      publish School / Program studies.
+                    </div>
+                  ) : (
+                    <label className="block">
+                      <span className="font-semibold text-slate-700">Program</span>
+                      <select
+                        value={editProgramId}
+                        onChange={(e) => setEditProgramId(e.target.value)}
+                        className="mt-1 w-full rounded-lg border border-stone-300 bg-white px-2.5 py-1.5"
+                      >
+                        {publishablePrograms.map((program) => (
+                          <option key={program.id} value={program.id}>
+                            {program.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                </div>
+              ) : null}
+
               {editError ? (
                 <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-rose-700">
                   {editError}
@@ -497,7 +573,11 @@ export function AccountLecturePage({
               </button>
               <button
                 type="button"
-                disabled={editBusy}
+                disabled={
+                  editBusy ||
+                  (editVisibility === "program" &&
+                    (programsLoading || publishablePrograms.length === 0 || !editProgramId))
+                }
                 onClick={() => void handleSaveEdit()}
                 className="rounded-lg bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
               >

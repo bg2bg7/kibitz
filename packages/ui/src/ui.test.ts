@@ -7,12 +7,17 @@ import {
   EmojiReactionBar,
   KibitzAuthMenu,
   KibitzLogo,
+  KibitzSignOutErrorBanner,
+  SIGN_OUT_ERROR_MESSAGE,
   SUITE_SERVICES,
   fetchKibitzSession,
   isAllowedSuiteUrl,
+  logoutKibitzSession,
+  performKibitzSignOut,
   pullReadOnlyFromService,
   resolveApiUrl,
   resolveServiceUrl,
+  type KibitzSessionUser,
 } from "./index.js";
 
 describe("@suite/ui", () => {
@@ -64,6 +69,126 @@ describe("@suite/ui", () => {
     expect(signedInHtml).toContain("coach");
     expect(signedInHtml).toContain('id="nav-sign-out"');
     expect(signedInHtml).toContain('href="http://localhost:5172/@coach_alice"');
+  });
+
+  it("preserves signed-in state and exposes error/retry when logout fails, clearing only on success (ID-05)", async () => {
+    const activeUser: KibitzSessionUser = {
+      sub: "11111111-1111-4111-8111-111111111111",
+      handle: "coach_alice",
+      role: "coach",
+      programIds: [],
+      iat: 100,
+      exp: 9999999999,
+    };
+
+    let currentUser: KibitzSessionUser | null = activeUser;
+    let signOutError: string | null = null;
+    let signingOut = false;
+    const sessionNotifications: Array<KibitzSessionUser | null> = [];
+
+    // 1. Server error (HTTP 500) -> logoutKibitzSession returns false -> user stays signed in
+    const failingFetch: typeof fetch = async () => new Response(null, { status: 500 });
+    const failedResult = await performKibitzSignOut({
+      logout: () => logoutKibitzSession({ fetchImpl: failingFetch }),
+      onStart: () => {
+        signingOut = true;
+        signOutError = null;
+      },
+      onSuccess: () => {
+        currentUser = null;
+        signOutError = null;
+        sessionNotifications.push(null);
+      },
+      onFailure: (msg) => {
+        signOutError = msg;
+      },
+      onFinally: () => {
+        signingOut = false;
+      },
+    });
+
+    expect(failedResult).toBe(false);
+    expect(currentUser).toEqual(activeUser);
+    expect(sessionNotifications).toEqual([]);
+    expect(signOutError).toBe(SIGN_OUT_ERROR_MESSAGE);
+    expect(signingOut).toBe(false);
+
+    // Verify rendered error alert & Retry button markup
+    const alertHtml = renderToStaticMarkup(
+      createElement(KibitzSignOutErrorBanner, {
+        message: signOutError ?? "",
+        retrying: false,
+        onRetry: () => {},
+      }),
+    );
+    expect(alertHtml).toContain('role="alert"');
+    expect(alertHtml).toContain(SIGN_OUT_ERROR_MESSAGE);
+    expect(alertHtml).toContain('id="nav-sign-out-retry"');
+    expect(alertHtml).toContain("Retry");
+
+    const retryingHtml = renderToStaticMarkup(
+      createElement(KibitzSignOutErrorBanner, {
+        message: SIGN_OUT_ERROR_MESSAGE,
+        retrying: true,
+        onRetry: () => {},
+      }),
+    );
+    expect(retryingHtml).toContain("disabled");
+
+    // 2. Network error -> logoutKibitzSession returns false -> user still stays signed in
+    const throwingFetch: typeof fetch = async () => {
+      throw new Error("network offline");
+    };
+    const networkFailed = await performKibitzSignOut({
+      logout: () => logoutKibitzSession({ fetchImpl: throwingFetch }),
+      onStart: () => {
+        signingOut = true;
+        signOutError = null;
+      },
+      onSuccess: () => {
+        currentUser = null;
+        sessionNotifications.push(null);
+      },
+      onFailure: (msg) => {
+        signOutError = msg;
+      },
+      onFinally: () => {
+        signingOut = false;
+      },
+    });
+
+    expect(networkFailed).toBe(false);
+    expect(currentUser).toEqual(activeUser);
+    expect(sessionNotifications).toEqual([]);
+    expect(signOutError).toBe(SIGN_OUT_ERROR_MESSAGE);
+
+    // 3. Retry succeeds (HTTP 200) -> clears user & error and notifies session change
+    const okFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ ok: true }), { status: 200 });
+    const retryResult = await performKibitzSignOut({
+      logout: () => logoutKibitzSession({ fetchImpl: okFetch }),
+      onStart: () => {
+        signingOut = true;
+        signOutError = null;
+      },
+      onSuccess: () => {
+        currentUser = null;
+        signOutError = null;
+        sessionNotifications.push(null);
+      },
+      onFailure: (msg) => {
+        signOutError = msg;
+      },
+      onFinally: () => {
+        signingOut = false;
+      },
+    });
+
+    expect(retryResult).toBe(true);
+    expect(currentUser).toBeNull();
+    expect(signOutError).toBeNull();
+    expect(signingOut).toBe(false);
+    expect(sessionNotifications).toEqual([null]);
   });
 
   it("renders KibitzLogo SVG emblem and wordmark", () => {

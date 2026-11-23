@@ -52,13 +52,15 @@ function bootstrapObjectStore(): PgnaObjectStore {
   return new InMemoryPgnaObjectStore();
 }
 
-async function bootstrapRepository(objectStore: PgnaObjectStore): Promise<StudyRepository> {
+async function bootstrapRepository(
+  objectStore: PgnaObjectStore,
+): Promise<{ repository: StudyRepository; readonlyZeroDbMode: boolean }> {
   const databaseUrl = process.env["DATABASE_URL"]?.trim();
   if (databaseUrl) {
     const { db, pool } = createDbClient(databaseUrl);
     await runSuiteMigrations(pool);
     console.log("[lecture] connected to PostgreSQL via DATABASE_URL (migrations up to date)");
-    return new PostgresStudyRepository(db);
+    return { repository: new PostgresStudyRepository(db), readonlyZeroDbMode: false };
   }
 
   if (process.env["NODE_ENV"] === "production") {
@@ -68,9 +70,9 @@ async function bootstrapRepository(objectStore: PgnaObjectStore): Promise<StudyR
   const repo = new InMemoryStudyRepository();
   await seedDemoLecturePrimer(repo, objectStore);
   console.warn(
-    '[lecture] DATABASE_URL not set; running with in-memory dev store (seeded demo primer under "@demo_coach").',
+    '[lecture] DATABASE_URL not set; running in read-only zero-DB dev mode (seeded demo primer under "@demo_coach"). Configure DATABASE_URL for cross-service writes.',
   );
-  return repo;
+  return { repository: repo, readonlyZeroDbMode: true };
 }
 
 const port = Number(
@@ -78,8 +80,8 @@ const port = Number(
 );
 const authConfig = resolveAuthConfig(process.env);
 const objectStore = bootstrapObjectStore();
-const repository = await bootstrapRepository(objectStore);
-const app = createLectureApp({ authConfig, repository, objectStore });
+const { repository, readonlyZeroDbMode } = await bootstrapRepository(objectStore);
+const app = createLectureApp({ authConfig, repository, objectStore, readonlyZeroDbMode });
 
 serve({ fetch: app.fetch, port }, (info) => {
   console.log(`[lecture] listening on http://localhost:${info.port}`);

@@ -4,11 +4,14 @@ import {
   DEFAULT_DEV_JWT_SECRET,
   buildClearSessionCookieHeader,
   buildSessionCookieHeader,
+  canIssueProgramInvite,
+  canPublishToProgram,
   canStudentReadStudy,
   computeEffectiveStudentAccess,
   evaluateDoubleBlindLinkTransition,
   extractSessionToken,
   getPasswordByteLength,
+  hasProgramStaffMembership,
   hashPassword,
   isAllowedSuiteOrigin,
   isPlaceholderJwtSecret,
@@ -346,4 +349,45 @@ describe("@suite/auth-core ACL & double-blind invariants", () => {
     await expect(verifyPassword(`${ascii72}extra-legacy-suffix`, ascii72Hash)).resolves.toBe(true);
     await expect(verifyPassword("b".repeat(100), ascii72Hash)).resolves.toBe(false);
   });
+
+  it("enforces shared program invite and program publish authority across roles and programs", () => {
+    const progA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const progB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const adminId = "00000000-0000-4000-8000-000000000001";
+    const coachA = "00000000-0000-4000-8000-000000000002";
+    const modId = "00000000-0000-4000-8000-000000000003";
+    const studentId = "00000000-0000-4000-8000-000000000004";
+
+    const memberships = [
+      { programId: progA, userId: coachA, role: "coach" as const },
+      { programId: progB, userId: coachA, role: "student" as const },
+      { programId: progA, userId: studentId, role: "student" as const },
+      { programId: progA, userId: modId, role: "director" as const },
+    ];
+
+    expect(hasProgramStaffMembership(coachA, progA, memberships)).toBe(true);
+    expect(hasProgramStaffMembership(coachA, progB, memberships)).toBe(false);
+
+    // Program invites (ID-01)
+    expect(canIssueProgramInvite({ id: adminId, role: "admin" }, progB, "coach", [])).toBe(true);
+    expect(canIssueProgramInvite({ id: coachA, role: "coach" }, progA, "student", memberships)).toBe(true);
+    expect(canIssueProgramInvite({ id: coachA, role: "coach" }, progA, "coach", memberships)).toBe(false);
+    expect(canIssueProgramInvite({ id: coachA, role: "coach" }, progB, "student", memberships)).toBe(false);
+    expect(canIssueProgramInvite({ id: modId, role: "moderator" }, progA, "student", memberships)).toBe(false);
+    expect(canIssueProgramInvite({ id: studentId, role: "student" }, progA, "student", memberships)).toBe(false);
+
+    // Program publishing (LEC-02): strictly admins and program-authorized coaches only
+    expect(canPublishToProgram({ id: adminId, role: "admin" }, progB, [])).toBe(true);
+    expect(canPublishToProgram({ id: coachA, role: "coach" }, progA, memberships)).toBe(true);
+    expect(canPublishToProgram({ id: coachA, role: "coach" }, progB, memberships)).toBe(false);
+    expect(canPublishToProgram({ id: modId, role: "moderator" }, progA, memberships)).toBe(false);
+    expect(canPublishToProgram({ id: studentId, role: "student" }, progA, memberships)).toBe(false);
+  });
+
+  it("returns null instead of throwing when session cookie contains malformed percent-encoding (ID-05)", () => {
+    expect(parseSessionCookie("kibitz_session=%E0%A4%A")).toBeNull();
+    expect(parseSessionCookie("foo=1; kibitz_session=%ZZ; bar=2")).toBeNull();
+    expect(extractSessionToken({ cookie: "kibitz_session=%E0%A4%A" })).toBeNull();
+  });
 });
+

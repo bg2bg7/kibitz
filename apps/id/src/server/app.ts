@@ -3,6 +3,7 @@ import {
   OPAQUE_LINK_INTENT_RESPONSE,
   buildClearSessionCookieHeader,
   buildSessionCookieHeader,
+  canIssueProgramInvite,
   extractSessionToken,
   hashPassword,
   isAllowedSuiteOrigin,
@@ -19,6 +20,11 @@ import { z } from "zod";
 import { InMemoryIdentityRepository, type IdentityRepository } from "./repository.js";
 
 const HANDLE_REGEX = /^[a-zA-Z0-9_-]{2,32}$/;
+
+const DEFAULT_AUTH_RATE_LIMIT: AuthRateLimitOptions = {
+  maxAttempts: 30,
+  windowMs: 60_000,
+};
 
 const LoginBodySchema = z.object({
   handle: z.string().trim().min(2).max(64),
@@ -54,17 +60,70 @@ const LinkIntentBodySchema = z.object({
   targetHandle: z.string().trim().min(2).max(64),
 });
 
+export interface AuthRateLimitOptions {
+  maxAttempts: number;
+  windowMs: number;
+}
+
 export interface CreateIdAppOptions {
   repository?: IdentityRepository;
   authConfig?: SessionJwtConfig;
   bcryptCost?: number;
+  authRateLimit?: AuthRateLimitOptions;
+}
+
+function getClientRateLimitKey(c: Context): string {
+  const forwardedFor = c.req.header("x-forwarded-for");
+  if (forwardedFor) {
+    const first = forwardedFor.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  const realIp = c.req.header("x-real-ip")?.trim();
+  if (realIp) return realIp;
+  return "local";
+}
+
+function mapInviteErrorResponse(
+  c: Context,
+  code: "invalid_invite" | "invite_expired" | "invite_exhausted",
+) {
+  if (code === "invite_expired") {
+    return c.json({ error: "This invite code has expired." }, 400);
+  }
+  if (code === "invite_exhausted") {
+    return c.json({ error: "This invite code has reached its maximum uses." }, 400);
+  }
+  return c.json({ error: "Invalid invite code." }, 400);
 }
 
 export function createIdApp(options: CreateIdAppOptions = {}) {
   const repository = options.repository ?? new InMemoryIdentityRepository();
   const authConfig = options.authConfig ?? resolveAuthConfig(process.env);
   const bcryptCost = options.bcryptCost ?? BCRYPT_COST;
+  const authRateLimit = options.authRateLimit ?? DEFAULT_AUTH_RATE_LIMIT;
+  const authAttemptsByClient = new Map<string, number[]>();
   const app = new Hono();
+
+  function isAuthRateLimited(clientKey: string): boolean {
+    const now = Date.now();
+    const windowStart = now - authRateLimit.windowMs;
+    const existing = authAttemptsByClient.get(clientKey) ?? [];
+    const recent = existing.filter((ts) => ts > windowStart);
+    if (recent.length >= authRateLimit.maxAttempts) {
+      authAttemptsByClient.set(clientKey, recent);
+      return true;
+    }
+    recent.push(now);
+    authAttemptsByClient.set(clientKey, recent);
+    if (authAttemptsByClient.size > 1000) {
+      for (const [key, timestamps] of authAttemptsByClient) {
+        if (timestamps.every((ts) => ts <= windowStart)) {
+          authAttemptsByClient.delete(key);
+        }
+      }
+    }
+    return false;
+  }
 
   // Strict cross-suite CORS & CSRF Origin check
   app.use("*", async (c, next) => {
@@ -143,6 +202,13 @@ export function createIdApp(options: CreateIdAppOptions = {}) {
 
   app.post("/auth/login", async (c) => {
     c.header("Cache-Control", "no-store");
+    if (isAuthRateLimited(getClientRateLimitKey(c))) {
+      return c.json(
+        { error: "Too many authentication attempts. Please try again shortly." },
+        429,
+      );
+    }
+
     const parsed = LoginBodySchema.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) {
       return c.json({ error: "Handle and password are required." }, 400);
@@ -175,10 +241,23 @@ export function createIdApp(options: CreateIdAppOptions = {}) {
 
   app.post("/auth/register", async (c) => {
     c.header("Cache-Control", "no-store");
+    if (isAuthRateLimited(getClientRateLimitKey(c))) {
+      return c.json(
+        { error: "Too many authentication attempts. Please try again shortly." },
+        429,
+      );
+    }
+
     const parsed = RegisterBodySchema.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) {
       const firstIssue = parsed.error.issues[0]?.message ?? "Invalid registration payload.";
       return c.json({ error: firstIssue }, 400);
+    }
+
+    // Check invite eligibility BEFORE hashing the password or probing handle existence.
+    const eligibility = await repository.checkInviteEligibility(parsed.data.inviteCode);
+    if (!eligibility.ok) {
+      return mapInviteErrorResponse(c, eligibility.code);
     }
 
     const passwordHash = await hashPassword(parsed.data.password, bcryptCost);
@@ -192,13 +271,7 @@ export function createIdApp(options: CreateIdAppOptions = {}) {
       if (result.code === "handle_taken") {
         return c.json({ error: "That handle is already taken." }, 409);
       }
-      if (result.code === "invite_expired") {
-        return c.json({ error: "This invite code has expired." }, 400);
-      }
-      if (result.code === "invite_exhausted") {
-        return c.json({ error: "This invite code has reached its maximum uses." }, 400);
-      }
-      return c.json({ error: "Invalid invite code." }, 400);
+      return mapInviteErrorResponse(c, result.code);
     }
 
     const { token, payload } = await signSessionToken(
@@ -239,6 +312,28 @@ export function createIdApp(options: CreateIdAppOptions = {}) {
       return c.json({ error: "Coaches can only issue student invite codes." }, 403);
     }
 
+    const programId = parsed.data.programId ?? null;
+    if (programId) {
+      const exists = await repository.programExists(programId);
+      if (!exists) {
+        return c.json({ error: "Target program not found." }, 404);
+      }
+      const memberships = await repository.getUserProgramMemberships(session.sub);
+      if (
+        !canIssueProgramInvite(
+          { id: session.sub, role: session.role },
+          programId,
+          parsed.data.assignedRole,
+          memberships,
+        )
+      ) {
+        return c.json(
+          { error: "You are not authorized to issue invitations for that program." },
+          403,
+        );
+      }
+    }
+
     const expiresAt = parsed.data.expiresInHours
       ? new Date(Date.now() + parsed.data.expiresInHours * 60 * 60 * 1000)
       : null;
@@ -246,7 +341,7 @@ export function createIdApp(options: CreateIdAppOptions = {}) {
     const invite = await repository.createInvite({
       createdByUserId: session.sub,
       assignedRole: parsed.data.assignedRole,
-      programId: parsed.data.programId ?? null,
+      programId,
       maxUses: parsed.data.maxUses,
       expiresAt,
     });

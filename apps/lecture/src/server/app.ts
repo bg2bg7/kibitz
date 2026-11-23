@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   buildClearSessionCookieHeader,
+  canPublishToProgram,
   canStudentReadStudy,
   computeEffectiveStudentAccess,
   extractSessionToken,
@@ -10,7 +11,6 @@ import {
   verifySessionToken,
   type EffectiveStudentAccess,
   type SessionJwtConfig,
-  type SessionPayload,
   type UserRole,
 } from "@suite/auth-core";
 import { PGNA_MIME_TYPE, validatePgnaZip } from "@suite/pgna";
@@ -33,6 +33,11 @@ import {
 
 const MAX_PGNA_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
 
+const ZERO_DB_WRITE_ERROR =
+  "Lecture is running in read-only zero-database dev mode. Configure DATABASE_URL (PostgreSQL) to enable cross-service publishing, editing, and deleting.";
+
+const ProgramIdSchema = z.string().uuid();
+
 const StudyVisibilitySchema = z.enum([
   "public_moderated",
   "coach_students",
@@ -45,6 +50,7 @@ const UpdateStudyBodySchema = z.object({
   description: z.string().max(4000).optional(),
   tags: z.array(z.string()).optional(),
   visibility: StudyVisibilitySchema.optional(),
+  programId: z.string().uuid().nullable().optional(),
 });
 
 export interface StudyDto {
@@ -54,6 +60,7 @@ export interface StudyDto {
   tags: string[];
   ownerHandle: string;
   ownerRole: UserRole;
+  programId: string | null;
   visibility: StudyVisibility;
   moderationStatus: "pending" | "approved" | "rejected";
   archivePath: string;
@@ -65,7 +72,20 @@ export interface CreateLectureAppOptions {
   authConfig?: SessionJwtConfig;
   repository?: StudyRepository;
   objectStore?: PgnaObjectStore;
+  readonlyZeroDbMode?: boolean;
 }
+
+interface CurrentPrincipal {
+  sub: string;
+  handle: string;
+  role: UserRole;
+}
+
+type PrincipalResolution =
+  | { status: "anonymous"; principal: null }
+  | { status: "invalid_token"; principal: null }
+  | { status: "missing_account"; principal: null }
+  | { status: "authenticated"; principal: CurrentPrincipal };
 
 function canPublishRole(role: UserRole): boolean {
   return role === "coach" || role === "moderator" || role === "admin";
@@ -79,6 +99,7 @@ function toStudyDto(record: StudyRecord): StudyDto {
     tags: [...record.tags],
     ownerHandle: record.ownerHandle,
     ownerRole: record.ownerRole,
+    programId: record.programId,
     visibility: record.visibility,
     moderationStatus: record.moderationStatus,
     archivePath: `/api/studies/${encodeURIComponent(record.id)}/archive`,
@@ -97,7 +118,7 @@ function slugifyFilename(title: string): string {
 
 function canViewerReadStudy(
   study: StudyRecord,
-  viewer: SessionPayload | null,
+  viewer: CurrentPrincipal | null,
   effectiveAccess: EffectiveStudentAccess | null,
 ): boolean {
   if (study.visibility === "public_moderated" && study.moderationStatus === "approved") {
@@ -125,6 +146,8 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
   const authConfig = options.authConfig ?? resolveAuthConfig(process.env);
   const repository = options.repository ?? new InMemoryStudyRepository();
   const objectStore = options.objectStore ?? new InMemoryPgnaObjectStore();
+  const readonlyZeroDbMode = options.readonlyZeroDbMode ?? false;
+  const clearCookieOnMissingAccount = !readonlyZeroDbMode;
   const app = new Hono();
 
   app.use("*", async (c, next) => {
@@ -150,20 +173,44 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
     await next();
   });
 
-  async function authenticateOptional(c: Context): Promise<SessionPayload | null> {
+  async function resolveCurrentPrincipal(c: Context): Promise<PrincipalResolution> {
+    const cookieHeader = c.req.header("cookie");
     const token = extractSessionToken({
       authorization: c.req.header("authorization"),
-      cookie: c.req.header("cookie"),
+      cookie: cookieHeader,
     });
     if (!token) {
-      return null;
+      return { status: "anonymous", principal: null };
     }
+
     const verified = await verifySessionToken(token, authConfig);
-    return verified.valid ? verified.payload : null;
+    if (!verified.valid || !verified.payload) {
+      if (cookieHeader && !readonlyZeroDbMode) {
+        c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
+      }
+      return { status: "invalid_token", principal: null };
+    }
+
+    const account = await repository.findAccountById(verified.payload.sub);
+    if (!account) {
+      if (cookieHeader && clearCookieOnMissingAccount) {
+        c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
+      }
+      return { status: "missing_account", principal: null };
+    }
+
+    return {
+      status: "authenticated",
+      principal: {
+        sub: account.id,
+        handle: account.handle,
+        role: account.role,
+      },
+    };
   }
 
   async function resolveEffectiveAccess(
-    viewer: SessionPayload | null,
+    viewer: CurrentPrincipal | null,
   ): Promise<EffectiveStudentAccess | null> {
     if (!viewer) return null;
     const ctx = await repository.getViewerAccessContext(viewer.sub);
@@ -211,22 +258,22 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
   });
 
   app.get("/api/assignments", async (c) => {
-    const token = extractSessionToken({
-      authorization: c.req.header("authorization"),
-      cookie: c.req.header("cookie"),
-    });
-    if (!token) {
-      return c.json({ error: "Authentication required for coach assignments." }, 401);
+    const resolved = await resolveCurrentPrincipal(c);
+    if (resolved.status !== "authenticated") {
+      const error =
+        resolved.status === "anonymous"
+          ? "Authentication required for coach assignments."
+          : resolved.status === "missing_account"
+            ? "Your Kibitz ID session is no longer valid (account not found). Please sign in again."
+            : "Invalid or expired Kibitz ID session.";
+      return c.json({ error }, 401);
     }
-    const verified = await verifySessionToken(token, authConfig);
-    if (!verified.valid || !verified.payload) {
-      return c.json({ error: "Invalid or expired Kibitz ID session." }, 401);
-    }
+
     return c.json({
       viewer: {
-        sub: verified.payload.sub,
-        handle: verified.payload.handle,
-        role: verified.payload.role,
+        sub: resolved.principal.sub,
+        handle: resolved.principal.handle,
+        role: resolved.principal.role,
       },
       items: [],
       interactionPolicy: "emoji_only",
@@ -234,28 +281,61 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
   });
 
   /**
+   * Lists the programs that the currently authenticated principal is authorized to publish into.
+   * Global admins see all programs; coaches see programs where they hold `director` or `coach`
+   * membership; moderators and students receive an empty list.
+   */
+  app.get("/api/programs/publishable", async (c) => {
+    const resolved = await resolveCurrentPrincipal(c);
+    if (resolved.status !== "authenticated") {
+      return c.json({ error: "Authentication required." }, 401);
+    }
+    const { principal } = resolved;
+    if (principal.role === "admin") {
+      const programs = await repository.listAllPrograms();
+      return c.json({ programs });
+    }
+    if (principal.role === "coach") {
+      const ctx = await repository.getViewerAccessContext(principal.sub);
+      const eligibleIds = [
+        ...new Set(
+          ctx.programMemberships
+            .filter((membership) =>
+              canPublishToProgram(
+                { id: principal.sub, role: principal.role },
+                membership.programId,
+                ctx.programMemberships,
+              ),
+            )
+            .map((membership) => membership.programId),
+        ),
+      ];
+      const programs = await repository.listProgramsByIds(eligibleIds);
+      return c.json({ programs });
+    }
+    return c.json({ programs: [] });
+  });
+
+  /**
    * Publishes a validated PGNA v1.0 archive from Scribe with user-chosen tags.
    * Requires an authenticated coach, moderator, or admin Kibitz ID session.
    */
   app.post("/api/studies", async (c) => {
-    const session = await authenticateOptional(c);
-    if (!session) {
-      return c.json({ error: "Sign in with Kibitz ID to publish a .pgna lecture." }, 401);
+    if (readonlyZeroDbMode) {
+      return c.json({ error: ZERO_DB_WRITE_ERROR }, 503);
     }
 
-    const ownerAccount = await repository.findAccountById(session.sub);
-    if (!ownerAccount) {
-      c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
-      return c.json(
-        {
-          error:
-            "Your Kibitz ID session is no longer valid (account not found). Please sign in again.",
-        },
-        401,
-      );
+    const resolved = await resolveCurrentPrincipal(c);
+    if (resolved.status !== "authenticated") {
+      const error =
+        resolved.status === "missing_account"
+          ? "Your Kibitz ID session is no longer valid (account not found). Please sign in again."
+          : "Sign in with Kibitz ID to publish a .pgna lecture.";
+      return c.json({ error }, 401);
     }
+    const { principal } = resolved;
 
-    if (!canPublishRole(ownerAccount.role)) {
+    if (!canPublishRole(principal.role)) {
       return c.json(
         { error: "Only coach, moderator, or admin accounts may publish .pgna studies." },
         403,
@@ -306,8 +386,40 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
     const visibility = parsedVisibility.data;
 
     const rawProgramId = formData.get("programId");
-    const programId =
+    const trimmedProgramId =
       typeof rawProgramId === "string" && rawProgramId.trim() ? rawProgramId.trim() : null;
+    if (trimmedProgramId !== null && !ProgramIdSchema.safeParse(trimmedProgramId).success) {
+      return c.json({ error: "Invalid programId format; expected a UUID." }, 400);
+    }
+
+    let resolvedProgramId: string | null = null;
+    if (visibility === "program") {
+      if (!trimmedProgramId) {
+        return c.json(
+          { error: "A target program must be selected when visibility is set to program." },
+          400,
+        );
+      }
+      if (!(await repository.programExists(trimmedProgramId))) {
+        return c.json({ error: "Target program not found." }, 404);
+      }
+      const ctx = await repository.getViewerAccessContext(principal.sub);
+      if (
+        !canPublishToProgram(
+          { id: principal.sub, role: principal.role },
+          trimmedProgramId,
+          ctx.programMemberships,
+        )
+      ) {
+        return c.json(
+          {
+            error: "Only admins and coaches assigned to that program may publish program studies.",
+          },
+          403,
+        );
+      }
+      resolvedProgramId = trimmedProgramId;
+    }
 
     const rawTags = parseRawTagsField(formData.get("tags"));
     const normalizedTags = normalizeStudyTags(rawTags);
@@ -325,7 +437,7 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
     const moderationStatus = visibility === "public_moderated" ? "approved" : "pending";
 
     const studyId = randomUUID();
-    const objectKey = `studies/${ownerAccount.id}/${studyId}.pgna`;
+    const objectKey = `studies/${principal.sub}/${studyId}.pgna`;
 
     try {
       await objectStore.put(objectKey, bytes, PGNA_MIME_TYPE);
@@ -341,10 +453,10 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
     try {
       const created = await repository.createStudy({
         id: studyId,
-        ownerUserId: ownerAccount.id,
-        ownerHandle: ownerAccount.handle,
-        ownerRole: ownerAccount.role,
-        programId,
+        ownerUserId: principal.sub,
+        ownerHandle: principal.handle,
+        ownerRole: principal.role,
+        programId: resolvedProgramId,
         title,
         description,
         tags: normalizedTags.tags,
@@ -371,7 +483,9 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
           ? (cause as { code?: unknown }).code
           : undefined;
       if (pgCode === "23503") {
-        c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
+        if (c.req.header("cookie") && clearCookieOnMissingAccount) {
+          c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
+        }
         return c.json(
           {
             error:
@@ -381,9 +495,7 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
         );
       }
       const causeMsg =
-        cause instanceof Error && cause.message
-          ? ` (${cause.message})`
-          : "";
+        cause instanceof Error && cause.message ? ` (${cause.message})` : "";
       return c.json(
         {
           error: `Failed to save study metadata: ${err instanceof Error ? err.message : String(err)}${causeMsg}`,
@@ -398,7 +510,7 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
    * Supports optional `?tag=`, `?author=`, and `?q=` query filters.
    */
   app.get("/api/studies", async (c) => {
-    const viewer = await authenticateOptional(c);
+    const { principal: viewer } = await resolveCurrentPrincipal(c);
     const effectiveAccess = await resolveEffectiveAccess(viewer);
 
     const allStudies = await repository.listAllStudies();
@@ -478,7 +590,7 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
       return c.json({ error: "Account handle is required." }, 400);
     }
 
-    const viewer = await authenticateOptional(c);
+    const { principal: viewer } = await resolveCurrentPrincipal(c);
     const account = await repository.findAccountByHandle(rawHandle);
     if (!account) {
       return c.json({ error: `Account "@${rawHandle}" not found.` }, 404);
@@ -516,7 +628,7 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
    */
   app.get("/api/studies/:id", async (c) => {
     const studyId = c.req.param("id");
-    const viewer = await authenticateOptional(c);
+    const { principal: viewer } = await resolveCurrentPrincipal(c);
     const study = await repository.getStudyById(studyId);
     if (!study) {
       return c.json({ error: "Study not found." }, 404);
@@ -539,7 +651,7 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
    */
   app.get("/api/studies/:id/archive", async (c) => {
     const studyId = c.req.param("id");
-    const viewer = await authenticateOptional(c);
+    const { principal: viewer } = await resolveCurrentPrincipal(c);
     const study = await repository.getStudyById(studyId);
     if (!study) {
       return c.json({ error: "Study not found." }, 404);
@@ -584,17 +696,26 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
    * Updates study metadata/tags/visibility (owner or admin only).
    */
   app.patch("/api/studies/:id", async (c) => {
-    const session = await authenticateOptional(c);
-    if (!session) {
-      return c.json({ error: "Authentication required." }, 401);
+    if (readonlyZeroDbMode) {
+      return c.json({ error: ZERO_DB_WRITE_ERROR }, 503);
     }
+
+    const resolved = await resolveCurrentPrincipal(c);
+    if (resolved.status !== "authenticated") {
+      const error =
+        resolved.status === "missing_account"
+          ? "Your Kibitz ID session is no longer valid (account not found). Please sign in again."
+          : "Authentication required.";
+      return c.json({ error }, 401);
+    }
+    const { principal } = resolved;
 
     const studyId = c.req.param("id");
     const existing = await repository.getStudyById(studyId);
     if (!existing) {
       return c.json({ error: "Study not found." }, 404);
     }
-    if (existing.ownerUserId !== session.sub && session.role !== "admin") {
+    if (existing.ownerUserId !== principal.sub && principal.role !== "admin") {
       return c.json({ error: "Only the study owner or an admin may update this study." }, 403);
     }
 
@@ -617,15 +738,52 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
       nextTags = normalized.tags;
     }
 
-    const nextVisibility = parsed.data.visibility;
+    const nextVisibility = parsed.data.visibility ?? existing.visibility;
+    const nextProgramId =
+      parsed.data.programId !== undefined ? parsed.data.programId : existing.programId;
+
+    let patchProgramId: string | null | undefined;
+    if (nextVisibility === "program") {
+      if (!nextProgramId) {
+        return c.json(
+          { error: "A target program must be selected when visibility is set to program." },
+          400,
+        );
+      }
+      if (!(await repository.programExists(nextProgramId))) {
+        return c.json({ error: "Target program not found." }, 404);
+      }
+      const ctx = await repository.getViewerAccessContext(principal.sub);
+      if (
+        !canPublishToProgram(
+          { id: principal.sub, role: principal.role },
+          nextProgramId,
+          ctx.programMemberships,
+        )
+      ) {
+        return c.json(
+          {
+            error: "Only admins and coaches assigned to that program may publish program studies.",
+          },
+          403,
+        );
+      }
+      if (parsed.data.programId !== undefined || parsed.data.visibility !== undefined) {
+        patchProgramId = nextProgramId;
+      }
+    } else if (parsed.data.visibility !== undefined || parsed.data.programId !== undefined) {
+      patchProgramId = null;
+    }
+
     const nextModeration =
-      nextVisibility === "public_moderated" ? "approved" : undefined;
+      parsed.data.visibility === "public_moderated" ? "approved" : undefined;
 
     const updated = await repository.updateStudy(studyId, {
       ...(parsed.data.title !== undefined ? { title: parsed.data.title } : {}),
       ...(parsed.data.description !== undefined ? { description: parsed.data.description } : {}),
       ...(nextTags !== undefined ? { tags: nextTags } : {}),
-      ...(nextVisibility !== undefined ? { visibility: nextVisibility } : {}),
+      ...(parsed.data.visibility !== undefined ? { visibility: parsed.data.visibility } : {}),
+      ...(patchProgramId !== undefined ? { programId: patchProgramId } : {}),
       ...(nextModeration !== undefined ? { moderationStatus: nextModeration } : {}),
     });
 
@@ -640,17 +798,26 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
    * Deletes a study and its `.pgna` blob (owner or admin only).
    */
   app.delete("/api/studies/:id", async (c) => {
-    const session = await authenticateOptional(c);
-    if (!session) {
-      return c.json({ error: "Authentication required." }, 401);
+    if (readonlyZeroDbMode) {
+      return c.json({ error: ZERO_DB_WRITE_ERROR }, 503);
     }
+
+    const resolved = await resolveCurrentPrincipal(c);
+    if (resolved.status !== "authenticated") {
+      const error =
+        resolved.status === "missing_account"
+          ? "Your Kibitz ID session is no longer valid (account not found). Please sign in again."
+          : "Authentication required.";
+      return c.json({ error }, 401);
+    }
+    const { principal } = resolved;
 
     const studyId = c.req.param("id");
     const existing = await repository.getStudyById(studyId);
     if (!existing) {
       return c.json({ error: "Study not found." }, 404);
     }
-    if (existing.ownerUserId !== session.sub && session.role !== "admin") {
+    if (existing.ownerUserId !== principal.sub && principal.role !== "admin") {
       return c.json({ error: "Only the study owner or an admin may delete this study." }, 403);
     }
 

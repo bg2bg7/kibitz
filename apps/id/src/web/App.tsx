@@ -49,14 +49,19 @@ function getInitialQueryParams(): { tab: AuthTab; invite: string; returnTo: stri
   };
 }
 
-export function App() {
+export interface IdAppProps {
+  initialUser?: KibitzSessionUser | null;
+  initialLogoutError?: string | null;
+}
+
+export function App({ initialUser = null, initialLogoutError = null }: IdAppProps) {
   const initialParams = getInitialQueryParams();
   const homeUrl = resolveServiceUrl("kibitz", { env: VITE_ENV });
   const idWebUrl = resolveServiceUrl("id", { env: VITE_ENV });
   const idApiUrl = resolveApiUrl("id", { env: VITE_ENV });
 
-  const [sessionLoading, setSessionLoading] = useState(true);
-  const [user, setUser] = useState<KibitzSessionUser | null>(null);
+  const [sessionLoading, setSessionLoading] = useState(initialUser === null);
+  const [user, setUser] = useState<KibitzSessionUser | null>(initialUser);
   const [activeTab, setActiveTab] = useState<AuthTab>(initialParams.tab);
   const [returnTo] = useState<string | null>(initialParams.returnTo);
 
@@ -72,6 +77,8 @@ export function App() {
   const [regPassword, setRegPassword] = useState("");
 
   // Signed-in management state
+  const [logoutError, setLogoutError] = useState<string | null>(initialLogoutError);
+  const [logoutSubmitting, setLogoutSubmitting] = useState(false);
   const [invites, setInvites] = useState<InviteItem[]>([]);
   const [inviteRole, setInviteRole] = useState<KibitzUserRole>("student");
   const [inviteMaxUses, setInviteMaxUses] = useState("1");
@@ -148,6 +155,7 @@ export function App() {
     }
 
     setLoginPassword("");
+    setLogoutError(null);
     if (returnTo && typeof window !== "undefined") {
       window.location.assign(returnTo);
       return;
@@ -187,6 +195,7 @@ export function App() {
       }
 
       setRegPassword("");
+      setLogoutError(null);
       setAuthSubmitting(false);
       if (returnTo && typeof window !== "undefined") {
         window.location.assign(returnTo);
@@ -201,7 +210,16 @@ export function App() {
   };
 
   const handleLogout = async () => {
-    await logoutKibitzSession({ env: VITE_ENV });
+    setLogoutError(null);
+    setLogoutSubmitting(true);
+    const ok = await logoutKibitzSession({ env: VITE_ENV });
+    setLogoutSubmitting(false);
+    if (!ok) {
+      setLogoutError(
+        "Unable to sign out cleanly. Your session may still be active — please try again.",
+      );
+      return;
+    }
     setUser(null);
     setInvites([]);
     setLinks([]);
@@ -347,13 +365,33 @@ export function App() {
                 <button
                   id="id-sign-out-button"
                   type="button"
+                  disabled={logoutSubmitting}
                   onClick={() => void handleLogout()}
-                  className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2 text-sm font-medium text-red-700 transition hover:bg-red-100"
+                  className="rounded-lg border border-red-200 bg-red-50 px-3.5 py-2 text-sm font-medium text-red-700 transition hover:bg-red-100 disabled:opacity-60"
                 >
-                  Sign Out
+                  {logoutSubmitting ? "Signing out…" : "Sign Out"}
                 </button>
               </div>
             </div>
+
+            {logoutError ? (
+              <div
+                id="id-sign-out-error"
+                role="alert"
+                className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-sm text-red-700"
+              >
+                <span>{logoutError}</span>
+                <button
+                  id="id-sign-out-retry-button"
+                  type="button"
+                  disabled={logoutSubmitting}
+                  onClick={() => void handleLogout()}
+                  className="rounded-md border border-red-300 bg-white px-2.5 py-1 text-xs font-semibold text-red-700 transition hover:bg-red-100 disabled:opacity-60"
+                >
+                  {logoutSubmitting ? "Retrying…" : "Retry Sign Out"}
+                </button>
+              </div>
+            ) : null}
           </section>
 
           <div className="grid gap-6 lg:grid-cols-2">

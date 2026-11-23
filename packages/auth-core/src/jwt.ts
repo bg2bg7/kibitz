@@ -269,7 +269,14 @@ export function parseSessionCookie(
     const key = rawPair.slice(0, eqIndex).trim();
     if (key === cookieName) {
       const value = rawPair.slice(eqIndex + 1).trim();
-      return value ? decodeURIComponent(value) : null;
+      if (!value) {
+        return null;
+      }
+      try {
+        return decodeURIComponent(value);
+      } catch {
+        return null;
+      }
     }
   }
   return null;

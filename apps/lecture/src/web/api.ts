@@ -11,11 +11,17 @@ export interface LectureStudy {
   tags: string[];
   ownerHandle: string;
   ownerRole: KibitzUserRole;
+  programId: string | null;
   visibility: StudyVisibility;
   moderationStatus: "pending" | "approved" | "rejected";
   archivePath: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface PublishableProgram {
+  id: string;
+  name: string;
 }
 
 export interface TagCount {
@@ -133,6 +139,20 @@ export async function fetchStudyArchiveBytes(studyId: string): Promise<Uint8Arra
   return new Uint8Array(await res.arrayBuffer());
 }
 
+export async function fetchPublishablePrograms(): Promise<PublishableProgram[]> {
+  const res = await fetch(`${getLectureApiBaseUrl()}/api/programs/publishable`, {
+    method: "GET",
+    credentials: "include",
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: string } | null;
+    throw new Error(body?.error ?? `Failed to load publishable programs (HTTP ${res.status}).`);
+  }
+  const data = (await res.json()) as { programs: PublishableProgram[] };
+  return data.programs;
+}
+
 export async function updateStudyMetadata(
   studyId: string,
   patch: {
@@ -140,6 +160,7 @@ export async function updateStudyMetadata(
     description?: string;
     tags?: string[];
     visibility?: StudyVisibility;
+    programId?: string | null;
   },
 ): Promise<LectureStudy> {
   const res = await fetch(
