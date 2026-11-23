@@ -5,8 +5,9 @@
   "type": "module",
   "license": "AGPL-3.0-only",
   "scripts": {
-    "dev": "vite --port 5170",
+    "dev": "vite --port 5170 --strictPort",
     "build": "vite build",
+    "preview": "vite preview --port 5170 --strictPort",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run"

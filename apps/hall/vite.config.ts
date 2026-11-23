@@ -6,6 +6,11 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     port: 5173,
+    strictPort: true,
+  },
+  preview: {
+    port: 5173,
+    strictPort: true,
   },
   build: {
     outDir: "dist-web",

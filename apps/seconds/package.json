@@ -5,9 +5,9 @@
   "type": "module",
   "license": "AGPL-3.0-only",
   "scripts": {
-    "dev": "vite --port 5176",
+    "dev": "vite --port 5176 --strictPort",
     "build": "vite build",
-    "preview": "vite preview --port 5176",
+    "preview": "vite preview --port 5176 --strictPort",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run"

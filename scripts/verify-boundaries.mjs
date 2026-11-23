@@ -196,7 +196,42 @@ async function verifyEslintGuardrails() {
   }
 }
 
+async function auditDeterministicDevPorts() {
+  const expectedPorts = {
+    kibitz: 5170,
+    id: 5171,
+    lecture: 5172,
+    hall: 5173,
+    scribe: 5174,
+    arbiter: 5175,
+    seconds: 5176,
+  };
+
+  for (const [appName, port] of Object.entries(expectedPorts)) {
+    const vitePath = path.join(REPO_ROOT, "apps", appName, "vite.config.ts");
+    const viteSrc = await readFile(vitePath, "utf8");
+    const serverBlock = /server:\s*\{[^}]*\}/s.exec(viteSrc)?.[0] ?? "";
+    if (!new RegExp(`port:\\s*${port}\\b`).test(serverBlock)) {
+      errors.push(`[PORTS] apps/${appName}/vite.config.ts must configure server.port = ${port}.`);
+    }
+    if (!/strictPort:\s*true\b/.test(serverBlock)) {
+      errors.push(
+        `[PORTS] apps/${appName}/vite.config.ts must set server.strictPort = true so Vite never silently hops onto another app's port.`,
+      );
+    }
+
+    const pkg = await readPackageJson(path.join("apps", appName));
+    const webDevScript = pkg.scripts?.["dev:web"] ?? pkg.scripts?.["dev"] ?? "";
+    if (!webDevScript.includes(`--port ${port}`) || !webDevScript.includes("--strictPort")) {
+      errors.push(
+        `[PORTS] apps/${appName}/package.json Vite dev script must include "--port ${port} --strictPort" (got: "${webDevScript}").`,
+      );
+    }
+  }
+}
+
 await auditPackageManifests();
+await auditDeterministicDevPorts();
 await verifyEslintGuardrails();
 
 if (errors.length > 0) {
@@ -208,5 +243,5 @@ if (errors.length > 0) {
 }
 
 console.log(
-  "Boundary verification PASSED: Zero-PII firewall, pure package, and cross-app guardrails are active.",
+  "Boundary verification PASSED: Zero-PII firewall, pure package, deterministic port, and cross-app guardrails are active.",
 );
