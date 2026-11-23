@@ -10,7 +10,7 @@ Licensed under the **GNU Affero General Public License v3.0 (`AGPL-3.0-only`)**.
 
 ### Prerequisites
 
-- Node.js `>= 22`
+- Node.js `>= 22.13.0`
 - `pnpm` (`>= 9`, pinned via `packageManager` in root `package.json`)
 - Docker & Docker Compose (for local PostgreSQL 16 + RustFS S3-compatible storage)
 
@@ -89,12 +89,25 @@ pnpm --filter @suite/kibitz dev
 Run the full verification suite from the repository root:
 
 ```bash
-pnpm verify:boundaries   # Audits package.json graphs + proves ESLint rejects Zero-PII/layer violations
-pnpm typecheck           # Strict TypeScript checks across all packages & apps
-pnpm lint                # ESLint v9 flat config + boundary rules
-pnpm test                # Vitest unit & integration tests
-pnpm build               # Full Turborepo build (packages -> servers -> Vite web/PWA bundles)
+pnpm verify:boundaries                  # Audits package.json graphs + proves ESLint rejects Zero-PII/layer violations
+pnpm typecheck                          # Strict TypeScript checks across all packages & apps
+pnpm lint                               # ESLint v9 flat config + boundary rules
+pnpm test                               # Vitest unit & integration tests
+pnpm build                              # Full Turborepo build (packages -> servers -> Vite web/PWA bundles)
+node scripts/verify-boundaries.mjs --check-dist # Verifies built offline PWA bundles & service workers contain zero upload paths
+pnpm audit --prod                       # Verifies zero production dependency advisories
 ```
+
+### Dependency Audit & Dev-Toolchain Exceptions (`OPS-02`)
+
+- **Production dependency scope (`pnpm audit --prod`):** **0 advisories** (enforced in CI).
+- **Development toolchain scope (`pnpm audit`):** Without forcing incompatible major transitive overrides on `drizzle-kit@0.31.11` (latest stable 0.x) and `vite-plugin-pwa@2.0.0` (latest stable 2.x), three moderate **dev-only** advisories are tracked as bounded build-time exceptions until upstream parent releases ship updated majors:
+
+| Advisory | Transitive path (dev-only) | Patched floor | Owner | Expiry / Review date |
+| --- | --- | --- | --- | --- |
+| `GHSA-67mh-4wv8-2f99` | `@suite/db > drizzle-kit > @esbuild-kit/esm-loader > @esbuild-kit/core-utils > esbuild@0.18.20` | `>= 0.25.0` | Platform / DB | `2027-02-28` (or `drizzle-kit` 1.0 GA) |
+| `GHSA-3g3m-2fjr-6pw4` | `@suite/{arbiter,seconds} > vite-plugin-pwa > workbox-build > glob@11.1.0` | `>= 14.0.2` | Platform / Frontend | `2027-02-28` (or `vite-plugin-pwa` next release) |
+| `GHSA-g3hv-75wg-m249` | `@suite/{arbiter,seconds} > vite-plugin-pwa > workbox-build > glob > minimatch@10.2.6` | `>= 11.0.1` | Platform / Frontend | `2027-02-28` (or `vite-plugin-pwa` next release) |
 
 ---
 

@@ -385,4 +385,53 @@ describe("@suite/scribe studio", () => {
       }
     }
   });
+
+  it("UI-02 & UI-03: preserves full elapsed frame delta across suspension and renders accessible dialogs & associated textarea labels", async () => {
+    const { computePlaybackFrameDeltaMs } = await import("./components/PreviewPlayer");
+    // A 1500ms frame suspension advances by full 1500ms rather than clamping to 100ms
+    expect(computePlaybackFrameDeltaMs(1000, 2500)).toBe(1500);
+    expect(computePlaybackFrameDeltaMs(2500, 2400)).toBe(0);
+    expect(computePlaybackFrameDeltaMs(Number.NaN, 2500)).toBe(0);
+
+    const { DraftsModal } = await import("./components/DraftsModal");
+    const { PublishModal } = await import("./publish/PublishModal");
+    const { INITIAL_PUBLISH_JOB_STATE } = await import("./publish/kibitzPublisher");
+
+    const draftsHtml = renderToStaticMarkup(
+      createElement(DraftsModal, {
+        open: true,
+        activeDraftId: "d1",
+        drafts: [],
+        onClose: () => undefined,
+        onCreateBlank: () => undefined,
+        onLoadDemo: () => undefined,
+        onOpenDraft: () => undefined,
+        onDeleteDraft: () => undefined,
+      }),
+    );
+    expect(draftsHtml).toContain('role="dialog"');
+    expect(draftsHtml).toContain('aria-modal="true"');
+    expect(draftsHtml).toContain('aria-labelledby="scribe-drafts-dialog-title"');
+    expect(draftsHtml).toContain('id="scribe-drafts-dialog-title"');
+
+    const demoDraft = createBlankDraft("Accessible Dialog Test");
+    const publishHtml = renderToStaticMarkup(
+      createElement(PublishModal, {
+        open: true,
+        manifest: demoDraft.manifest,
+        sessionUser: null,
+        publishState: INITIAL_PUBLISH_JOB_STATE,
+        onStartPublish: async () => ({ published: false, message: "test" }),
+        onResetPublishResult: () => undefined,
+        onSessionChange: () => undefined,
+        onClose: () => undefined,
+        onExportLocalPgna: () => undefined,
+      }),
+    );
+    expect(publishHtml).toContain('role="dialog"');
+    expect(publishHtml).toContain('aria-modal="true"');
+    expect(publishHtml).toContain('aria-labelledby="scribe-publish-dialog-title"');
+    expect(publishHtml).toContain('id="scribe-publish-dialog-title"');
+  });
 });
+

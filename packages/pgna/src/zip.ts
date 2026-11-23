@@ -9,6 +9,7 @@ import type {
 import {
   ZIP_METHOD_DEFLATE,
   ZIP_METHOD_STORE,
+  indexArchiveEntries,
   isSafeArchivePath,
   validatePgnaZip,
 } from "./validator.js";
@@ -108,12 +109,25 @@ interface MinimalTransformStream {
 }
 interface GlobalWebApiSurface {
   TextEncoder?: new () => { encode(input: string): Uint8Array };
-  TextDecoder?: new (label?: string) => { decode(input: Uint8Array): string };
+  TextDecoder?: new (
+    label?: string,
+    options?: { fatal?: boolean },
+  ) => { decode(input: Uint8Array): string };
   CompressionStream?: new (format: string) => MinimalTransformStream;
   DecompressionStream?: new (format: string) => MinimalTransformStream;
 }
 
 const webGlobals = globalThis as unknown as GlobalWebApiSurface;
+
+export class PgnaUtf8Error extends Error {
+  readonly code = "INVALID_UTF8" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "PgnaUtf8Error";
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
 
 export function utf8Encode(text: string): Uint8Array {
   if (webGlobals.TextEncoder) {
@@ -142,9 +156,19 @@ export function utf8Encode(text: string): Uint8Array {
   return new Uint8Array(bytes);
 }
 
+/**
+ * Strictly decodes UTF-8 bytes without U+FFFD replacement.
+ * Throws `PgnaUtf8Error` (`code = "INVALID_UTF8"`) on any malformed byte sequence.
+ */
 export function utf8Decode(bytes: Uint8Array): string {
   if (webGlobals.TextDecoder) {
-    return new webGlobals.TextDecoder("utf-8").decode(bytes);
+    try {
+      return new webGlobals.TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (err) {
+      throw new PgnaUtf8Error(
+        `Invalid UTF-8 byte sequence: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   let out = "";
   let i = 0;
@@ -152,20 +176,38 @@ export function utf8Decode(bytes: Uint8Array): string {
     const b0 = bytes[i++]!;
     if (b0 < 0x80) {
       out += String.fromCharCode(b0);
-    } else if ((b0 & 0xe0) === 0xc0) {
-      const b1 = bytes[i++]! & 0x3f;
-      out += String.fromCharCode(((b0 & 0x1f) << 6) | b1);
-    } else if ((b0 & 0xf0) === 0xe0) {
-      const b1 = bytes[i++]! & 0x3f;
-      const b2 = bytes[i++]! & 0x3f;
-      out += String.fromCharCode(((b0 & 0x0f) << 12) | (b1 << 6) | b2);
-    } else {
-      const b1 = bytes[i++]! & 0x3f;
-      const b2 = bytes[i++]! & 0x3f;
-      const b3 = bytes[i++]! & 0x3f;
-      const cp = ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3;
+    } else if (b0 >= 0xc2 && b0 <= 0xdf) {
+      if (i >= bytes.length) throw new PgnaUtf8Error("Truncated 2-byte UTF-8 sequence.");
+      const b1 = bytes[i++]!;
+      if ((b1 & 0xc0) !== 0x80) throw new PgnaUtf8Error("Invalid UTF-8 continuation byte.");
+      out += String.fromCharCode(((b0 & 0x1f) << 6) | (b1 & 0x3f));
+    } else if (b0 >= 0xe0 && b0 <= 0xef) {
+      if (i + 1 >= bytes.length) throw new PgnaUtf8Error("Truncated 3-byte UTF-8 sequence.");
+      const b1 = bytes[i++]!;
+      const b2 = bytes[i++]!;
+      if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80) {
+        throw new PgnaUtf8Error("Invalid UTF-8 continuation byte.");
+      }
+      if ((b0 === 0xe0 && b1 < 0xa0) || (b0 === 0xed && b1 >= 0xa0)) {
+        throw new PgnaUtf8Error("Overlong or surrogate UTF-8 sequence.");
+      }
+      out += String.fromCharCode(((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f));
+    } else if (b0 >= 0xf0 && b0 <= 0xf4) {
+      if (i + 2 >= bytes.length) throw new PgnaUtf8Error("Truncated 4-byte UTF-8 sequence.");
+      const b1 = bytes[i++]!;
+      const b2 = bytes[i++]!;
+      const b3 = bytes[i++]!;
+      if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80 || (b3 & 0xc0) !== 0x80) {
+        throw new PgnaUtf8Error("Invalid UTF-8 continuation byte.");
+      }
+      if ((b0 === 0xf0 && b1 < 0x90) || (b0 === 0xf4 && b1 > 0x8f)) {
+        throw new PgnaUtf8Error("Overlong or out-of-range UTF-8 sequence.");
+      }
+      const cp = ((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
       const offset = cp - 0x10000;
       out += String.fromCharCode(0xd800 + (offset >> 10), 0xdc00 + (offset & 0x3ff));
+    } else {
+      throw new PgnaUtf8Error(`Invalid UTF-8 leading byte 0x${b0.toString(16)}.`);
     }
   }
   return out;
@@ -270,10 +312,11 @@ async function inflateRaw(data: Uint8Array, maxBytes?: number): Promise<Uint8Arr
  * when scanning unreferenced files per PGNA v1.0 §2.1.
  */
 export function isOsMetadataPath(entryPath: string): boolean {
+  const baseName = entryPath.slice(entryPath.lastIndexOf("/") + 1);
   return (
     entryPath.startsWith("__MACOSX/") ||
-    entryPath === ".DS_Store" ||
-    entryPath.endsWith("/.DS_Store")
+    baseName === ".DS_Store" ||
+    baseName.startsWith("._")
   );
 }
 
@@ -726,14 +769,24 @@ export async function packPgnaArchive(
     }
   }
 
+  const safeSubtitlesByPath = Object.create(null) as Record<string, string>;
+  if (subtitlesByPath) {
+    for (const [subPath, vttText] of Object.entries(subtitlesByPath)) {
+      if (typeof vttText === "string") {
+        safeSubtitlesByPath[subPath] = vttText;
+      }
+    }
+  }
+
   const compiled = compilePgna({
     manifest: input.manifest,
     pgnText: input.pgnText,
-    subtitlesByPath,
+    subtitlesByPath: safeSubtitlesByPath,
     compiledAt: input.compiledAt,
   });
 
-  const pgnPath = input.manifest.pgnPath ?? "study.pgn";
+  const rawPgnPath: unknown = input.manifest.pgnPath;
+  const pgnPath = rawPgnPath === undefined ? "study.pgn" : rawPgnPath;
   if (typeof pgnPath !== "string" || !isSafeArchivePath(pgnPath)) {
     throw new PgnaPackError(
       "ARCHIVE_VALIDATION_FAILED",
@@ -742,7 +795,8 @@ export async function packPgnaArchive(
     );
   }
 
-  const timelinePath = input.manifest.timelinePath ?? "timeline.json";
+  const rawTimelinePath: unknown = input.manifest.timelinePath;
+  const timelinePath = rawTimelinePath === undefined ? "timeline.json" : rawTimelinePath;
   if (typeof timelinePath !== "string" || !isSafeArchivePath(timelinePath)) {
     throw new PgnaPackError(
       "ARCHIVE_VALIDATION_FAILED",
@@ -860,11 +914,9 @@ export async function unpackPgnaArchive(
   limits?: UnpackZipLimits,
 ): Promise<UnpackedPgnaArchive> {
   const entries = await unpackPgnaZip(zipBytes, limits);
-  const byPath = new Map<string, ArchiveEntry>();
-  for (const entry of entries) {
-    if (!isOsMetadataPath(entry.path)) {
-      byPath.set(entry.path, entry);
-    }
+  const { byPath, diagnostics } = indexArchiveEntries(entries);
+  if (diagnostics.length > 0) {
+    throw new Error(diagnostics[0]!.message);
   }
 
   const manifestEntry = byPath.get("manifest.json");
@@ -899,6 +951,7 @@ export async function unpackPgnaArchive(
     timelinePath,
   };
 
+  // Resolve explicit manifest references BEFORE filtering/ignoring extraneous OS metadata.
   const pgnEntry = byPath.get(pgnPath);
   if (!pgnEntry) {
     throw new Error(`PGNA archive is missing required PGN entry "${pgnPath}".`);
@@ -915,33 +968,74 @@ export async function unpackPgnaArchive(
   }
   const timeline = rawTimeline as unknown as PgnaTimeline;
 
-  const audioPathSet = new Set<string>();
-  const subtitlePathSet = new Set<string>();
+  const audioByPath = Object.create(null) as Record<string, Uint8Array>;
+  const subtitlesByPath = Object.create(null) as Record<string, string>;
+  const explicitPaths = new Set<string>(["manifest.json", pgnPath, timelinePath]);
+
   if (isPlainObject(rawClips)) {
-    for (const rawClip of Object.values(rawClips)) {
-      if (!isPlainObject(rawClip)) continue;
-      const clipPath = rawClip["path"];
-      if (typeof clipPath === "string") {
-        audioPathSet.add(clipPath);
+    for (const [clipId, rawClip] of Object.entries(rawClips)) {
+      if (!isPlainObject(rawClip)) {
+        throw new Error(`Invalid clip entry "${clipId}" in manifest.clips: expected an object.`);
       }
+
+      const clipPath = rawClip["path"];
+      if (typeof clipPath !== "string" || !isSafeArchivePath(clipPath)) {
+        throw new Error(
+          `Invalid or unsafe clip path "${String(clipPath)}" for clip "${clipId}".`,
+        );
+      }
+      const audioEntry = byPath.get(clipPath);
+      if (!audioEntry) {
+        throw new Error(
+          `PGNA archive is missing referenced audio clip "${clipPath}" (clip "${clipId}").`,
+        );
+      }
+      explicitPaths.add(clipPath);
+      audioByPath[clipPath] = audioEntry.data;
+
       const clipSubtitles = rawClip["subtitles"];
-      if (isPlainObject(clipSubtitles)) {
-        for (const sp of Object.values(clipSubtitles)) {
-          if (typeof sp === "string") {
-            subtitlePathSet.add(sp);
+      if (clipSubtitles !== undefined) {
+        if (!isPlainObject(clipSubtitles)) {
+          throw new Error(`Invalid subtitles map for clip "${clipId}": expected an object.`);
+        }
+        for (const [lang, subPath] of Object.entries(clipSubtitles)) {
+          if (typeof subPath !== "string" || !isSafeArchivePath(subPath)) {
+            throw new Error(
+              `Invalid or unsafe subtitle path "${String(subPath)}" for clip "${clipId}" (lang "${lang}").`,
+            );
           }
+          const subEntry = byPath.get(subPath);
+          if (!subEntry) {
+            throw new Error(
+              `PGNA archive is missing referenced subtitle track "${subPath}" (clip "${clipId}", lang "${lang}").`,
+            );
+          }
+          explicitPaths.add(subPath);
+          subtitlesByPath[subPath] = utf8Decode(subEntry.data);
         }
       }
     }
   }
 
-  const audioByPath: Record<string, Uint8Array> = {};
-  const subtitlesByPath: Record<string, string> = {};
+  const rawMergedSubtitles = rawTimeline["mergedSubtitles"];
+  if (isPlainObject(rawMergedSubtitles)) {
+    for (const mergedPath of Object.values(rawMergedSubtitles)) {
+      if (typeof mergedPath === "string" && isSafeArchivePath(mergedPath)) {
+        const mergedEntry = byPath.get(mergedPath);
+        if (mergedEntry && !explicitPaths.has(mergedPath)) {
+          explicitPaths.add(mergedPath);
+          subtitlesByPath[mergedPath] = utf8Decode(mergedEntry.data);
+        }
+      }
+    }
+  }
 
+  // Scan unreferenced .vtt entries AFTER explicit references, ignoring extraneous OS metadata.
   for (const [entryPath, entry] of byPath.entries()) {
-    if (audioPathSet.has(entryPath)) {
-      audioByPath[entryPath] = entry.data;
-    } else if (subtitlePathSet.has(entryPath) || entryPath.endsWith(".vtt")) {
+    if (explicitPaths.has(entryPath) || isOsMetadataPath(entryPath)) {
+      continue;
+    }
+    if (entryPath.endsWith(".vtt")) {
       subtitlesByPath[entryPath] = utf8Decode(entry.data);
     }
   }

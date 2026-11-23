@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
-import { resolveServiceUrl, type KibitzSessionUser } from "@suite/ui";
+import { AccessibleDialog, resolveServiceUrl, type KibitzSessionUser } from "@suite/ui";
 import {
   deleteStudyById,
   fetchAccountLecturePage,
@@ -455,19 +455,21 @@ export function AccountLecturePage({
 
       {/* Owner Tag & Visibility Editor Modal */}
       {editingStudy ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-xs"
-          onClick={() => setEditingStudy(null)}
+        <AccessibleDialog
+          open={true}
+          onClose={() => setEditingStudy(null)}
+          ariaLabelledBy="lecture-edit-study-dialog-title"
+          overlayClassName="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-xs"
+          panelClassName="w-full max-w-md rounded-2xl border border-stone-200 bg-white p-5 shadow-xl"
         >
-          <div
-            role="dialog"
-            aria-modal="true"
-            className="w-full max-w-md rounded-2xl border border-stone-200 bg-white p-5 shadow-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
             <div className="flex items-start justify-between border-b border-stone-100 pb-3">
               <div>
-                <h3 className="text-base font-semibold text-slate-900">Edit Tags &amp; Visibility</h3>
+                <h3
+                  id="lecture-edit-study-dialog-title"
+                  className="text-base font-semibold text-slate-900"
+                >
+                  Edit Tags &amp; Visibility
+                </h3>
                 <p className="mt-0.5 text-xs text-slate-500">{editingStudy.title}</p>
               </div>
               <button
@@ -584,8 +586,7 @@ export function AccountLecturePage({
                 {editBusy ? "Saving…" : "Save Changes"}
               </button>
             </div>
-          </div>
-        </div>
+        </AccessibleDialog>
       ) : null}
     </div>
   );

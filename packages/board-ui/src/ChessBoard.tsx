@@ -1,4 +1,10 @@
-import { useRef, useState, type CSSProperties, type MouseEvent } from "react";
+import {
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type MouseEvent,
+} from "react";
 import { ChessPosition, INITIAL_FEN, type AppliedMove, type BoardPiece } from "@suite/chess-core";
 
 export type BoardTheme = "default" | "projector-high-contrast";
@@ -14,6 +20,11 @@ export interface BoardArrow {
 export interface BoardHighlight {
   color: BoardAnnotationColor;
   square: string;
+}
+
+export interface SquareAccessibleLabelOptions {
+  selected?: boolean;
+  isLegalTarget?: boolean;
 }
 
 export interface ChessBoardProps {
@@ -62,6 +73,20 @@ const PIECE_FILLED_UNICODE: Record<string, string> = {
   bk: "♚",
 };
 
+const PIECE_COLOR_NAMES: Record<BoardPiece["color"], string> = {
+  w: "White",
+  b: "Black",
+};
+
+const PIECE_TYPE_NAMES: Record<BoardPiece["type"], string> = {
+  p: "pawn",
+  n: "knight",
+  b: "bishop",
+  r: "rook",
+  q: "queen",
+  k: "king",
+};
+
 const ANNOTATION_COLORS: Record<BoardAnnotationColor, string> = {
   G: "rgba(21, 128, 61, 0.82)",
   R: "rgba(220, 38, 38, 0.82)",
@@ -71,6 +96,102 @@ const ANNOTATION_COLORS: Record<BoardAnnotationColor, string> = {
 
 const FILES = ["a", "b", "c", "d", "e", "f", "g", "h"] as const;
 const RANKS = ["8", "7", "6", "5", "4", "3", "2", "1"] as const;
+
+const SR_ONLY_STYLE: CSSProperties = {
+  position: "absolute",
+  width: "1px",
+  height: "1px",
+  padding: 0,
+  margin: "-1px",
+  overflow: "hidden",
+  clip: "rect(0, 0, 0, 0)",
+  whiteSpace: "nowrap",
+  border: 0,
+};
+
+function describePiece(piece: Pick<BoardPiece, "color" | "type">): string {
+  return `${PIECE_COLOR_NAMES[piece.color]} ${PIECE_TYPE_NAMES[piece.type]}`;
+}
+
+/**
+ * Formats a screen-reader accessible label for a chess board square,
+ * including coordinate, piece identity (or empty), selection state, and legal destination status.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export function formatSquareAccessibleLabel(
+  square: string,
+  piece: Pick<BoardPiece, "color" | "type"> | null | undefined,
+  options?: SquareAccessibleLabelOptions,
+): string {
+  const parts: string[] = [square];
+  if (piece) {
+    parts.push(describePiece(piece));
+  } else {
+    parts.push("empty");
+  }
+  if (options?.selected) {
+    parts.push("selected");
+  }
+  if (options?.isLegalTarget) {
+    parts.push("legal destination");
+  }
+  return parts.join(", ");
+}
+
+/**
+ * Computes the next board square for orientation-aware keyboard navigation
+ * (ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End).
+ * Returns `null` if the key is not a board navigation key or the square is invalid.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export function getNextBoardSquare(
+  currentSquare: string,
+  key: string,
+  orientation: "white" | "black",
+  options?: { ctrlKey?: boolean },
+): string | null {
+  if (currentSquare.length !== 2) return null;
+  const orderedFiles = orientation === "white" ? FILES : [...FILES].reverse();
+  const orderedRanks = orientation === "white" ? RANKS : [...RANKS].reverse();
+
+  const col = orderedFiles.indexOf(currentSquare[0] as (typeof FILES)[number]);
+  const row = orderedRanks.indexOf(currentSquare[1] as (typeof RANKS)[number]);
+  if (col < 0 || row < 0) return null;
+
+  let nextCol = col;
+  let nextRow = row;
+
+  switch (key) {
+    case "ArrowUp":
+      nextRow = Math.max(0, row - 1);
+      break;
+    case "ArrowDown":
+      nextRow = Math.min(7, row + 1);
+      break;
+    case "ArrowLeft":
+      nextCol = Math.max(0, col - 1);
+      break;
+    case "ArrowRight":
+      nextCol = Math.min(7, col + 1);
+      break;
+    case "Home":
+      nextCol = 0;
+      if (options?.ctrlKey) {
+        nextRow = 0;
+      }
+      break;
+    case "End":
+      nextCol = 7;
+      if (options?.ctrlKey) {
+        nextRow = 7;
+      }
+      break;
+    default:
+      return null;
+  }
+
+  return `${orderedFiles[nextCol]}${orderedRanks[nextRow]}`;
+}
 
 function squareToCoords(square: string, orientation: "white" | "black"): { x: number; y: number } {
   const fileIndex = FILES.indexOf(square[0] as (typeof FILES)[number]);
@@ -109,6 +230,8 @@ export function ChessBoard({
     fen,
     square: null,
   });
+  const [focusedSquare, setFocusedSquare] = useState<string | null>(null);
+  const [statusAnnouncement, setStatusAnnouncement] = useState<string>("");
   const [pendingPromotion, setPendingPromotion] = useState<{
     fen: string;
     from: string;
@@ -118,6 +241,7 @@ export function ChessBoard({
 
   const leftDragOriginRef = useRef<string | null>(null);
   const rightDragRef = useRef<{ square: string; color: BoardAnnotationColor } | null>(null);
+  const squareButtonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
 
   const selectedSquare = selectionState.fen === fen ? selectionState.square : null;
   const activePromotion = pendingPromotion?.fen === fen ? pendingPromotion : null;
@@ -153,35 +277,64 @@ export function ChessBoard({
 
   const orderedFiles = orientation === "white" ? FILES : [...FILES].reverse();
   const orderedRanks = orientation === "white" ? RANKS : [...RANKS].reverse();
+  const activeFocusSquare =
+    focusedSquare ?? selectedSquare ?? `${orderedFiles[0]}${orderedRanks[0]}`;
 
   const lightSquareColor = theme === "projector-high-contrast" ? "#ffffff" : "#f0d9b5";
   const darkSquareColor = theme === "projector-high-contrast" ? "#1e293b" : "#b58863";
   const borderColor = theme === "projector-high-contrast" ? "#0f172a" : "#785a3a";
   const canAnnotate = Boolean(onToggleHighlight || onToggleArrow);
 
+  const announceSelection = (square: string, piece: BoardPiece) => {
+    const targetCount = new Set(
+      legalMoves.filter((m) => m.from === square).map((m) => m.to),
+    ).size;
+    const targetsPhrase =
+      targetCount === 0
+        ? "No legal destinations."
+        : targetCount === 1
+          ? "1 legal destination."
+          : `${targetCount} legal destinations.`;
+    setStatusAnnouncement(`Selected ${describePiece(piece)} on ${square}. ${targetsPhrase}`);
+  };
+
   const commitMove = (from: string, to: string) => {
     if (!interactive || !onMove) return;
     const matchingMoves = legalMoves.filter((m) => m.from === from && m.to === to);
     const hasPromotion = matchingMoves.some((m) => Boolean(m.promotion));
+    const movingPiece = pieceBySquare.get(from);
     if (hasPromotion) {
-      const piece = pieceBySquare.get(from);
       setPendingPromotion({
         fen,
         from,
         to,
-        color: piece?.color ?? position.turn,
+        color: movingPiece?.color ?? position.turn,
       });
       setSelectionState({ fen, square: null });
+      setStatusAnnouncement(`Choose promotion piece for ${from} to ${to}.`);
       return;
+    }
+    if (matchingMoves.length > 0) {
+      const capturedPiece = pieceBySquare.get(to);
+      const moveDesc = movingPiece
+        ? `Moved ${describePiece(movingPiece)} from ${from} to ${to}`
+        : `Moved from ${from} to ${to}`;
+      setStatusAnnouncement(
+        capturedPiece ? `${moveDesc}, capturing ${describePiece(capturedPiece)}.` : `${moveDesc}.`,
+      );
+    } else {
+      setStatusAnnouncement("Selection cleared.");
     }
     onMove({ from, to });
     setSelectionState({ fen, square: null });
   };
 
   const handleSquareClick = (square: string) => {
+    setFocusedSquare(square);
     if (!interactive || !onMove) return;
     if (activePromotion) {
       setPendingPromotion(null);
+      setStatusAnnouncement("Promotion canceled.");
       return;
     }
 
@@ -189,12 +342,14 @@ export function ChessBoard({
       const piece = pieceBySquare.get(square);
       if (piece && piece.color === position.turn) {
         setSelectionState({ fen, square });
+        announceSelection(square, piece);
       }
       return;
     }
 
     if (selectedSquare === square) {
       setSelectionState({ fen, square: null });
+      setStatusAnnouncement("Selection cleared.");
       return;
     }
 
@@ -202,10 +357,29 @@ export function ChessBoard({
     const clickedPiece = pieceBySquare.get(square);
     if (clickedPiece && clickedPiece.color === position.turn && !legalTargetsForSelected.has(square)) {
       setSelectionState({ fen, square });
+      announceSelection(square, clickedPiece);
       return;
     }
 
     commitMove(selectedSquare, square);
+  };
+
+  const handleSquareKeyDown = (e: KeyboardEvent<HTMLButtonElement>, square: string) => {
+    if (e.key === "Escape" && selectedSquare) {
+      e.preventDefault();
+      e.stopPropagation();
+      setSelectionState({ fen, square: null });
+      setStatusAnnouncement("Selection cleared.");
+      return;
+    }
+
+    const nextSquare = getNextBoardSquare(square, e.key, orientation, { ctrlKey: e.ctrlKey });
+    if (nextSquare) {
+      e.preventDefault();
+      e.stopPropagation();
+      setFocusedSquare(nextSquare);
+      squareButtonRefs.current.get(nextSquare)?.focus();
+    }
   };
 
   const handleMouseDown = (e: MouseEvent, square: string) => {
@@ -274,6 +448,8 @@ export function ChessBoard({
       onContextMenu={canAnnotate ? (e) => e.preventDefault() : undefined}
     >
       <div
+        role="group"
+        aria-label={`Chess board, ${orientation} perspective`}
         style={{
           display: "grid",
           gridTemplateColumns: "repeat(8, minmax(0, 1fr))",
@@ -311,9 +487,24 @@ export function ChessBoard({
             return (
               <button
                 key={square}
+                ref={(node) => {
+                  if (node) {
+                    squareButtonRefs.current.set(square, node);
+                  } else {
+                    squareButtonRefs.current.delete(square);
+                  }
+                }}
                 type="button"
-                aria-label={`Square ${square}`}
+                data-square={square}
+                tabIndex={activeFocusSquare === square ? 0 : -1}
+                aria-label={formatSquareAccessibleLabel(square, piece, {
+                  selected: isSelected,
+                  isLegalTarget,
+                })}
+                aria-pressed={isSelected}
+                onFocus={() => setFocusedSquare(square)}
                 onClick={() => handleSquareClick(square)}
+                onKeyDown={(e) => handleSquareKeyDown(e, square)}
                 onMouseDown={(e) => handleMouseDown(e, square)}
                 onMouseUp={(e) => handleMouseUp(e, square)}
                 style={{
@@ -367,6 +558,7 @@ export function ChessBoard({
 
                 {highlight ? (
                   <span
+                    aria-hidden="true"
                     style={{
                       position: "absolute",
                       inset: "7%",
@@ -406,6 +598,7 @@ export function ChessBoard({
 
                 {piece ? (
                   <span
+                    aria-hidden="true"
                     style={{
                       position: "relative",
                       zIndex: 1,
@@ -424,6 +617,16 @@ export function ChessBoard({
             );
           }),
         )}
+      </div>
+
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        data-testid="chess-board-status"
+        style={SR_ONLY_STYLE}
+      >
+        {statusAnnouncement}
       </div>
 
       {arrows.length > 0 ? (
@@ -484,6 +687,7 @@ export function ChessBoard({
       {activePromotion ? (
         <div
           role="dialog"
+          aria-modal="true"
           aria-label="Choose promotion piece"
           style={{
             position: "absolute",
@@ -494,7 +698,18 @@ export function ChessBoard({
             justifyContent: "center",
             zIndex: 10,
           }}
-          onClick={() => setPendingPromotion(null)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              e.stopPropagation();
+              setPendingPromotion(null);
+              setStatusAnnouncement("Promotion canceled.");
+            }
+          }}
+          onClick={() => {
+            setPendingPromotion(null);
+            setStatusAnnouncement("Promotion canceled.");
+          }}
         >
           <div
             style={{
@@ -511,8 +726,11 @@ export function ChessBoard({
               <button
                 key={promo}
                 type="button"
-                aria-label={`Promote to ${promo}`}
+                aria-label={`Promote to ${PIECE_TYPE_NAMES[promo]}`}
                 onClick={() => {
+                  setStatusAnnouncement(
+                    `Moved from ${activePromotion.from} to ${activePromotion.to}, promoted to ${PIECE_TYPE_NAMES[promo]}.`,
+                  );
                   onMove?.({
                     from: activePromotion.from,
                     to: activePromotion.to,
@@ -533,7 +751,7 @@ export function ChessBoard({
                   justifyContent: "center",
                 }}
               >
-                {PIECE_UNICODE[`${activePromotion.color}${promo}`]}
+                <span aria-hidden="true">{PIECE_UNICODE[`${activePromotion.color}${promo}`]}</span>
               </button>
             ))}
           </div>

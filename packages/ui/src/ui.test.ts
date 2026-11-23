@@ -1,7 +1,8 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  AccessibleDialog,
   AppShell,
   CURATED_STUDENT_EMOJIS,
   EmojiReactionBar,
@@ -11,12 +12,20 @@ import {
   SIGN_OUT_ERROR_MESSAGE,
   SUITE_SERVICES,
   fetchKibitzSession,
+  focusInitialDialogElement,
+  getFocusableElements,
+  handleDialogKeyDown,
   isAllowedSuiteUrl,
   logoutKibitzSession,
   performKibitzSignOut,
   pullReadOnlyFromService,
   resolveApiUrl,
   resolveServiceUrl,
+  restoreDialogFocus,
+  trapFocusInDialog,
+  type DialogKeyEventLike,
+  type FocusTrapContainerLike,
+  type FocusableElementLike,
   type KibitzSessionUser,
 } from "./index.js";
 
@@ -292,5 +301,253 @@ describe("@suite/ui", () => {
     expect(calls[1]?.init?.method).toBe("GET");
     expect(calls[1]?.init?.credentials).toBe("include");
     expect(calls[1]?.init?.body).toBeUndefined();
+  });
+
+  describe("AccessibleDialog (UI-03)", () => {
+    const createMockFocusable = (opts?: {
+      id?: string;
+      disabled?: boolean;
+      hidden?: boolean;
+      tabIndex?: number;
+      isConnected?: boolean;
+      insideInert?: boolean;
+    }): FocusableElementLike & { id: string; focusCalls: number } => {
+      const node = {
+        id: opts?.id ?? "el",
+        focusCalls: 0,
+        tabIndex: opts?.tabIndex ?? 0,
+        isConnected: opts?.isConnected ?? true,
+        focus() {
+          node.focusCalls += 1;
+        },
+        hasAttribute(name: string) {
+          if (name === "disabled") return Boolean(opts?.disabled);
+          if (name === "hidden") return Boolean(opts?.hidden);
+          return false;
+        },
+        closest() {
+          return opts?.insideInert ? {} : null;
+        },
+      };
+      return node;
+    };
+
+    const createMockPanel = (
+      children: FocusableElementLike[],
+    ): FocusTrapContainerLike & { focusCalls: number } => {
+      const panel = {
+        focusCalls: 0,
+        tabIndex: -1,
+        focus() {
+          panel.focusCalls += 1;
+        },
+        querySelectorAll() {
+          return children;
+        },
+        contains(target: unknown) {
+          return target === panel || children.includes(target as FocusableElementLike);
+        },
+      };
+      return panel;
+    };
+
+    const createMockKeyEvent = (
+      key: string,
+      shiftKey = false,
+    ): DialogKeyEventLike & {
+      defaultPrevented: boolean;
+      propagationStopped: boolean;
+      immediatePropagationStopped: boolean;
+    } => {
+      const ev = {
+        key,
+        shiftKey,
+        defaultPrevented: false,
+        propagationStopped: false,
+        immediatePropagationStopped: false,
+        preventDefault() {
+          ev.defaultPrevented = true;
+        },
+        stopPropagation() {
+          ev.propagationStopped = true;
+        },
+        stopImmediatePropagation() {
+          ev.immediatePropagationStopped = true;
+        },
+      };
+      return ev;
+    };
+
+    it("renders nothing when closed and renders accessible dialog attributes and classes when open", () => {
+      const closedHtml = renderToStaticMarkup(
+        createElement(AccessibleDialog, {
+          open: false,
+          onClose: () => {},
+          ariaLabelledBy: "dlg-title",
+          children: createElement("h2", { id: "dlg-title" }, "Hidden"),
+        }),
+      );
+      expect(closedHtml).toBe("");
+
+      const tailwindHtml = renderToStaticMarkup(
+        createElement(AccessibleDialog, {
+          open: true,
+          onClose: () => {},
+          ariaLabelledBy: "dlg-title",
+          ariaDescribedBy: "dlg-desc",
+          overlayClassName: "fixed inset-0 bg-slate-950/45",
+          panelClassName: "max-w-md rounded-2xl bg-white",
+          className: "p-6",
+          testId: "sample-dialog",
+          children: [
+            createElement("h2", { key: "t", id: "dlg-title" }, "Dialog Title"),
+            createElement("p", { key: "d", id: "dlg-desc" }, "Dialog description"),
+          ],
+        }),
+      );
+
+      expect(tailwindHtml).toContain('role="dialog"');
+      expect(tailwindHtml).toContain('aria-modal="true"');
+      expect(tailwindHtml).toContain('aria-labelledby="dlg-title"');
+      expect(tailwindHtml).toContain('aria-describedby="dlg-desc"');
+      expect(tailwindHtml).toMatch(/tabindex="-1"/i);
+      expect(tailwindHtml).toContain('data-testid="sample-dialog"');
+      expect(tailwindHtml).toContain('class="fixed inset-0 bg-slate-950/45"');
+      expect(tailwindHtml).toContain('class="max-w-md rounded-2xl bg-white p-6"');
+      // Does not inject conflicting inline overlay style when overlayClassName is supplied
+      expect(tailwindHtml).not.toContain("position:fixed");
+
+      const styledHtml = renderToStaticMarkup(
+        createElement(AccessibleDialog, {
+          open: true,
+          onClose: () => {},
+          ariaLabel: "Inline Styled Dialog",
+          style: { zIndex: 200 },
+          panelStyle: { maxWidth: "28rem" },
+          children: createElement("span", null, "Body"),
+        }),
+      );
+      expect(styledHtml).toContain('aria-label="Inline Styled Dialog"');
+      expect(styledHtml).toContain("z-index:200");
+      expect(styledHtml).toContain("max-width:28rem");
+    });
+
+    it("transfers initial focus to preferred target, first focusable element, or panel fallback", () => {
+      const disabledBtn = createMockFocusable({ id: "disabled", disabled: true });
+      const hiddenBtn = createMockFocusable({ id: "hidden", hidden: true });
+      const inertBtn = createMockFocusable({ id: "inert", insideInert: true });
+      const first = createMockFocusable({ id: "first" });
+      const second = createMockFocusable({ id: "second" });
+      const panel = createMockPanel([disabledBtn, hiddenBtn, inertBtn, first, second]);
+
+      expect(getFocusableElements(panel)).toEqual([first, second]);
+
+      // Default focuses first visible focusable element
+      expect(focusInitialDialogElement(panel)).toBe(first);
+      expect(first.focusCalls).toBe(1);
+
+      // Preferred target overrides default when focusable
+      expect(focusInitialDialogElement(panel, second)).toBe(second);
+      expect(second.focusCalls).toBe(1);
+
+      // Falls back to dialog panel itself when no focusable children exist
+      const emptyPanel = createMockPanel([disabledBtn]);
+      expect(focusInitialDialogElement(emptyPanel)).toBe(emptyPanel);
+      expect(emptyPanel.focusCalls).toBe(1);
+    });
+
+    it("traps Tab and Shift+Tab within the dialog container", () => {
+      const first = createMockFocusable({ id: "first" });
+      const middle = createMockFocusable({ id: "middle" });
+      const last = createMockFocusable({ id: "last" });
+      const outside = createMockFocusable({ id: "outside" });
+      const panel = createMockPanel([first, middle, last]);
+
+      // Tab on last wraps to first
+      const tabOnLast = createMockKeyEvent("Tab", false);
+      expect(trapFocusInDialog(panel, tabOnLast, last)).toBe(first);
+      expect(tabOnLast.defaultPrevented).toBe(true);
+      expect(first.focusCalls).toBe(1);
+
+      // Shift+Tab on first wraps to last
+      const shiftTabOnFirst = createMockKeyEvent("Tab", true);
+      expect(trapFocusInDialog(panel, shiftTabOnFirst, first)).toBe(last);
+      expect(shiftTabOnFirst.defaultPrevented).toBe(true);
+      expect(last.focusCalls).toBe(1);
+
+      // Shift+Tab on dialog panel itself wraps to last
+      const shiftTabOnPanel = createMockKeyEvent("Tab", true);
+      expect(trapFocusInDialog(panel, shiftTabOnPanel, panel)).toBe(last);
+      expect(shiftTabOnPanel.defaultPrevented).toBe(true);
+      expect(last.focusCalls).toBe(2);
+
+      // Tab on middle does NOT preventDefault (native movement inside dialog)
+      const tabOnMiddle = createMockKeyEvent("Tab", false);
+      expect(trapFocusInDialog(panel, tabOnMiddle, middle)).toBeNull();
+      expect(tabOnMiddle.defaultPrevented).toBe(false);
+
+      // Focus escaped outside dialog -> Tab brings focus back to first, Shift+Tab to last
+      const tabOutside = createMockKeyEvent("Tab", false);
+      expect(trapFocusInDialog(panel, tabOutside, outside)).toBe(first);
+      expect(tabOutside.defaultPrevented).toBe(true);
+      expect(first.focusCalls).toBe(2);
+
+      const shiftTabOutside = createMockKeyEvent("Tab", true);
+      expect(trapFocusInDialog(panel, shiftTabOutside, outside)).toBe(last);
+      expect(shiftTabOutside.defaultPrevented).toBe(true);
+      expect(last.focusCalls).toBe(3);
+
+      // Dialog with zero focusable children keeps focus on panel
+      const emptyPanel = createMockPanel([]);
+      const tabEmpty = createMockKeyEvent("Tab", false);
+      expect(trapFocusInDialog(emptyPanel, tabEmpty, emptyPanel)).toBe(emptyPanel);
+      expect(tabEmpty.defaultPrevented).toBe(true);
+      expect(emptyPanel.focusCalls).toBe(1);
+    });
+
+    it("handles Escape by closing and stopping propagation so background shortcuts do not fire", () => {
+      const first = createMockFocusable({ id: "first" });
+      const last = createMockFocusable({ id: "last" });
+      const panel = createMockPanel([first, last]);
+      const onClose = vi.fn();
+
+      const escapeEv = createMockKeyEvent("Escape");
+      expect(
+        handleDialogKeyDown(escapeEv, { panel, onClose, activeElement: first }),
+      ).toBe("escape");
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(escapeEv.defaultPrevented).toBe(true);
+      expect(escapeEv.propagationStopped).toBe(true);
+      expect(escapeEv.immediatePropagationStopped).toBe(true);
+
+      // Unrelated key is ignored
+      const enterEv = createMockKeyEvent("Enter");
+      expect(
+        handleDialogKeyDown(enterEv, { panel, onClose, activeElement: first }),
+      ).toBeNull();
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(enterEv.defaultPrevented).toBe(false);
+
+      // Tab delegates to trapFocusInDialog
+      const tabEv = createMockKeyEvent("Tab");
+      expect(
+        handleDialogKeyDown(tabEv, { panel, onClose, activeElement: last }),
+      ).toBe("tab");
+      expect(tabEv.defaultPrevented).toBe(true);
+      expect(first.focusCalls).toBe(1);
+    });
+
+    it("restores focus to connected trigger elements and skips disconnected or null elements", () => {
+      const trigger = createMockFocusable({ id: "trigger", isConnected: true });
+      const detached = createMockFocusable({ id: "detached", isConnected: false });
+
+      expect(restoreDialogFocus(trigger)).toBe(true);
+      expect(trigger.focusCalls).toBe(1);
+
+      expect(restoreDialogFocus(detached)).toBe(false);
+      expect(detached.focusCalls).toBe(0);
+
+      expect(restoreDialogFocus(null)).toBe(false);
+    });
   });
 });

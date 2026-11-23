@@ -311,9 +311,9 @@ export function createPgnaPlayer(
         fen: promptNode?.fen ?? promptEntry?.fen ?? INITIAL_FEN,
         lastMove: promptNode?.lastMove ?? promptEntry?.lastMove ?? null,
         orientation: promptNode?.orientation ?? promptEntry?.orientation ?? "white",
-        comment: promptEntry?.comment ?? "",
-        arrows: finalCue?.arrows ?? [],
-        highlights: finalCue?.highlights ?? [],
+        comment: promptEntry?.comment ?? promptNode?.comment ?? "",
+        arrows: finalCue ? finalCue.arrows : (promptNode?.arrows ?? []),
+        highlights: finalCue ? finalCue.highlights : (promptNode?.highlights ?? []),
         activeAudio: null,
         audioTimeMs: null,
         activeSubtitle: null,
@@ -355,9 +355,9 @@ export function createPgnaPlayer(
         fen: nodeEntry?.fen ?? timeline.games[0]?.initialFen ?? INITIAL_FEN,
         lastMove: nodeEntry?.lastMove ?? null,
         orientation: nodeEntry?.orientation ?? timeline.games[0]?.orientation ?? "white",
-        comment: primaryEntry?.comment ?? "",
-        arrows: cue?.arrows ?? [],
-        highlights: cue?.highlights ?? [],
+        comment: primaryEntry?.comment ?? nodeEntry?.comment ?? "",
+        arrows: cue ? cue.arrows : (nodeEntry?.arrows ?? []),
+        highlights: cue ? cue.highlights : (nodeEntry?.highlights ?? []),
         activeAudio: isWithinClip ? audio : null,
         audioTimeMs: isWithinClip ? manualClipTimeMs : null,
         activeSubtitle,
@@ -458,6 +458,16 @@ export function createPgnaPlayer(
 
     play() {
       if (guessPhase === "awaiting" || guessPhase === "branch_complete") {
+        return;
+      }
+      // FMT-05: Check active branch playback first so resuming a paused branch entered
+      // from a silent manual prompt resumes the branch rather than checking manualNodeId's audio.
+      if (guessPhase === "playing_branch" && activeBranch) {
+        if (branchTimeMs >= activeBranch.branchDurationMs && activeBranch.branchDurationMs > 0) {
+          branchTimeMs = 0;
+        }
+        isPlaying = true;
+        notify();
         return;
       }
       if (mode === "timeline" && guessPhase === "idle") {
@@ -690,15 +700,15 @@ export function createPgnaPlayer(
       };
       lastGuessResult = result;
 
-      // §8.3.2: Mainline success scheduled on main timeline resumes seamlessly
+      // §8.3.2 / FMT-05: Mainline success scheduled on main timeline resumes seamlessly into timeline mode
       if (
         matched.outcome === "success" &&
         matched.isMainline &&
-        matched.mainTimelineIndex !== null &&
-        mode === "timeline"
+        matched.mainTimelineIndex !== null
       ) {
         const resumeEntry = timeline.entries[matched.mainTimelineIndex];
         resolvedPromptIds.add(activeGuess.promptNodeId);
+        mode = "timeline";
         guessPhase = "idle";
         activeGuess = null;
         activeGuessPromptTimelineIndex = null;
@@ -752,14 +762,18 @@ export function createPgnaPlayer(
     continueAfterGuess() {
       if (!activeGuess) return;
       const promptId = activeGuess.promptNodeId;
-      const nextIndex =
-        activeGuessPromptTimelineIndex !== null ? activeGuessPromptTimelineIndex + 1 : null;
+      const resolvedPromptIdx =
+        activeGuessPromptTimelineIndex ?? timeline.nodeIndex[promptId]?.timelineIndex ?? null;
+      const nextIndex = resolvedPromptIdx !== null ? resolvedPromptIdx + 1 : null;
       resolvedPromptIds.add(promptId);
       clearGuessSession();
-      if (mode === "timeline" && nextIndex !== null) {
+      if (nextIndex !== null) {
+        mode = "timeline";
         const nextEntry = timeline.entries[nextIndex];
         globalTimeMs = nextEntry ? nextEntry.startMs : timeline.totalDurationMs;
         isPlaying = nextEntry !== undefined;
+      } else {
+        isPlaying = false;
       }
       notify();
     },

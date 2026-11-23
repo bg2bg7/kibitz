@@ -92,14 +92,28 @@ function UnpackedPlayerStage({ unpacked }: UnpackedPlayerStageProps) {
     let lastTs = performance.now();
 
     const loop = (now: number) => {
-      const dt = Math.min(100, Math.max(0, now - lastTs));
+      const dt = Number.isFinite(now - lastTs) ? Math.max(0, now - lastTs) : 0;
       lastTs = now;
       player.tick(dt);
       rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);
 
-    return () => cancelAnimationFrame(rafId);
+    const onVisibilityChange = () => {
+      if (typeof document !== "undefined" && document.hidden) {
+        player.pause();
+      }
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+    };
   }, [snapshot.isPlaying, player]);
 
   useEffect(() => {
@@ -247,7 +261,9 @@ function UnpackedPlayerStage({ unpacked }: UnpackedPlayerStageProps) {
             <button
               type="button"
               disabled={
-                (timeline.totalDurationMs === 0 && snapshot.mode === "timeline") ||
+                (timeline.totalDurationMs === 0 &&
+                  snapshot.mode === "timeline" &&
+                  snapshot.guessPhase !== "playing_branch") ||
                 snapshot.guessPhase === "awaiting" ||
                 snapshot.guessPhase === "branch_complete"
               }

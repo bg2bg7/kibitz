@@ -22,6 +22,102 @@ const MM_SS_PATTERN = /^(\d+):([0-5]\d)(?:\.(\d{1,3}))?$/;
 const HH_MM_SS_PATTERN = /^(\d+):([0-5]\d):([0-5]\d)(?:\.(\d{1,3}))?$/;
 
 /**
+ * Normalizes a non-negative decimal string (`\d+(?:\.\d+)?`) into canonical form without
+ * leading integer zeros or trailing fractional zeros, preserving exact arbitrary precision.
+ */
+export function canonicalizeDecimalOrdinal(rawDecimal: string): string | null {
+  const trimmed = rawDecimal.trim();
+  if (!DECIMAL_SECONDS_PATTERN.test(trimmed)) {
+    return null;
+  }
+  const dotIdx = trimmed.indexOf(".");
+  const rawInt = dotIdx === -1 ? trimmed : trimmed.slice(0, dotIdx);
+  const rawFrac = dotIdx === -1 ? "" : trimmed.slice(dotIdx + 1);
+  const intPart = rawInt.replace(/^0+(?=\d)/, "") || "0";
+  const fracPart = rawFrac.replace(/0+$/, "");
+  return fracPart.length > 0 ? `${intPart}.${fracPart}` : intPart;
+}
+
+/**
+ * Formats a finite non-negative JS number as a plain decimal string (never scientific notation)
+ * within the PGNA `[%at #N]` parser grammar.
+ */
+function formatFiniteNonNegativeDecimal(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return "0";
+  const raw = String(value);
+  if (!/[eE]/.test(raw)) {
+    return canonicalizeDecimalOrdinal(raw) ?? "0";
+  }
+  const [mantissa = "0", expPart = "0"] = raw.split(/[eE]/);
+  const exp = Number.parseInt(expPart, 10);
+  const [intPart = "0", fracPart = ""] = mantissa.split(".");
+  const digits = intPart + fracPart;
+  const decimalPos = intPart.length + exp;
+  let expanded: string;
+  if (decimalPos <= 0) {
+    expanded = `0.${"0".repeat(-decimalPos)}${digits}`;
+  } else if (decimalPos >= digits.length) {
+    expanded = `${digits}${"0".repeat(decimalPos - digits.length)}`;
+  } else {
+    expanded = `${digits.slice(0, decimalPos)}.${digits.slice(decimalPos)}`;
+  }
+  return canonicalizeDecimalOrdinal(expanded) ?? "0";
+}
+
+function getCanonicalOrdinalString(at: ParsedAtTag): string {
+  const match = ORDINAL_PATTERN.exec(at.rawSpec.trim());
+  if (match?.[1]) {
+    const canonical = canonicalizeDecimalOrdinal(match[1]);
+    if (canonical !== null && Number(canonical) === at.value) {
+      return canonical;
+    }
+  }
+  return formatFiniteNonNegativeDecimal(at.value);
+}
+
+/**
+ * Compares two non-negative decimal ordinal strings (with or without leading `#`)
+ * using exact decimal arithmetic (no IEEE-754 float64 precision loss).
+ */
+export function compareDecimalOrdinals(aRaw: string, bRaw: string): number {
+  const aClean = aRaw.trim().replace(/^#/, "");
+  const bClean = bRaw.trim().replace(/^#/, "");
+  const aCanon = canonicalizeDecimalOrdinal(aClean) ?? "0";
+  const bCanon = canonicalizeDecimalOrdinal(bClean) ?? "0";
+
+  const aDot = aCanon.indexOf(".");
+  const bDot = bCanon.indexOf(".");
+  const aInt = aDot === -1 ? aCanon : aCanon.slice(0, aDot);
+  const bInt = bDot === -1 ? bCanon : bCanon.slice(0, bDot);
+
+  if (aInt.length !== bInt.length) {
+    return aInt.length < bInt.length ? -1 : 1;
+  }
+  if (aInt !== bInt) {
+    return aInt < bInt ? -1 : 1;
+  }
+
+  const aFrac = aDot === -1 ? "" : aCanon.slice(aDot + 1);
+  const bFrac = bDot === -1 ? "" : bCanon.slice(bDot + 1);
+  if (aFrac === bFrac) return 0;
+  return aFrac < bFrac ? -1 : 1;
+}
+
+/**
+ * Compares two parsed `[%at]` tags using exact decimal ordering for ordinals
+ * and numeric millisecond ordering for timestamps.
+ */
+export function compareAtTags(a: ParsedAtTag, b: ParsedAtTag): number {
+  if (a.mode === "ordinal" && b.mode === "ordinal") {
+    return compareDecimalOrdinals(getCanonicalOrdinalString(a), getCanonicalOrdinalString(b));
+  }
+  if (a.value !== b.value) {
+    return a.value < b.value ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
  * Strictly parses PGNA time strings:
  * - Non-negative decimal seconds (`12`, `45.25`) — rejects signs, hex, scientific notation
  * - `MM:SS(.mmm)`
@@ -299,14 +395,15 @@ function parseAtTagBody(
     return null;
   }
 
-  const rawSpec = parts[0]!;
+  let rawSpec = parts[0]!;
   let mode: "ordinal" | "timestamp";
   let value: number;
 
   const ordMatch = ORDINAL_PATTERN.exec(rawSpec);
   if (ordMatch?.[1]) {
     const parsedOrd = Number(ordMatch[1]);
-    if (!Number.isFinite(parsedOrd)) {
+    const canonical = canonicalizeDecimalOrdinal(ordMatch[1]);
+    if (!Number.isFinite(parsedOrd) || canonical === null) {
       diagnostics.push({
         code: "INVALID_AT_TAG",
         severity: "error",
@@ -317,6 +414,7 @@ function parseAtTagBody(
     }
     mode = "ordinal";
     value = parsedOrd;
+    rawSpec = `#${canonical}`;
   } else {
     const timeMs = parsePgnaTimeMs(rawSpec);
     if (timeMs === null) {
@@ -626,7 +724,7 @@ export function formatNodeComment(tags: ParsedNodeTags): string {
 
   for (const at of tags.atTags) {
     const spec =
-      at.mode === "ordinal" ? `#${at.value}` : formatPgnaSeconds(at.value);
+      at.mode === "ordinal" ? `#${getCanonicalOrdinalString(at)}` : formatPgnaSeconds(at.value);
     const durSuffix = at.durMs !== undefined ? ` dur=${formatPgnaSeconds(at.durMs)}` : "";
     tokens.push(`[%at ${spec}${durSuffix}]`);
   }

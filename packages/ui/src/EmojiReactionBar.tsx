@@ -1,3 +1,4 @@
+// eslint-disable-next-line react-refresh/only-export-components
 export const CURATED_STUDENT_EMOJIS = [
   { id: "thumbs_up", glyph: "👍", label: "Got it" },
   { id: "lightbulb", glyph: "💡", label: "Aha moment" },

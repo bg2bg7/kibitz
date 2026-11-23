@@ -860,15 +860,20 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
         return false;
       }
       if (queryFilter) {
+        const normalizedQueryHandle = queryFilter.replace(/^@+/, "");
         const haystack = [
           study.title,
           study.description,
           study.ownerHandle,
+          `@${study.ownerHandle}`,
           ...study.tags,
         ]
           .join(" ")
           .toLowerCase();
-        if (!haystack.includes(queryFilter)) {
+        const matchesOwnerHandle =
+          normalizedQueryHandle.length > 0 &&
+          normalizeHandle(study.ownerHandle).includes(normalizedQueryHandle);
+        if (!haystack.includes(queryFilter) && !matchesOwnerHandle) {
           return false;
         }
       }

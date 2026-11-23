@@ -1639,4 +1639,75 @@ describe("@suite/lecture server", () => {
     const allStudies = await repository.listAllStudies();
     expect(allStudies).toHaveLength(3);
   });
+
+  it("LEC-05: normalizes displayed @handle queries in free-text ?q= search while enforcing visibility", async () => {
+    const repository = new InMemoryStudyRepository();
+    const objectStore = new InMemoryPgnaObjectStore();
+    const app = createLectureApp({ authConfig: TEST_AUTH_CONFIG, repository, objectStore });
+
+    const coachId = "cccccccc-cccc-4ccc-8ccc-ccccccccccc1";
+    const otherCoachId = "cccccccc-cccc-4ccc-8ccc-ccccccccccc2";
+    repository.registerAccount({ id: coachId, handle: "Coach_Alice", role: "coach" });
+    repository.registerAccount({ id: otherCoachId, handle: "coach_bob", role: "coach" });
+
+    const { token: coachToken } = await signSessionToken(
+      { sub: coachId, handle: "Coach_Alice", role: "coach", programIds: [] },
+      TEST_AUTH_CONFIG,
+    );
+
+    await repository.createStudy({
+      id: "11111111-2222-4333-8444-555555555501",
+      ownerUserId: coachId,
+      ownerHandle: "Coach_Alice",
+      ownerRole: "coach",
+      title: "Rook Endgames Fundamentals",
+      description: "Lucena and Philidor positions.",
+      tags: ["endgames"],
+      pgnaObjectKey: "studies/coach/s1.pgna",
+      visibility: "public_moderated",
+      moderationStatus: "approved",
+    });
+    await repository.createStudy({
+      id: "11111111-2222-4333-8444-555555555502",
+      ownerUserId: coachId,
+      ownerHandle: "Coach_Alice",
+      ownerRole: "coach",
+      title: "Private Preparation Notes",
+      description: "Top secret opening repertoire.",
+      tags: ["prep"],
+      pgnaObjectKey: "studies/coach/s2.pgna",
+      visibility: "private",
+      moderationStatus: "pending",
+    });
+    await repository.createStudy({
+      id: "11111111-2222-4333-8444-555555555503",
+      ownerUserId: otherCoachId,
+      ownerHandle: "coach_bob",
+      ownerRole: "coach",
+      title: "King and Pawn Basics",
+      description: "Opposition and key squares.",
+      tags: ["endgames"],
+      pgnaObjectKey: "studies/bob/s3.pgna",
+      visibility: "public_moderated",
+      moderationStatus: "approved",
+    });
+
+    // Anonymous search for @coach_alice (with no matching title) returns ONLY Coach_Alice's public study
+    const anonRes = await app.request("/api/studies?q=%40coach_alice");
+    expect(anonRes.status).toBe(200);
+    const anonJson = (await anonRes.json()) as { studies: Array<{ title: string }> };
+    expect(anonJson.studies.map((s) => s.title)).toEqual(["Rook Endgames Fundamentals"]);
+
+    // Authenticated owner search for @Coach_Alice returns both public and private studies owned by Coach_Alice
+    const ownerRes = await app.request("/api/studies?q=%40Coach_Alice", {
+      headers: { cookie: `kibitz_session=${coachToken}` },
+    });
+    expect(ownerRes.status).toBe(200);
+    const ownerJson = (await ownerRes.json()) as { studies: Array<{ title: string }> };
+    expect(ownerJson.studies.map((s) => s.title).sort()).toEqual([
+      "Private Preparation Notes",
+      "Rook Endgames Fundamentals",
+    ]);
+  });
 });
+

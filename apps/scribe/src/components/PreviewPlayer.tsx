@@ -27,6 +27,18 @@ function formatClock(ms: number): string {
   return `${mins}:${String(secs).padStart(2, "0")}`;
 }
 
+/**
+ * Computes the true wall-clock elapsed delta in milliseconds between animation frames
+ * without artificially clamping delayed frames to 100 ms (which would desynchronize
+ * timeline progress from continuing Web Audio / HTML audio playback).
+ */
+export function computePlaybackFrameDeltaMs(prevFrameMs: number, nowMs: number): number {
+  if (!Number.isFinite(prevFrameMs) || !Number.isFinite(nowMs)) {
+    return 0;
+  }
+  return Math.max(0, nowMs - prevFrameMs);
+}
+
 export function PreviewPlayer({
   manifest,
   timeline,
@@ -86,21 +98,37 @@ export function PreviewPlayer({
     };
   }, [audioByPath, manifest.clips]);
 
-  // Animation loop driving player.tick(dt) while playing
+  // Animation loop driving player.tick(dt) while playing.
+  // Advances by true elapsed wall-clock delta (no 100ms clamp) so delayed/suspended frames
+  // remain synchronized with playing audio, and pauses both clocks when the document is hidden.
   useEffect(() => {
     if (!snapshot.isPlaying) return;
     let rafId = 0;
     let lastTs = performance.now();
 
     const loop = (now: number) => {
-      const dt = Math.min(100, Math.max(0, now - lastTs));
+      const dt = computePlaybackFrameDeltaMs(lastTs, now);
       lastTs = now;
       player.tick(dt);
       rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);
 
-    return () => cancelAnimationFrame(rafId);
+    const onVisibilityChange = () => {
+      if (typeof document !== "undefined" && document.hidden) {
+        player.pause();
+      }
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+    };
   }, [snapshot.isPlaying, player]);
 
   // Sync Web Audio engine to snapshot.activeAudio & snapshot.audioTimeMs

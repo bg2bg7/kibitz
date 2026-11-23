@@ -1005,7 +1005,12 @@ export function NodeInspector({
             {attachedClip ? (
               <div className="rounded-lg border border-slate-200 bg-white p-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <h4 className="font-semibold text-slate-800">Clip WebVTT Subtitles</h4>
+                  <label
+                    htmlFor="scribe-clip-subtitles-vtt"
+                    className="font-semibold text-slate-800"
+                  >
+                    Clip WebVTT Subtitles
+                  </label>
                   <div className="flex items-center gap-1.5">
                     <input
                       type="text"
@@ -1044,6 +1049,7 @@ export function NodeInspector({
                   </p>
                 ) : null}
                 <textarea
+                  id="scribe-clip-subtitles-vtt"
                   rows={4}
                   disabled={!isSubLangValid}
                   value={currentVtt}
@@ -1348,7 +1354,12 @@ export function NodeInspector({
             <div>
               <div className="mb-1 flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
-                  <span className="font-semibold text-slate-800">Raw PGN Source (study.pgn)</span>
+                  <label
+                    htmlFor="scribe-raw-pgn-source"
+                    className="font-semibold text-slate-800"
+                  >
+                    Raw PGN Source (study.pgn)
+                  </label>
                   {isRawPgnDirty && !hasRawPgnConflict ? (
                     <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
                       Unapplied edits
@@ -1394,6 +1405,7 @@ export function NodeInspector({
                 </div>
               ) : null}
               <textarea
+                id="scribe-raw-pgn-source"
                 rows={7}
                 value={displayedPgn}
                 onChange={(e) => {

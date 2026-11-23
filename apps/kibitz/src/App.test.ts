@@ -95,4 +95,19 @@ describe("@suite/kibitz homepage", () => {
     expect(currentUser).toBeNull();
     expect(signOutError).toBeNull();
   });
+
+  it("renders AuthMenu sign-in dialog via AccessibleDialog with aria-modal and labelled heading (UI-03)", () => {
+    const html = renderToStaticMarkup(
+      createElement(AuthMenu, {
+        initialModalOpen: true,
+      }),
+    );
+    expect(html).toContain('role="dialog"');
+    expect(html).toContain('aria-modal="true"');
+    expect(html).toContain('aria-labelledby="kibitz-login-dialog-title"');
+    expect(html).toContain('id="kibitz-login-dialog-title"');
+    expect(html).toContain('for="home-login-handle"');
+    expect(html).toContain('for="home-login-password"');
+  });
 });
+

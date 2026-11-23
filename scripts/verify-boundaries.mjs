@@ -5,9 +5,12 @@
  * 1. Audits package.json dependency graphs across apps/* and packages/*.
  * 2. Runs ESLint programmatically against synthetic boundary violations to prove
  *    every guardrail in eslint.config.mjs actively fails lint.
+ * 3. With `--check-dist`, audits built bundles (`dist/assets/*.js`, `dist/sw.js`,
+ *    `dist/manifest.webmanifest`) for offline Zero-PII apps (`arbiter`, `seconds`).
  */
 
-import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -15,6 +18,7 @@ import { ESLint } from "eslint";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
+const REQUIRE_DIST = process.argv.includes("--check-dist");
 
 const errors = [];
 
@@ -230,9 +234,130 @@ async function auditDeterministicDevPorts() {
   }
 }
 
+async function auditOfflineBuiltBundles() {
+  const offlineApps = ["arbiter", "seconds"];
+
+  const forbiddenBundlePatterns = [
+    {
+      label: "navigator.sendBeacon exfiltration",
+      pattern: /\bnavigator\s*\.\s*sendBeacon\b|\bsendBeacon\s*\(/,
+    },
+    {
+      label: "WebSocket transport",
+      pattern: /\bnew\s+WebSocket\b/,
+    },
+    {
+      label: "EventSource transport",
+      pattern: /\bnew\s+EventSource\b/,
+    },
+    {
+      label: "XMLHttpRequest transport",
+      pattern: /\bXMLHttpRequest\b/,
+    },
+    {
+      label: "non-GET HTTP mutation method literal",
+      pattern: /\bmethod\s*:\s*["'`]\s*(?:POST|PUT|PATCH|DELETE)\s*["'`]/i,
+    },
+    {
+      label: "mutating fetch() call or fetch() request body",
+      pattern:
+        /\bfetch\s*\([^;{}]{0,300}\b(?:method\s*:\s*["'`]\s*(?!GET\b|HEAD\b)[A-Z]+\s*["'`]|body\s*:)/i,
+    },
+  ];
+
+  const externalEndpointPattern = /https?:\/\//i;
+
+  for (const appName of offlineApps) {
+    const distDir = path.join(REPO_ROOT, "apps", appName, "dist");
+    if (!existsSync(distDir)) {
+      errors.push(
+        `[DIST] apps/${appName}/dist does not exist. Run "pnpm build" before executing --check-dist.`,
+      );
+      continue;
+    }
+
+    // 1. Service Worker (dist/sw.js)
+    const swPath = path.join(distDir, "sw.js");
+    if (!existsSync(swPath)) {
+      errors.push(`[DIST] apps/${appName}/dist/sw.js is missing (PWA service worker required).`);
+    } else {
+      const swContent = await readFile(swPath, "utf8");
+      if (swContent.trim().length === 0) {
+        errors.push(`[DIST] apps/${appName}/dist/sw.js is empty.`);
+      }
+      for (const rule of forbiddenBundlePatterns) {
+        if (rule.pattern.test(swContent)) {
+          errors.push(`[DIST] apps/${appName}/dist/sw.js matched forbidden pattern: ${rule.label}.`);
+        }
+      }
+      if (externalEndpointPattern.test(swContent)) {
+        errors.push(
+          `[DIST] apps/${appName}/dist/sw.js contains an external http(s) URL (must precache local assets only).`,
+        );
+      }
+    }
+
+    // 2. Web App Manifest (dist/manifest.webmanifest)
+    const manifestPath = path.join(distDir, "manifest.webmanifest");
+    if (!existsSync(manifestPath)) {
+      errors.push(
+        `[DIST] apps/${appName}/dist/manifest.webmanifest is missing (PWA manifest required).`,
+      );
+    } else {
+      const manifestRaw = await readFile(manifestPath, "utf8");
+      try {
+        const manifest = JSON.parse(manifestRaw);
+        if (!manifest || typeof manifest !== "object" || typeof manifest.name !== "string") {
+          errors.push(
+            `[DIST] apps/${appName}/dist/manifest.webmanifest must be a valid JSON manifest with a "name".`,
+          );
+        }
+      } catch (err) {
+        errors.push(
+          `[DIST] apps/${appName}/dist/manifest.webmanifest is invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (externalEndpointPattern.test(manifestRaw)) {
+        errors.push(
+          `[DIST] apps/${appName}/dist/manifest.webmanifest contains an external http(s) endpoint.`,
+        );
+      }
+    }
+
+    // 3. Built JS assets (dist/assets/*.js)
+    const assetsDir = path.join(distDir, "assets");
+    if (!existsSync(assetsDir)) {
+      errors.push(`[DIST] apps/${appName}/dist/assets directory is missing.`);
+      continue;
+    }
+
+    const assetEntries = await readdir(assetsDir);
+    const jsAssets = assetEntries.filter((name) => name.endsWith(".js"));
+    if (jsAssets.length === 0) {
+      errors.push(`[DIST] apps/${appName}/dist/assets contains no built .js bundles.`);
+      continue;
+    }
+
+    for (const jsFile of jsAssets) {
+      const fullPath = path.join(assetsDir, jsFile);
+      const bundleContent = await readFile(fullPath, "utf8");
+      for (const rule of forbiddenBundlePatterns) {
+        if (rule.pattern.test(bundleContent)) {
+          errors.push(
+            `[DIST] apps/${appName}/dist/assets/${jsFile} matched forbidden Zero-PII pattern: ${rule.label}.`,
+          );
+        }
+      }
+    }
+  }
+}
+
 await auditPackageManifests();
 await auditDeterministicDevPorts();
 await verifyEslintGuardrails();
+if (REQUIRE_DIST) {
+  await auditOfflineBuiltBundles();
+}
 
 if (errors.length > 0) {
   console.error("Boundary verification FAILED:");
@@ -243,5 +368,7 @@ if (errors.length > 0) {
 }
 
 console.log(
-  "Boundary verification PASSED: Zero-PII firewall, pure package, deterministic port, and cross-app guardrails are active.",
+  REQUIRE_DIST
+    ? "Boundary verification PASSED: Zero-PII firewall, pure package, deterministic port, cross-app guardrails, and offline dist bundles are verified."
+    : "Boundary verification PASSED: Zero-PII firewall, pure package, deterministic port, and cross-app guardrails are active.",
 );

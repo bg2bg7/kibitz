@@ -2,6 +2,7 @@ import { useState } from "react";
 import { ChessBoard, type BoardAnnotationColor, type PromotionPiece } from "@suite/board-ui";
 import { INITIAL_FEN, validateFen, type PgnGameDocument } from "@suite/chess-core";
 import type { ArrowAnnotation, BoardOrientation, NodeId, SquareHighlight } from "@suite/pgna";
+import { AccessibleDialog } from "@suite/ui";
 
 export interface BoardStageProps {
   games: readonly PgnGameDocument[];
@@ -275,84 +276,80 @@ export function BoardStage({
       </div>
 
       {/* Add / Edit Chapter Modal */}
-      {editingGameModal ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4"
-          onClick={() => setEditingGameModal(null)}
-        >
-          <div
-            className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 className="text-sm font-semibold text-slate-900">
-              {editingGameModal === "new" ? "Add New Chapter / Game" : "Edit Chapter Headers & FEN"}
-            </h3>
-            <div className="mt-3 space-y-3 text-xs">
-              <label className="block">
-                <span className="font-medium text-slate-700">Event / Chapter Title</span>
-                <input
-                  type="text"
-                  value={eventInput}
-                  onChange={(e) => setEventInput(e.target.value)}
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5"
-                />
-              </label>
-              <div className="grid grid-cols-2 gap-2">
-                <label className="block">
-                  <span className="font-medium text-slate-700">White</span>
-                  <input
-                    type="text"
-                    value={whiteInput}
-                    onChange={(e) => setWhiteInput(e.target.value)}
-                    className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5"
-                  />
-                </label>
-                <label className="block">
-                  <span className="font-medium text-slate-700">Black</span>
-                  <input
-                    type="text"
-                    value={blackInput}
-                    onChange={(e) => setBlackInput(e.target.value)}
-                    className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5"
-                  />
-                </label>
-              </div>
-              <label className="block">
-                <span className="font-medium text-slate-700">
-                  Starting FEN (leave blank for standard start)
-                </span>
-                <input
-                  type="text"
-                  value={fenInput}
-                  onChange={(e) => {
-                    setFenInput(e.target.value);
-                    setFenError(null);
-                  }}
-                  placeholder={INITIAL_FEN}
-                  className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 font-mono text-[11px]"
-                />
-              </label>
-              {fenError ? <p className="text-red-600">{fenError}</p> : null}
-            </div>
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setEditingGameModal(null)}
-                className="rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleSaveGameModal}
-                className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
-              >
-                Save
-              </button>
-            </div>
+      <AccessibleDialog
+        open={editingGameModal !== null}
+        onClose={() => setEditingGameModal(null)}
+        ariaLabelledBy="scribe-chapter-dialog-title"
+        overlayClassName="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4"
+        panelClassName="w-full max-w-md rounded-xl bg-white p-5 shadow-xl"
+      >
+        <h3 id="scribe-chapter-dialog-title" className="text-sm font-semibold text-slate-900">
+          {editingGameModal === "new" ? "Add New Chapter / Game" : "Edit Chapter Headers & FEN"}
+        </h3>
+        <div className="mt-3 space-y-3 text-xs">
+          <label className="block">
+            <span className="font-medium text-slate-700">Event / Chapter Title</span>
+            <input
+              type="text"
+              value={eventInput}
+              onChange={(e) => setEventInput(e.target.value)}
+              className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5"
+            />
+          </label>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block">
+              <span className="font-medium text-slate-700">White</span>
+              <input
+                type="text"
+                value={whiteInput}
+                onChange={(e) => setWhiteInput(e.target.value)}
+                className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5"
+              />
+            </label>
+            <label className="block">
+              <span className="font-medium text-slate-700">Black</span>
+              <input
+                type="text"
+                value={blackInput}
+                onChange={(e) => setBlackInput(e.target.value)}
+                className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5"
+              />
+            </label>
           </div>
+          <label className="block">
+            <span className="font-medium text-slate-700">
+              Starting FEN (leave blank for standard start)
+            </span>
+            <input
+              type="text"
+              value={fenInput}
+              onChange={(e) => {
+                setFenInput(e.target.value);
+                setFenError(null);
+              }}
+              placeholder={INITIAL_FEN}
+              className="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-1.5 font-mono text-[11px]"
+            />
+          </label>
+          {fenError ? <p className="text-red-600">{fenError}</p> : null}
         </div>
-      ) : null}
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => setEditingGameModal(null)}
+            className="rounded-md border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleSaveGameModal}
+            className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
+          >
+            Save
+          </button>
+        </div>
+      </AccessibleDialog>
     </div>
   );
 }

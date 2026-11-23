@@ -1,5 +1,11 @@
-import { ChessPosition, INITIAL_FEN, parsePgnGames, validateFen, type PgnMoveNode } from "@suite/chess-core";
-import { applyCueDirectives, parseNodeComments } from "./tags.js";
+import {
+  ChessPosition,
+  INITIAL_FEN,
+  getPgnTextualNodeOrder,
+  parsePgnGames,
+  validateFen,
+} from "@suite/chess-core";
+import { applyCueDirectives, compareAtTags, parseNodeComments } from "./tags.js";
 import {
   DEFAULT_GAP_MS,
   DEFAULT_RETURN_PAUSE_MS,
@@ -31,6 +37,36 @@ import { mergeTimelineSubtitles } from "./vtt.js";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toNullProtoStringRecord(
+  input: Readonly<Record<string, string>> | undefined,
+): Record<string, string> {
+  const out = Object.create(null) as Record<string, string>;
+  if (!input) return out;
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value === "string") {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+/**
+ * Validates that a timeline interval `[startMs, endMs]` is finite, strictly advancing,
+ * non-negative, and within JavaScript's JSON-safe integer bound (`Number.MAX_SAFE_INTEGER`).
+ */
+export function isValidTimelineInterval(startMs: number, endMs: number): boolean {
+  return (
+    typeof startMs === "number" &&
+    typeof endMs === "number" &&
+    Number.isFinite(startMs) &&
+    Number.isFinite(endMs) &&
+    startMs >= 0 &&
+    endMs > startMs &&
+    startMs <= Number.MAX_SAFE_INTEGER &&
+    endMs <= Number.MAX_SAFE_INTEGER
+  );
 }
 
 export interface CompilePgnaInput {
@@ -97,7 +133,8 @@ function resolveCompilationOptions(
     };
   }
 
-  const timingModeRaw = raw?.timingMode ?? "flow";
+  const timingModeRaw: unknown =
+    raw && raw.timingMode !== undefined ? raw.timingMode : "flow";
   let timingMode: "flow" | "strict" = "flow";
   if (timingModeRaw === "flow" || timingModeRaw === "strict") {
     timingMode = timingModeRaw;
@@ -109,43 +146,66 @@ function resolveCompilationOptions(
     });
   }
 
-  const defaultSilentRaw = raw?.defaultSilentDurationMs ?? DEFAULT_SILENT_DURATION_MS;
+  const defaultSilentRaw: unknown =
+    raw && raw.defaultSilentDurationMs !== undefined
+      ? raw.defaultSilentDurationMs
+      : DEFAULT_SILENT_DURATION_MS;
   let defaultSilentDurationMs: number = DEFAULT_SILENT_DURATION_MS;
-  if (typeof defaultSilentRaw === "number" && Number.isFinite(defaultSilentRaw) && defaultSilentRaw > 0) {
+  if (
+    typeof defaultSilentRaw === "number" &&
+    Number.isFinite(defaultSilentRaw) &&
+    defaultSilentRaw > 0 &&
+    defaultSilentRaw <= Number.MAX_SAFE_INTEGER
+  ) {
     defaultSilentDurationMs = defaultSilentRaw;
   } else {
     diagnostics.push({
       code: "INVALID_COMPILATION_OPTIONS",
       severity: "error",
-      message: `Invalid compilation.defaultSilentDurationMs "${String(defaultSilentRaw)}": must be a finite number > 0.`,
+      message: `Invalid compilation.defaultSilentDurationMs "${String(defaultSilentRaw)}": must be a finite number > 0 and <= MAX_SAFE_INTEGER.`,
     });
   }
 
-  const defaultReturnRaw = raw?.defaultReturnPauseMs ?? DEFAULT_RETURN_PAUSE_MS;
+  const defaultReturnRaw: unknown =
+    raw && raw.defaultReturnPauseMs !== undefined
+      ? raw.defaultReturnPauseMs
+      : DEFAULT_RETURN_PAUSE_MS;
   let defaultReturnPauseMs: number = DEFAULT_RETURN_PAUSE_MS;
-  if (typeof defaultReturnRaw === "number" && Number.isFinite(defaultReturnRaw) && defaultReturnRaw > 0) {
+  if (
+    typeof defaultReturnRaw === "number" &&
+    Number.isFinite(defaultReturnRaw) &&
+    defaultReturnRaw > 0 &&
+    defaultReturnRaw <= Number.MAX_SAFE_INTEGER
+  ) {
     defaultReturnPauseMs = defaultReturnRaw;
   } else {
     diagnostics.push({
       code: "INVALID_COMPILATION_OPTIONS",
       severity: "error",
-      message: `Invalid compilation.defaultReturnPauseMs "${String(defaultReturnRaw)}": must be a finite number > 0.`,
+      message: `Invalid compilation.defaultReturnPauseMs "${String(defaultReturnRaw)}": must be a finite number > 0 and <= MAX_SAFE_INTEGER.`,
     });
   }
 
-  const defaultGapRaw = raw?.defaultGapMs ?? DEFAULT_GAP_MS;
+  const defaultGapRaw: unknown =
+    raw && raw.defaultGapMs !== undefined ? raw.defaultGapMs : DEFAULT_GAP_MS;
   let defaultGapMs: number = DEFAULT_GAP_MS;
-  if (typeof defaultGapRaw === "number" && Number.isFinite(defaultGapRaw) && defaultGapRaw >= 0) {
+  if (
+    typeof defaultGapRaw === "number" &&
+    Number.isFinite(defaultGapRaw) &&
+    defaultGapRaw >= 0 &&
+    defaultGapRaw <= Number.MAX_SAFE_INTEGER
+  ) {
     defaultGapMs = defaultGapRaw;
   } else {
     diagnostics.push({
       code: "INVALID_COMPILATION_OPTIONS",
       severity: "error",
-      message: `Invalid compilation.defaultGapMs "${String(defaultGapRaw)}": must be a finite number >= 0.`,
+      message: `Invalid compilation.defaultGapMs "${String(defaultGapRaw)}": must be a finite number >= 0 and <= MAX_SAFE_INTEGER.`,
     });
   }
 
-  const includeUnscheduledRaw = raw?.includeUnscheduledAudio ?? false;
+  const includeUnscheduledRaw: unknown =
+    raw && raw.includeUnscheduledAudio !== undefined ? raw.includeUnscheduledAudio : false;
   let includeUnscheduledAudio = false;
   if (typeof includeUnscheduledRaw === "boolean") {
     includeUnscheduledAudio = includeUnscheduledRaw;
@@ -317,18 +377,23 @@ function validateManifestAndClips(
       }
     }
 
-    if (typeof clip.durationMs !== "number" || !Number.isFinite(clip.durationMs) || clip.durationMs <= 0) {
+    if (
+      typeof clip.durationMs !== "number" ||
+      !Number.isFinite(clip.durationMs) ||
+      clip.durationMs <= 0 ||
+      clip.durationMs > Number.MAX_SAFE_INTEGER
+    ) {
       diagnostics.push({
         code: "INVALID_CLIP_DURATION",
         severity: "error",
         ...(typeof clipPath === "string" ? { path: clipPath } : {}),
-        message: `Clip "${clipId}" durationMs must be a finite number > 0.`,
+        message: `Clip "${clipId}" durationMs must be a finite number > 0 and <= MAX_SAFE_INTEGER.`,
       });
       continue;
     }
 
-    const trimStartMs: unknown = clip.trimStartMs ?? 0;
-    const trimEndMs: unknown = clip.trimEndMs ?? clip.durationMs;
+    const trimStartMs: unknown = clip.trimStartMs === undefined ? 0 : clip.trimStartMs;
+    const trimEndMs: unknown = clip.trimEndMs === undefined ? clip.durationMs : clip.trimEndMs;
     if (
       typeof trimStartMs !== "number" ||
       typeof trimEndMs !== "number" ||
@@ -381,11 +446,16 @@ function resolveGameOrientation(
   return "white";
 }
 
-function makeChildNodeId(parentId: NodeId, childIndex: number): NodeId {
-  if (parentId.includes("/")) {
-    return `${parentId}.${childIndex}` as NodeId;
+function getParentNodeId(nodeId: NodeId): NodeId | null {
+  const lastDot = nodeId.lastIndexOf(".");
+  if (lastDot !== -1) {
+    return nodeId.slice(0, lastDot) as NodeId;
   }
-  return `${parentId}/${childIndex}` as NodeId;
+  const slash = nodeId.indexOf("/");
+  if (slash !== -1) {
+    return nodeId.slice(0, slash) as NodeId;
+  }
+  return null;
 }
 
 function compileCuesForEntry(
@@ -492,7 +562,7 @@ function getPrimaryAtTagDurMs(node: CompiledNode): number | undefined {
   if (node.tags.atTags.length === 0) return undefined;
   const earliest = node.tags.atTags
     .map((tag, idx) => ({ tag, idx }))
-    .sort((a, b) => a.tag.value - b.tag.value || a.idx - b.idx)[0];
+    .sort((a, b) => compareAtTags(a.tag, b.tag) || a.idx - b.idx)[0];
   return earliest?.tag.durMs;
 }
 
@@ -573,82 +643,6 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
   const nodeById = new Map<NodeId, CompiledNode>();
   let docOrderCounter = 0;
 
-  // Walk games in exact PGN document order:
-  // For a list of siblings [M, RAV1, RAV2, ...]:
-  //   1. Visit M (document order)
-  //   2. Visit each RAV_k subtree in order (they appear immediately after M in PGN text)
-  //   3. Visit M's children
-  const walkSiblings = (
-    pgnSiblings: readonly PgnMoveNode[],
-    parentNode: CompiledNode,
-    gameOrientation: BoardOrientation,
-  ): void => {
-    if (pgnSiblings.length === 0) return;
-
-    const compiledSiblings: Array<{ pgn: PgnMoveNode; compiled: CompiledNode | null }> = [];
-
-    // First instantiate M (child 0) so it gets documentOrder before its sibling RAVs
-    const createCompiledChild = (
-      pgnNode: PgnMoveNode,
-      childIndex: number,
-    ): CompiledNode | null => {
-      const nodeId = makeChildNodeId(parentNode.nodeId, childIndex);
-      const pos = new ChessPosition(parentNode.fen);
-      const applied = pos.tryMove(pgnNode.san);
-      if (!applied) {
-        diagnostics.push({
-          code: "ILLEGAL_MOVE",
-          severity: "error",
-          nodeId,
-          message: `Illegal move "${pgnNode.san}" at ${nodeId} from FEN "${parentNode.fen}".`,
-        });
-        return null;
-      }
-
-      const { tags, diagnostics: tagDiags } = parseNodeComments(pgnNode.comments, nodeId);
-      diagnostics.push(...tagDiags);
-
-      const compiled: CompiledNode = {
-        nodeId,
-        gameIndex: parentNode.gameIndex,
-        ply: parentNode.ply + 1,
-        san: applied.san,
-        fen: applied.fen,
-        lastMove: { from: applied.from, to: applied.to },
-        orientation: tags.orientation ?? gameOrientation,
-        nags: [...pgnNode.nags],
-        tags,
-        documentOrder: docOrderCounter++,
-        siblingIndex: childIndex,
-        children: [],
-      };
-
-      parentNode.children.push(compiled);
-      allNodes.push(compiled);
-      nodeById.set(nodeId, compiled);
-      return compiled;
-    };
-
-    // 1. Primary move M (child 0)
-    const primaryPgn = pgnSiblings[0]!;
-    const primaryCompiled = createCompiledChild(primaryPgn, 0);
-    compiledSiblings.push({ pgn: primaryPgn, compiled: primaryCompiled });
-
-    // 2. Sibling RAVs (children 1..k) appear in PGN text right after M, before M's continuation
-    for (let i = 1; i < pgnSiblings.length; i++) {
-      const ravPgn = pgnSiblings[i]!;
-      const ravCompiled = createCompiledChild(ravPgn, i);
-      if (ravCompiled) {
-        walkSiblings(ravPgn.children, ravCompiled, gameOrientation);
-      }
-    }
-
-    // 3. Mainline continuation of M
-    if (primaryCompiled) {
-      walkSiblings(primaryPgn.children, primaryCompiled, gameOrientation);
-    }
-  };
-
   for (let gameIndex = 0; gameIndex < parsedGames.length; gameIndex++) {
     const game = parsedGames[gameIndex]!;
 
@@ -713,7 +707,51 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
     allNodes.push(rootNode);
     nodeById.set(rootNodeId, rootNode);
 
-    walkSiblings(game.rootMoves, rootNode, gameOrientation);
+    // Walk game nodes in exact PGN textual source order (preserving nested same-ply RAV
+    // placement and canonical positional NodeIds) via @suite/chess-core.
+    for (const textualEntry of getPgnTextualNodeOrder(game, gameIndex)) {
+      const nodeId = textualEntry.nodeId as NodeId;
+      const parentId = getParentNodeId(nodeId);
+      const parentNode = parentId ? nodeById.get(parentId) : undefined;
+      if (!parentNode) {
+        continue;
+      }
+
+      const pgnNode = textualEntry.node;
+      const pos = new ChessPosition(parentNode.fen);
+      const applied = pos.tryMove(pgnNode.san);
+      if (!applied) {
+        diagnostics.push({
+          code: "ILLEGAL_MOVE",
+          severity: "error",
+          nodeId,
+          message: `Illegal move "${pgnNode.san}" at ${nodeId} from FEN "${parentNode.fen}".`,
+        });
+        continue;
+      }
+
+      const { tags, diagnostics: tagDiags } = parseNodeComments(pgnNode.comments, nodeId);
+      diagnostics.push(...tagDiags);
+
+      const compiled: CompiledNode = {
+        nodeId,
+        gameIndex,
+        ply: textualEntry.ply,
+        san: applied.san,
+        fen: applied.fen,
+        lastMove: { from: applied.from, to: applied.to },
+        orientation: tags.orientation ?? gameOrientation,
+        nags: [...pgnNode.nags],
+        tags,
+        documentOrder: docOrderCounter++,
+        siblingIndex: textualEntry.siblingIndex,
+        children: [],
+      };
+
+      parentNode.children.push(compiled);
+      allNodes.push(compiled);
+      nodeById.set(nodeId, compiled);
+    }
   }
 
   // Validate clip references on all nodes & check single scheduling mode
@@ -765,9 +803,8 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
 
   // Deterministic sort: key ascending -> PGN document order -> tag order on node
   scheduledOccurrences.sort((a, b) => {
-    const aVal = a.atTag!.value;
-    const bVal = b.atTag!.value;
-    if (aVal !== bVal) return aVal - bVal;
+    const cmp = compareAtTags(a.atTag!, b.atTag!);
+    if (cmp !== 0) return cmp;
     if (a.node.documentOrder !== b.node.documentOrder) {
       return a.node.documentOrder - b.node.documentOrder;
     }
@@ -809,7 +846,7 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
       durationMs = atTag?.durMs ?? node.tags.durMs ?? options.defaultSilentDurationMs;
     }
 
-    if (durationMs <= 0) {
+    if (!Number.isFinite(durationMs) || durationMs <= 0) {
       diagnostics.push({
         code: "ZERO_ENTRY_DURATION",
         severity: "error",
@@ -818,8 +855,6 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
       });
       continue;
     }
-
-    visitedNodes.add(node.nodeId);
 
     const prevEntry = entries[entries.length - 1];
     let startMs: number;
@@ -854,6 +889,24 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
     } else {
       startMs = prevEntry.endMs + options.defaultGapMs;
     }
+
+    const endMs = startMs + durationMs;
+    if (
+      !isValidTimelineInterval(startMs, endMs) ||
+      (prevEntry &&
+        options.timingMode !== "strict" &&
+        startMs < prevEntry.endMs)
+    ) {
+      diagnostics.push({
+        code: "TIMELINE_INTERVAL_OVERFLOW",
+        severity: "error",
+        nodeId: node.nodeId,
+        message: `Resolved timeline interval [${startMs}, ${endMs}] for ${node.nodeId} is non-finite, non-advancing, or exceeds MAX_SAFE_INTEGER.`,
+      });
+      continue;
+    }
+
+    visitedNodes.add(node.nodeId);
 
     const entryIndex = entries.length;
     const entry = buildEntryFromNode(
@@ -891,6 +944,9 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
       lastMove: node.lastMove ? { ...node.lastMove } : null,
       orientation: node.orientation,
       clipId: node.tags.audioClipId,
+      comment: node.tags.prose,
+      arrows: cloneArrows(node.tags.arrows),
+      highlights: cloneHighlights(node.tags.highlights),
       timelineIndex: indices[0] ?? null,
       timelineIndices: [...indices],
     };
@@ -934,12 +990,27 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
           ? stepClip.trimEndMs - stepClip.trimStartMs
           : (getPrimaryAtTagDurMs(cur) ?? cur.tags.durMs ?? options.defaultSilentDurationMs);
 
-        if (stepDurationMs <= 0) {
+        if (!Number.isFinite(stepDurationMs) || stepDurationMs <= 0) {
           diagnostics.push({
             code: "ZERO_ENTRY_DURATION",
             severity: "error",
             nodeId: cur.nodeId,
             message: `Branch step ${cur.nodeId} has non-positive duration ${stepDurationMs}ms.`,
+          });
+          break;
+        }
+
+        const stepEndMs = cursorMs + stepDurationMs;
+        const prevBranchStep = branchTimeline[branchTimeline.length - 1];
+        if (
+          !isValidTimelineInterval(cursorMs, stepEndMs) ||
+          (prevBranchStep && cursorMs < prevBranchStep.endMs)
+        ) {
+          diagnostics.push({
+            code: "TIMELINE_INTERVAL_OVERFLOW",
+            severity: "error",
+            nodeId: cur.nodeId,
+            message: `Branch timeline interval [${cursorMs}, ${stepEndMs}] for ${cur.nodeId} is non-finite, non-advancing, or exceeds MAX_SAFE_INTEGER.`,
           });
           break;
         }
@@ -996,10 +1067,10 @@ export function compilePgna(input: CompilePgnaInput): CompilePgnaResult {
     }
   }
 
-  // Merge WebVTT subtitles
+  // Merge WebVTT subtitles using prototype-safe lookup record
   const { mergedSubtitlesPaths, mergedSubtitlesVtt } = mergeTimelineSubtitles(
     entries,
-    input.subtitlesByPath ?? {},
+    toNullProtoStringRecord(input.subtitlesByPath),
   );
 
   const lastEntry = entries[entries.length - 1];

@@ -453,17 +453,24 @@ export function App() {
     setSelectedNodeId(cur.nodeId);
   }, [activeNode, studyIndex.nodesById]);
 
-  // Keyboard move navigation in Author mode
+  // Keyboard move navigation in Author mode (disabled whenever any modal/dialog is open)
   useEffect(() => {
-    if (studioMode !== "author") return;
+    if (studioMode !== "author" || showDraftsModal || showPublishModal) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (
+        typeof document !== "undefined" &&
+        document.querySelector('[role="dialog"][aria-modal="true"]') !== null
+      ) {
+        return;
+      }
       const target = e.target as HTMLElement | null;
       if (
         target &&
         (target.tagName === "INPUT" ||
           target.tagName === "TEXTAREA" ||
           target.tagName === "SELECT" ||
-          target.isContentEditable)
+          target.isContentEditable ||
+          target.closest('[role="dialog"]') !== null)
       ) {
         return;
       }
@@ -483,7 +490,15 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [studioMode, stepFirst, stepLast, stepNext, stepPrev]);
+  }, [
+    studioMode,
+    showDraftsModal,
+    showPublishModal,
+    stepFirst,
+    stepLast,
+    stepNext,
+    stepPrev,
+  ]);
 
   // Board interactions
   const handleMove = (move: { from: string; to: string; promotion?: PromotionPiece }) => {

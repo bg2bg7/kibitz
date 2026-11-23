@@ -1539,3 +1539,154 @@ describe("@suite/pgna FMT-02 archive completeness & subtitle track integrity", (
   });
 });
 
+describe("@suite/pgna FMT-01, FMT-03, FMT-04, FMT-05 & LEC-05 correctness", () => {
+  it("FMT-01: preserves nested same-ply variation textual playback order across compile & unscheduled audio", () => {
+    const manifest = makeBaseManifest({
+      compilation: {
+        timingMode: "flow",
+        defaultSilentDurationMs: 1000,
+        defaultReturnPauseMs: 500,
+        defaultGapMs: 0,
+        includeUnscheduledAudio: true,
+      },
+      clips: {
+        c1: { id: "c1", path: "audio/c1.ogg", mimeType: "audio/ogg; codecs=opus", durationMs: 1000 },
+        c2: { id: "c2", path: "audio/c2.ogg", mimeType: "audio/ogg; codecs=opus", durationMs: 1000 },
+        c3: { id: "c3", path: "audio/c3.ogg", mimeType: "audio/ogg; codecs=opus", durationMs: 1000 },
+      },
+    });
+
+    // Nested same-ply RAV (1. c4) appears inside (1. d4 ... 1... d5) BEFORE 1... d5 and BEFORE 1... e5
+    const pgnText =
+      "1. e4 ( 1. d4 { [%at #1] } ( 1. c4 { [%at #1] } ) 1... d5 { [%at #1] } ) 1... e5 { [%at #1] } *";
+    const compiled = compilePgna({ manifest, pgnText });
+    expect(compiled.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
+    expect(compiled.timeline.entries.map((e) => e.san)).toEqual(["d4", "c4", "d5", "e5"]);
+  });
+
+  it("FMT-03: round-trips prototype-key-like paths and rejects invalid UTF-8 with INVALID_UTF8 diagnostics", async () => {
+    const manifest = makeBaseManifest({
+      defaultSubtitleLang: "en",
+      clips: {
+        cProto: {
+          id: "cProto",
+          path: "audio/constructor.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 1500,
+          subtitles: { en: "subtitles/en/toString.vtt" },
+        },
+      },
+    });
+    const audioBytes = new Uint8Array([0x4f, 0x67, 0x67, 0x53]);
+    const vttText = "WEBVTT\n\n00:00.000 --> 00:01.000\nPrototype key subtitle\n";
+
+    const packed = await packPgnaArchive({
+      manifest,
+      pgnText: "1. e4 { [%audio cProto] [%at #1] } *",
+      audioByPath: { "audio/constructor.ogg": audioBytes },
+      subtitlesByPath: { "subtitles/en/toString.vtt": vttText },
+    });
+    expect((await validatePgnaZip(packed.zipBytes)).valid).toBe(true);
+    const unpacked = await unpackPgnaArchive(packed.zipBytes);
+    expect(unpacked.audioByPath["audio/constructor.ogg"]).toEqual(audioBytes);
+    expect(unpacked.subtitlesByPath["subtitles/en/toString.vtt"]).toBe(vttText);
+
+    // Invalid UTF-8 in PGN entry produces INVALID_UTF8 diagnostic rather than U+FFFD replacement
+    const invalidUtf8Entries = packed.entries.map((entry) =>
+      entry.path === "study.pgn"
+        ? { ...entry, data: new Uint8Array([0xff, 0xfe, 0x80]) }
+        : entry,
+    );
+    const invalidRes = validatePgnaPackage(invalidUtf8Entries);
+    expect(invalidRes.valid).toBe(false);
+    expect(invalidRes.diagnostics.some((d) => d.code === "INVALID_UTF8")).toBe(true);
+  });
+
+  it("FMT-04: rejects explicit JSON null timing fields and preserves exact arbitrary-precision decimal ordinals", () => {
+    // Explicit null on compilation timing field produces INVALID_COMPILATION_OPTIONS diagnostic
+    const badManifest = {
+      ...makeBaseManifest(),
+      compilation: {
+        defaultSilentDurationMs: null as unknown as number,
+      },
+    };
+    const nullCompRes = compilePgna({
+      manifest: badManifest,
+      pgnText: "1. e4 { [%at #1] } *",
+    });
+    expect(
+      nullCompRes.diagnostics.some(
+        (d) => d.code === "INVALID_COMPILATION_OPTIONS" && d.severity === "error",
+      ),
+    ).toBe(true);
+
+    // High-precision decimal ordinals beyond float64 precision preserve exact ordering
+    const pgnHighPrecision =
+      "1. e4 { [%at #1.00000000000000002] } 1... e5 { [%at #1.00000000000000001] } *";
+    const ordRes = compilePgna({
+      manifest: makeBaseManifest(),
+      pgnText: pgnHighPrecision,
+    });
+    expect(ordRes.diagnostics.filter((d) => d.severity === "error")).toEqual([]);
+    expect(ordRes.timeline.entries.map((e) => e.san)).toEqual(["e5", "e4"]);
+  });
+
+  it("FMT-05 & LEC-05: resumes paused narrated guess branches from silent manual prompts, enters timeline mode on Continue, and preserves unscheduled manual node annotations", () => {
+    const manifest = makeBaseManifest({
+      clips: {
+        branchClip: {
+          id: "branchClip",
+          path: "audio/branch.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 2000,
+        },
+      },
+    });
+    const pgnText = [
+      "1. e4 { Silent prompt [%at #1 dur=1] [%guess return=manual] }",
+      "1... e5 { Mainline reply [%at #2 dur=1] }",
+      "( 1... c5 { Sicilian branch with audio [%audio branchClip] [%outcome interesting] } )",
+      "( 1... e6 { French unscheduled note [%cal Ge7e6] [%csl Yd5] } )",
+      "*",
+    ].join("\n");
+
+    const compiled = compilePgna({ manifest, pgnText });
+    const player = createPgnaPlayer(compiled.timeline, { clips: manifest.clips });
+
+    // LEC-05: Select unscheduled variation (1... e6 -> g0/0.2) in manual mode and inspect annotations
+    player.selectNode("g0/0.2");
+    const manualSnap = player.getSnapshot();
+    expect(manualSnap.mode).toBe("manual");
+    expect(manualSnap.comment).toBe("French unscheduled note");
+    expect(manualSnap.arrows).toEqual([{ color: "G", from: "e7", to: "e6" }]);
+    expect(manualSnap.highlights).toEqual([{ color: "Y", square: "d5" }]);
+
+    // FMT-05: Enter silent guess prompt manually, play narrated branch (1... c5), pause, and resume
+    expect(player.enterGuessPrompt("g0/0")).toBe(true);
+    expect(player.getSnapshot().mode).toBe("manual");
+    const evalRes = player.submitGuessMove("c7", "c5");
+    expect(evalRes.status).toBe("interesting");
+    expect(player.getSnapshot().guessPhase).toBe("playing_branch");
+    expect(player.getSnapshot().isPlaying).toBe(true);
+
+    player.tick(500);
+    player.pause();
+    expect(player.getSnapshot().isPlaying).toBe(false);
+    expect(player.getSnapshot().branchTimeMs).toBe(500);
+
+    // Resuming play checks the active branch rather than the silent manual prompt node
+    player.play();
+    expect(player.getSnapshot().isPlaying).toBe(true);
+    player.tick(1500);
+    expect(player.getSnapshot().guessPhase).toBe("branch_complete");
+
+    // Continue from a manually entered scheduled prompt transitions into timeline mode at next scheduled entry (1... e5)
+    player.continueAfterGuess();
+    const afterContinue = player.getSnapshot();
+    expect(afterContinue.mode).toBe("timeline");
+    expect(afterContinue.isPlaying).toBe(true);
+    expect(afterContinue.activeNodeId).toBe("g0/0.0");
+  });
+});
+
+

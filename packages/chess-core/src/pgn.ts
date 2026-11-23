@@ -11,6 +11,23 @@ export interface PgnMoveNode {
   comments: string[];
   /** Mainline continuation is children[0]; RAV alternatives are children[1..k]. */
   children: PgnMoveNode[];
+  /**
+   * Optional index within the same sibling array of the move this RAV was anchored after
+   * in source PGN text. Omitted (defaults to `0`) for RAVs attached directly to the
+   * mainline sibling `children[0]`; set to `k >= 1` when nested inside another same-ply RAV.
+   */
+  ravAnchorIndex?: number;
+}
+
+export interface PgnTextualNodeEntry {
+  /** Canonical PGNA NodeId (e.g. `g0/0`, `g0/1`, `g0/2`, `g0/1.0`). */
+  nodeId: string;
+  /** 1-based ply depth from the game root. */
+  ply: number;
+  /** 0-based index within the parent's children array (`0` = mainline). */
+  siblingIndex: number;
+  /** The PGN move AST node. */
+  node: PgnMoveNode;
 }
 
 export type PgnResult = "1-0" | "0-1" | "1/2-1/2" | "*";
@@ -110,7 +127,8 @@ function normalizeSanAndInlineNags(rawWord: string): { san: string; inlineNags: 
 }
 
 function tokenizePgn(pgnText: string): PgnToken[] {
-  const input = pgnText.startsWith("\uFEFF") ? pgnText.slice(1) : pgnText;
+  const withoutBom = pgnText.startsWith("\uFEFF") ? pgnText.slice(1) : pgnText;
+  const input = withoutBom.replace(/\r\n?/g, "\n");
   const tokens: PgnToken[] = [];
   const len = input.length;
   let i = 0;
@@ -140,7 +158,7 @@ function tokenizePgn(pgnText: string): PgnToken[] {
       while (i < len && input[i] !== "\n") {
         i++;
       }
-      const text = input.slice(start, i).replace(/\r$/, "").trim();
+      const text = input.slice(start, i).trim();
       if (text.length > 0) {
         tokens.push({ type: "comment", text });
       }
@@ -311,10 +329,12 @@ function parseSequence(
   cursor: TokenCursor,
   siblingArray: PgnMoveNode[],
   rootCommentsTarget: string[] | null,
+  ravAnchorIndex = 0,
 ): PgnResult | null {
   const pendingComments: string[] = [];
   let lastMove: PgnMoveNode | null = null;
   let lastMoveSiblingArray: PgnMoveNode[] = siblingArray;
+  let lastMoveSiblingIndex = -1;
   const explicitResult: PgnResult | null = null;
 
   while (cursor.index < cursor.tokens.length) {
@@ -373,7 +393,7 @@ function parseSequence(
         // PGNA §3: RAV appearing before any move in a sequence is malformed and ignored
         skipBalancedRav(cursor);
       } else {
-        parseSequence(cursor, lastMoveSiblingArray, null);
+        parseSequence(cursor, lastMoveSiblingArray, null, lastMoveSiblingIndex);
       }
       continue;
     }
@@ -389,11 +409,18 @@ function parseSequence(
       pendingComments.length = 0;
 
       if (lastMove === null) {
+        const insertedIndex = siblingArray.length;
+        if (rootCommentsTarget === null && ravAnchorIndex > 0 && ravAnchorIndex < insertedIndex) {
+          node.ravAnchorIndex = ravAnchorIndex;
+        }
         siblingArray.push(node);
         lastMoveSiblingArray = siblingArray;
+        lastMoveSiblingIndex = insertedIndex;
       } else {
+        const insertedIndex = lastMove.children.length;
         lastMove.children.push(node);
         lastMoveSiblingArray = lastMove.children;
+        lastMoveSiblingIndex = insertedIndex;
       }
       lastMove = node;
       continue;
@@ -460,6 +487,73 @@ export function parsePgnGames(pgnText: string): PgnGameDocument[] {
   return games;
 }
 
+function resolveRavAnchorIndex(node: PgnMoveNode, siblingIndex: number): number {
+  const raw = node.ravAnchorIndex;
+  if (typeof raw === "number" && Number.isInteger(raw) && raw >= 0 && raw < siblingIndex) {
+    return raw;
+  }
+  return 0;
+}
+
+/**
+ * Groups each sibling index `i` in a PGN sibling array with the indices of RAVs directly
+ * anchored immediately after sibling `i` in PGN textual order.
+ *
+ * Guarantees a cycle-free tree rooted at index `0` even if `ravAnchorIndex` metadata is
+ * absent or stale after manual AST mutations.
+ */
+export function getPgnSiblingRavMap(siblings: readonly PgnMoveNode[]): number[][] {
+  const anchored: number[][] = siblings.map(() => []);
+  for (let i = 1; i < siblings.length; i++) {
+    const anchor = resolveRavAnchorIndex(siblings[i]!, i);
+    anchored[anchor]!.push(i);
+  }
+  return anchored;
+}
+
+function makeChildNodeId(parentId: string, childIndex: number): string {
+  return parentId.includes("/") ? `${parentId}.${childIndex}` : `${parentId}/${childIndex}`;
+}
+
+/**
+ * Returns all move nodes of a `PgnGameDocument` in exact PGN textual document order
+ * (preserving nested same-ply RAV placement) along with each node's canonical `NodeId`.
+ */
+export function getPgnTextualNodeOrder(
+  game: PgnGameDocument,
+  gameIndex = 0,
+): PgnTextualNodeEntry[] {
+  const entries: PgnTextualNodeEntry[] = [];
+
+  const walkSiblings = (
+    siblings: readonly PgnMoveNode[],
+    parentNodeId: string,
+    parentPly: number,
+  ): void => {
+    if (siblings.length === 0) return;
+    const ravMap = getPgnSiblingRavMap(siblings);
+
+    const visitSibling = (siblingIndex: number): void => {
+      const node = siblings[siblingIndex];
+      if (!node) return;
+      const nodeId = makeChildNodeId(parentNodeId, siblingIndex);
+      const ply = parentPly + 1;
+      entries.push({ nodeId, ply, siblingIndex, node });
+
+      for (const ravIndex of ravMap[siblingIndex] ?? []) {
+        visitSibling(ravIndex);
+      }
+
+      walkSiblings(node.children, nodeId, ply);
+    };
+
+    visitSibling(0);
+  };
+
+  walkSiblings(game.rootMoves, `g${gameIndex}`, 0);
+  return entries;
+}
+
 function getInitialTurnAndMoveNumber(headers: Record<string, string>): {
   turn: "w" | "b";
   moveNumber: number;
@@ -475,6 +569,51 @@ function getInitialTurnAndMoveNumber(headers: Record<string, string>): {
   return { turn, moveNumber };
 }
 
+function serializeSiblingNode(
+  siblings: readonly PgnMoveNode[],
+  ravMap: readonly (readonly number[])[],
+  siblingIndex: number,
+  turn: "w" | "b",
+  moveNumber: number,
+  forceMoveNumber: boolean,
+  parts: string[],
+): void {
+  const node = siblings[siblingIndex];
+  if (!node) return;
+
+  if (turn === "w") {
+    parts.push(`${moveNumber}. ${node.san}`);
+  } else if (forceMoveNumber) {
+    parts.push(`${moveNumber}... ${node.san}`);
+  } else {
+    parts.push(node.san);
+  }
+
+  for (const nag of node.nags) {
+    parts.push(nag);
+  }
+
+  for (const comment of node.comments) {
+    const safe = sanitizeBraceComment(comment);
+    parts.push(safe.length > 0 ? `{ ${safe} }` : "{}");
+  }
+
+  let emittedInterrupter = node.comments.length > 0;
+
+  for (const ravIndex of ravMap[siblingIndex] ?? []) {
+    const ravParts: string[] = [];
+    serializeSiblingNode(siblings, ravMap, ravIndex, turn, moveNumber, true, ravParts);
+    parts.push(`(${ravParts.join(" ")})`);
+    emittedInterrupter = true;
+  }
+
+  if (node.children.length > 0) {
+    const nextTurn: "w" | "b" = turn === "w" ? "b" : "w";
+    const nextMoveNumber = turn === "b" ? moveNumber + 1 : moveNumber;
+    serializeMoveBranch(node.children, nextTurn, nextMoveNumber, emittedInterrupter, parts);
+  }
+}
+
 function serializeMoveBranch(
   siblings: readonly PgnMoveNode[],
   turn: "w" | "b",
@@ -482,47 +621,9 @@ function serializeMoveBranch(
   forceMoveNumber: boolean,
   parts: string[],
 ): void {
-  const primary = siblings[0];
-  if (!primary) return;
-
-  if (turn === "w") {
-    parts.push(`${moveNumber}. ${primary.san}`);
-  } else if (forceMoveNumber) {
-    parts.push(`${moveNumber}... ${primary.san}`);
-  } else {
-    parts.push(primary.san);
-  }
-
-  for (const nag of primary.nags) {
-    parts.push(nag);
-  }
-
-  for (const comment of primary.comments) {
-    const safe = sanitizeBraceComment(comment);
-    parts.push(safe.length > 0 ? `{ ${safe} }` : "{}");
-  }
-
-  let emittedInterrupter = primary.comments.length > 0;
-
-  for (let i = 1; i < siblings.length; i++) {
-    const alt = siblings[i]!;
-    const ravParts: string[] = [];
-    serializeMoveBranch([alt], turn, moveNumber, true, ravParts);
-    parts.push(`(${ravParts.join(" ")})`);
-    emittedInterrupter = true;
-  }
-
-  if (primary.children.length > 0) {
-    const nextTurn: "w" | "b" = turn === "w" ? "b" : "w";
-    const nextMoveNumber = turn === "b" ? moveNumber + 1 : moveNumber;
-    serializeMoveBranch(
-      primary.children,
-      nextTurn,
-      nextMoveNumber,
-      emittedInterrupter,
-      parts,
-    );
-  }
+  if (siblings.length === 0) return;
+  const ravMap = getPgnSiblingRavMap(siblings);
+  serializeSiblingNode(siblings, ravMap, 0, turn, moveNumber, forceMoveNumber, parts);
 }
 
 /**

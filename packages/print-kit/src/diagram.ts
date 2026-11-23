@@ -24,6 +24,15 @@ const PRINT_GLYPHS: Record<string, string> = {
 const FILES = ["a", "b", "c", "d", "e", "f", "g", "h"] as const;
 const RANKS = ["8", "7", "6", "5", "4", "3", "2", "1"] as const;
 
+function escapeXmlText(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 /**
  * Renders a self-contained high-DPI SVG chess diagram suitable for client-side PDF printouts.
  */
@@ -62,7 +71,7 @@ export function renderBoardDiagramSvg(
 
   const captionHeight = options.caption ? 24 : 0;
   const captionSvg = options.caption
-    ? `<text x="${sizePx / 2}" y="${sizePx + 18}" text-anchor="middle" font-size="14" font-family="sans-serif" fill="#111111">${options.caption.replace(/[<>&]/g, "")}</text>`
+    ? `<text x="${sizePx / 2}" y="${sizePx + 18}" text-anchor="middle" font-size="14" font-family="sans-serif" fill="#111111">${escapeXmlText(options.caption)}</text>`
     : "";
 
   return [

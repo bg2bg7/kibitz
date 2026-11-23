@@ -7,6 +7,7 @@ import type {
   PgnaTimeline,
 } from "./types.js";
 import {
+  PgnaUtf8Error,
   isOsMetadataPath,
   unpackPgnaZip,
   utf8Decode,
@@ -63,6 +64,123 @@ export function isValidSubtitleLang(lang: string): boolean {
 export interface ValidationResult {
   valid: boolean;
   diagnostics: PgnaDiagnostic[];
+}
+
+export interface IndexedArchiveEntries {
+  byPath: Map<string, ArchiveEntry>;
+  diagnostics: PgnaDiagnostic[];
+}
+
+/**
+ * Builds a single validated `Map<string, ArchiveEntry>` index across all archive entries
+ * without pre-filtering metadata-like paths, so explicit manifest references can be resolved
+ * before ignoring extraneous OS metadata (FMT-03).
+ */
+export function indexArchiveEntries(entries: readonly ArchiveEntry[]): IndexedArchiveEntries {
+  const byPath = new Map<string, ArchiveEntry>();
+  const diagnostics: PgnaDiagnostic[] = [];
+
+  for (const entry of entries) {
+    if (!isSafeArchivePath(entry.path)) {
+      diagnostics.push({
+        code: "UNSAFE_ARCHIVE_PATH",
+        severity: "error",
+        path: entry.path,
+        message: `Archive path "${entry.path}" violates PGNA v1.0 §2.1 POSIX safety rules.`,
+      });
+      continue;
+    }
+    if (byPath.has(entry.path)) {
+      diagnostics.push({
+        code: "DUPLICATE_ARCHIVE_ENTRY",
+        severity: "error",
+        path: entry.path,
+        message: `Duplicate archive entry "${entry.path}".`,
+      });
+      continue;
+    }
+    byPath.set(entry.path, entry);
+  }
+
+  return { byPath, diagnostics };
+}
+
+function decodeStrictUtf8Entry(
+  entry: ArchiveEntry,
+  diagnostics: PgnaDiagnostic[],
+): string | null {
+  try {
+    return utf8Decode(entry.data);
+  } catch (err) {
+    diagnostics.push({
+      code: err instanceof PgnaUtf8Error ? err.code : "INVALID_UTF8",
+      severity: "error",
+      path: entry.path,
+      message: `Archive entry "${entry.path}" contains invalid UTF-8: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return null;
+  }
+}
+
+function isValidIntervalNumber(val: unknown): val is number {
+  return (
+    typeof val === "number" &&
+    Number.isFinite(val) &&
+    val >= 0 &&
+    val <= Number.MAX_SAFE_INTEGER
+  );
+}
+
+function validateArchivedTimelineIntervals(
+  rawTimeline: Record<string, unknown>,
+  timelinePath: string,
+  diagnostics: PgnaDiagnostic[],
+): boolean {
+  const checkEntryList = (list: unknown[], label: string): boolean => {
+    let prevEnd = 0;
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      if (!isPlainObject(item)) return false;
+      const startMs = item["startMs"];
+      const endMs = item["endMs"];
+      if (
+        !isValidIntervalNumber(startMs) ||
+        !isValidIntervalNumber(endMs) ||
+        endMs <= startMs ||
+        startMs < prevEnd
+      ) {
+        diagnostics.push({
+          code: "INVALID_TIMELINE_INTERVAL",
+          severity: "error",
+          path: timelinePath,
+          message: `Invalid ${label} interval [${String(startMs)}, ${String(endMs)}] at index ${i} in "${timelinePath}".`,
+        });
+        return false;
+      }
+      prevEnd = endMs;
+    }
+    return true;
+  };
+
+  let ok = true;
+  if (Array.isArray(rawTimeline["entries"])) {
+    if (!checkEntryList(rawTimeline["entries"], "timeline")) {
+      ok = false;
+    }
+  }
+  const rawGuesses = rawTimeline["guesses"];
+  if (isPlainObject(rawGuesses)) {
+    for (const [promptId, rawSpec] of Object.entries(rawGuesses)) {
+      if (!isPlainObject(rawSpec) || !Array.isArray(rawSpec["branches"])) continue;
+      for (const rawBranch of rawSpec["branches"]) {
+        if (!isPlainObject(rawBranch) || !Array.isArray(rawBranch["branchTimeline"])) continue;
+        if (!checkEntryList(rawBranch["branchTimeline"], `guess branch (${promptId})`)) {
+          ok = false;
+        }
+      }
+    }
+  }
+  return ok;
 }
 
 function stableJsonStringify(value: unknown): string {
@@ -404,33 +522,7 @@ export function validatePgnaArchive(
  * - Verifies compiler-generated merged subtitles (`MISSING_ARCHIVE_ENTRY` / `STALE_SUBTITLES`).
  */
 export function validatePgnaPackage(entries: readonly ArchiveEntry[]): ValidationResult {
-  const diagnostics: PgnaDiagnostic[] = [];
-
-  const byPath = new Map<string, ArchiveEntry>();
-  for (const entry of entries) {
-    if (!isSafeArchivePath(entry.path)) {
-      diagnostics.push({
-        code: "UNSAFE_ARCHIVE_PATH",
-        severity: "error",
-        path: entry.path,
-        message: `Archive path "${entry.path}" violates PGNA v1.0 §2.1 POSIX safety rules.`,
-      });
-      continue;
-    }
-    if (isOsMetadataPath(entry.path)) {
-      continue;
-    }
-    if (byPath.has(entry.path)) {
-      diagnostics.push({
-        code: "DUPLICATE_ARCHIVE_ENTRY",
-        severity: "error",
-        path: entry.path,
-        message: `Duplicate archive entry "${entry.path}".`,
-      });
-      continue;
-    }
-    byPath.set(entry.path, entry);
-  }
+  const { byPath, diagnostics } = indexArchiveEntries(entries);
 
   const manifestEntry = byPath.get("manifest.json");
   if (!manifestEntry) {
@@ -443,9 +535,14 @@ export function validatePgnaPackage(entries: readonly ArchiveEntry[]): Validatio
     return { valid: false, diagnostics };
   }
 
+  const manifestText = decodeStrictUtf8Entry(manifestEntry, diagnostics);
+  if (manifestText === null) {
+    return { valid: false, diagnostics };
+  }
+
   let rawManifest: unknown;
   try {
-    rawManifest = JSON.parse(utf8Decode(manifestEntry.data));
+    rawManifest = JSON.parse(manifestText);
   } catch (err) {
     diagnostics.push({
       code: "INVALID_MANIFEST_JSON",
@@ -503,7 +600,7 @@ export function validatePgnaPackage(entries: readonly ArchiveEntry[]): Validatio
     }
   }
 
-  // Enforce audio STORE (method 0) and existence
+  // Enforce audio STORE (method 0) and existence (resolved before filtering OS metadata)
   for (const audioPath of audioPaths) {
     const audioEntry = byPath.get(audioPath);
     if (!audioEntry) {
@@ -523,7 +620,7 @@ export function validatePgnaPackage(entries: readonly ArchiveEntry[]): Validatio
     }
   }
 
-  const subtitlesByPath: Record<string, string> = {};
+  const subtitlesByPath = Object.create(null) as Record<string, string>;
   for (const subPath of subtitlePaths) {
     const subEntry = byPath.get(subPath);
     if (!subEntry) {
@@ -534,7 +631,10 @@ export function validatePgnaPackage(entries: readonly ArchiveEntry[]): Validatio
         message: `Referenced subtitle track "${subPath}" is missing from the archive.`,
       });
     } else {
-      subtitlesByPath[subPath] = utf8Decode(subEntry.data);
+      const decodedSub = decodeStrictUtf8Entry(subEntry, diagnostics);
+      if (decodedSub !== null) {
+        subtitlesByPath[subPath] = decodedSub;
+      }
     }
   }
 
@@ -559,7 +659,17 @@ export function validatePgnaPackage(entries: readonly ArchiveEntry[]): Validatio
   }
 
   // Always run manifest/clip compilation validation even when PGN or timeline entries are missing
-  const pgnText = pgnEntry ? utf8Decode(pgnEntry.data) : "";
+  let pgnText = "";
+  let pgnDecodedOk = true;
+  if (pgnEntry) {
+    const decodedPgn = decodeStrictUtf8Entry(pgnEntry, diagnostics);
+    if (decodedPgn === null) {
+      pgnDecodedOk = false;
+    } else {
+      pgnText = decodedPgn;
+    }
+  }
+
   const recompiled = compilePgna({
     manifest: rawManifest as unknown as PgnaManifest,
     pgnText,
@@ -567,19 +677,30 @@ export function validatePgnaPackage(entries: readonly ArchiveEntry[]): Validatio
   });
   diagnostics.push(...recompiled.diagnostics);
 
+  const explicitPaths = new Set<string>([
+    "manifest.json",
+    ...(pgnPath !== null ? [pgnPath] : []),
+    ...(timelinePath !== null ? [timelinePath] : []),
+    ...audioPaths,
+    ...subtitlePaths,
+  ]);
+
   if (timelineEntry && timelinePath !== null) {
+    const timelineText = decodeStrictUtf8Entry(timelineEntry, diagnostics);
     let rawArchivedTimeline: unknown;
     let parsedTimelineOk = false;
-    try {
-      rawArchivedTimeline = JSON.parse(utf8Decode(timelineEntry.data));
-      parsedTimelineOk = true;
-    } catch (err) {
-      diagnostics.push({
-        code: "INVALID_TIMELINE_JSON",
-        severity: "error",
-        path: timelinePath,
-        message: `Failed to parse ${timelinePath}: ${err instanceof Error ? err.message : String(err)}`,
-      });
+    if (timelineText !== null) {
+      try {
+        rawArchivedTimeline = JSON.parse(timelineText);
+        parsedTimelineOk = true;
+      } catch (err) {
+        diagnostics.push({
+          code: "INVALID_TIMELINE_JSON",
+          severity: "error",
+          path: timelinePath,
+          message: `Failed to parse ${timelinePath}: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
     }
 
     if (parsedTimelineOk) {
@@ -590,23 +711,28 @@ export function validatePgnaPackage(entries: readonly ArchiveEntry[]): Validatio
           path: timelinePath,
           message: `${timelinePath} must contain a JSON object.`,
         });
-      } else if (
-        pgnEntry &&
-        !timelinesMatchIgnoringCompiledAt(rawArchivedTimeline, recompiled.timeline)
-      ) {
-        diagnostics.push({
-          code: "STALE_TIMELINE",
-          severity: "error",
-          path: timelinePath,
-          message: `Archived "${timelinePath}" does not match deterministic recompilation of "${pgnPath}" and "manifest.json".`,
-        });
+      } else {
+        validateArchivedTimelineIntervals(rawArchivedTimeline, timelinePath, diagnostics);
+        if (
+          pgnEntry &&
+          pgnDecodedOk &&
+          !timelinesMatchIgnoringCompiledAt(rawArchivedTimeline, recompiled.timeline)
+        ) {
+          diagnostics.push({
+            code: "STALE_TIMELINE",
+            severity: "error",
+            path: timelinePath,
+            message: `Archived "${timelinePath}" does not match deterministic recompilation of "${pgnPath}" and "manifest.json".`,
+          });
+        }
       }
     }
   }
 
   // Verify compiler-generated merged subtitle tracks when PGN was present
-  if (pgnEntry) {
+  if (pgnEntry && pgnDecodedOk) {
     for (const [mergedPath, expectedVtt] of Object.entries(recompiled.mergedSubtitlesVtt)) {
+      explicitPaths.add(mergedPath);
       const mergedEntry = byPath.get(mergedPath);
       if (!mergedEntry) {
         diagnostics.push({
@@ -615,14 +741,27 @@ export function validatePgnaPackage(entries: readonly ArchiveEntry[]): Validatio
           path: mergedPath,
           message: `Required merged subtitle track "${mergedPath}" is missing from the archive.`,
         });
-      } else if (utf8Decode(mergedEntry.data) !== expectedVtt) {
-        diagnostics.push({
-          code: "STALE_SUBTITLES",
-          severity: "error",
-          path: mergedPath,
-          message: `Archived merged subtitle track "${mergedPath}" does not match deterministic recompilation.`,
-        });
+      } else {
+        const decodedMerged = decodeStrictUtf8Entry(mergedEntry, diagnostics);
+        if (decodedMerged !== null && decodedMerged !== expectedVtt) {
+          diagnostics.push({
+            code: "STALE_SUBTITLES",
+            severity: "error",
+            path: mergedPath,
+            message: `Archived merged subtitle track "${mergedPath}" does not match deterministic recompilation.`,
+          });
+        }
       }
+    }
+  }
+
+  // Check any remaining unreferenced .vtt entries (ignoring extraneous OS metadata) for strict UTF-8
+  for (const [entryPath, entry] of byPath.entries()) {
+    if (explicitPaths.has(entryPath) || isOsMetadataPath(entryPath)) {
+      continue;
+    }
+    if (entryPath.endsWith(".vtt")) {
+      decodeStrictUtf8Entry(entry, diagnostics);
     }
   }
 

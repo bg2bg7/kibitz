@@ -138,6 +138,12 @@ export interface NodeIndexEntry {
   orientation: BoardOrientation;
   clipId: string | null;
   subtitles?: Record<string, string>;
+  /** Parsed PGN prose commentary on this node (available even when unscheduled). */
+  comment?: string;
+  /** Parsed static `[%cal]` board arrows on this node (available even when unscheduled). */
+  arrows?: ArrowAnnotation[];
+  /** Parsed static `[%csl]` square highlights on this node (available even when unscheduled). */
+  highlights?: SquareHighlight[];
   /** Primary (earliest) timeline entry index for this node, or null if unscheduled. */
   timelineIndex: number | null;
   /** All main-timeline entry indices for this node in ascending timeline order. */

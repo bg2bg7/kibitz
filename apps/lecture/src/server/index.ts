@@ -20,14 +20,44 @@ import {
 } from "./repository.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-for (const envPath of [
-  path.resolve(__dirname, "../../.env"),
-  path.resolve(__dirname, "../../../../.env"),
-]) {
-  if (existsSync(envPath) && typeof process.loadEnvFile === "function") {
-    process.loadEnvFile(envPath);
+
+function loadRuntimeEnv(startDir: string): void {
+  if (typeof process.loadEnvFile !== "function") {
+    return;
+  }
+
+  const explicitEnvFile = process.env["KIBITZ_ENV_FILE"]?.trim();
+  if (explicitEnvFile) {
+    const resolved = path.resolve(explicitEnvFile);
+    if (!existsSync(resolved)) {
+      throw new Error(`KIBITZ_ENV_FILE does not exist: ${resolved}`);
+    }
+    process.loadEnvFile(resolved);
+    return;
+  }
+
+  // Walk upward from this entrypoint (works identically from src/server/ and dist-server/,
+  // independent of process.cwd()) and stop at the monorepo workspace root.
+  // process.loadEnvFile preserves already-set process.env keys, so explicit runtime env vars
+  // and nearer app-level .env files always take precedence.
+  let currentDir = startDir;
+  for (let depth = 0; depth <= 5; depth += 1) {
+    const candidate = path.join(currentDir, ".env");
+    if (existsSync(candidate)) {
+      process.loadEnvFile(candidate);
+    }
+    if (existsSync(path.join(currentDir, "pnpm-workspace.yaml"))) {
+      break;
+    }
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) {
+      break;
+    }
+    currentDir = parentDir;
   }
 }
+
+loadRuntimeEnv(__dirname);
 
 function bootstrapObjectStore(): PgnaObjectStore {
   const s3Config = resolveS3ConfigFromEnv(process.env);

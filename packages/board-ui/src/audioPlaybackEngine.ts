@@ -63,6 +63,9 @@ export function createTimelineAudioEngine(
   let sourceEnded = false;
   let lastEndedOffsetSec = 0;
   let fallbackEl: HTMLAudioElement | null = null;
+  let fallbackEnded = false;
+  let fallbackEndedOffsetSec = 0;
+  let fallbackEndedListener: (() => void) | null = null;
 
   // Latest desired state (used if an async decode finishes mid-clip)
   let latestIsPlaying = false;
@@ -143,11 +146,39 @@ export function createTimelineAudioEngine(
     }
   }
 
+  const playFallbackEl = (el: HTMLAudioElement) => {
+    try {
+      const result = el.play();
+      if (result && typeof result.catch === "function") {
+        void result.catch(() => undefined);
+      }
+    } catch {
+      // ignore autoplay / playback errors
+    }
+  };
+
+  const recordFallbackEnded = (el: HTMLAudioElement) => {
+    fallbackEnded = true;
+    const duration = el.duration;
+    if (Number.isFinite(duration) && duration > 0) {
+      fallbackEndedOffsetSec =
+        el.currentTime > 0 ? Math.min(duration, el.currentTime) : duration;
+    } else if (el.currentTime > 0) {
+      fallbackEndedOffsetSec = el.currentTime;
+    } else if (latestAudioTimeMs !== null) {
+      fallbackEndedOffsetSec = latestAudioTimeMs / 1000;
+    } else {
+      fallbackEndedOffsetSec = 0;
+    }
+  };
+
   const stopActivePlayback = () => {
     activeToken++;
     currentClipKey = null;
     sourceEnded = false;
     lastEndedOffsetSec = 0;
+    fallbackEnded = false;
+    fallbackEndedOffsetSec = 0;
 
     if (currentSource) {
       try {
@@ -165,6 +196,14 @@ export function createTimelineAudioEngine(
     }
 
     if (fallbackEl) {
+      if (fallbackEndedListener) {
+        try {
+          fallbackEl.removeEventListener("ended", fallbackEndedListener);
+        } catch {
+          // ignore
+        }
+        fallbackEndedListener = null;
+      }
       try {
         fallbackEl.pause();
         fallbackEl.src = "";
@@ -180,15 +219,25 @@ export function createTimelineAudioEngine(
     offsetSec: number,
     token: number,
   ) => {
-    if (disposed || token !== activeToken) return;
+    if (disposed || token !== activeToken || !latestIsPlaying) return;
     const url = getBlobUrl(audio.path);
     if (!url || typeof Audio === "undefined") return;
 
     const el = new Audio(url);
     fallbackEl = el;
+    fallbackEnded = false;
+    fallbackEndedOffsetSec = 0;
+
+    const onEnded = () => {
+      if (fallbackEl === el) {
+        recordFallbackEnded(el);
+      }
+    };
+    fallbackEndedListener = onEnded;
+    el.addEventListener("ended", onEnded);
 
     const startPlayback = () => {
-      if (disposed || token !== activeToken || fallbackEl !== el) return;
+      if (disposed || token !== activeToken || fallbackEl !== el || !latestIsPlaying) return;
       if (offsetSec > 0.05) {
         try {
           el.currentTime = offsetSec;
@@ -196,7 +245,9 @@ export function createTimelineAudioEngine(
           // ignore unseekable streams
         }
       }
-      void el.play().catch(() => undefined);
+      fallbackEnded = false;
+      fallbackEndedOffsetSec = 0;
+      playFallbackEl(el);
     };
 
     if (offsetSec > 0.05 && el.readyState < 1) {
@@ -323,7 +374,29 @@ export function createTimelineAudioEngine(
           beginClipPlayback(activeAudio, desiredSec);
         }
       } else if (fallbackEl) {
-        if (
+        if (fallbackEnded || fallbackEl.ended) {
+          if (!fallbackEnded) {
+            recordFallbackEnded(fallbackEl);
+          }
+          if (
+            fallbackEl.readyState >= 1 &&
+            !fallbackEl.seeking &&
+            desiredSec < fallbackEndedOffsetSec - 0.1
+          ) {
+            let sought = false;
+            try {
+              fallbackEl.currentTime = desiredSec;
+              sought = true;
+            } catch {
+              // ignore unseekable streams
+            }
+            if (sought) {
+              fallbackEnded = false;
+              fallbackEndedOffsetSec = 0;
+              playFallbackEl(fallbackEl);
+            }
+          }
+        } else if (
           fallbackEl.readyState >= 1 &&
           !fallbackEl.seeking &&
           Math.abs(fallbackEl.currentTime - desiredSec) > DRIFT_RESYNC_SEC

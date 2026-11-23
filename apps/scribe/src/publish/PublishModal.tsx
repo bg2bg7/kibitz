@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { PgnaManifest } from "@suite/pgna";
 import {
+  AccessibleDialog,
   loginWithKibitzId,
   resolveApiUrl,
   resolveServiceUrl,
@@ -347,17 +348,13 @@ function PublishModalContent({
   const registerUrl = `${idWebUrl}/?mode=register&returnTo=${encodeURIComponent(currentHref)}`;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-900/45 p-4 backdrop-blur-xs"
-      onClick={onClose}
+    <AccessibleDialog
+      open={true}
+      onClose={onClose}
+      ariaLabelledBy="scribe-publish-dialog-title"
+      overlayClassName="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-900/45 p-4 backdrop-blur-xs"
+      panelClassName="my-auto w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-5 shadow-xl"
     >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="scribe-publish-dialog-title"
-        className="my-auto w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
         <div className="flex items-start justify-between border-b border-slate-100 pb-3">
           <div>
             <h2
@@ -803,7 +800,6 @@ function PublishModalContent({
             </button>
           ) : null}
         </div>
-      </div>
-    </div>
+    </AccessibleDialog>
   );
 }

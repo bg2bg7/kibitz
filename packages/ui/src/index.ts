@@ -1,3 +1,4 @@
+export * from "./AccessibleDialog.js";
 export * from "./EmojiReactionBar.js";
 export * from "./AppShell.js";
 export * from "./KibitzAuthMenu.js";
