@@ -55,6 +55,20 @@ pnpm install
 pnpm db:migrate # Applies any newer Drizzle migrations added after initial volume creation
 ```
 
+#### Migration Recovery & Cleanup Operations
+
+[`docker/postgres/init-db-and-admin.sh`](./docker/postgres/init-db-and-admin.sh) acquires the shared PostgreSQL advisory lock (`42190837`, matching `runSuiteMigrations`), wraps each migration's DDL and `drizzle.__drizzle_migrations` journal insert in a single `BEGIN`/`COMMIT` transaction, and skips already-recorded hashes. If a bootstrap run is interrupted or new migrations are added later, recover safely **without** deleting the `kibitz_pgdata` volume:
+
+- **Apply pending migrations from the host** (preferred after initial bootstrap):
+  ```bash
+  pnpm db:migrate
+  ```
+- **Re-run the bootstrap script safely inside the running Postgres container** (resumes any unapplied migrations and skips already-applied hashes and existing admin handles):
+  ```bash
+  docker compose exec postgres /docker-entrypoint-initdb.d/01-init-db-and-admin.sh
+  ```
+- Only drop volumes (`docker compose down -v`) for disposable local development resets, never for production recovery.
+
 ### 3. Run the Suite Locally
 
 ```bash

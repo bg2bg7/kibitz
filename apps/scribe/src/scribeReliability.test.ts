@@ -44,6 +44,14 @@ import {
   type MicRecordingStateAdapter,
   type MicRecordingTarget,
 } from "./local/workspaceTransitions";
+import {
+  MAX_PUBLISH_DESCRIPTION_LENGTH,
+  MAX_PUBLISH_TAGS,
+  MAX_PUBLISH_TITLE_LENGTH,
+  createPublishSessionController,
+  mergePendingTagInput,
+  validatePublishMetadata,
+} from "./publish/kibitzPublisher";
 
 type GlobalRecord = Record<string, unknown>;
 
@@ -971,5 +979,158 @@ describe("FMT-02 · export gate rejects missing media and round-trips valid narr
     expect(reopened.subtitlesByPath["subtitles/en/clip-001.vtt"]).toBe(vttText);
     // Generated merged timeline.vtt must be stripped on reopen so re-export never collides
     expect(reopened.subtitlesByPath["subtitles/en/timeline.vtt"]).toBeUndefined();
+  });
+});
+
+// ============================================================================
+// SCR-05 · Persistent publish state outside dismissible dialog, idempotency,
+//          non-truncating batched tags, and strict title/description bounds
+// ============================================================================
+
+describe("SCR-05 · persistent publish state, single in-flight guard, and strict metadata bounds", () => {
+  const coachSession = {
+    sub: "00000000-0000-4000-8000-000000000001",
+    handle: "coach-alice",
+    role: "coach" as const,
+    programIds: [] as string[],
+    iat: 1_700_000_000,
+    exp: 1_900_000_000,
+  };
+
+  it("produces one study and one retrievable result when closing and reopening while publishing", async () => {
+    const draft = createDemoItalianDraft();
+    const zipBytes = await buildValidatedPgnaArchive(draft);
+    const responseGate = createDeferred<Response>();
+
+    let fetchCalls = 0;
+    const mockFetch: typeof fetch = async () => {
+      fetchCalls++;
+      return responseGate.promise;
+    };
+
+    const controller = createPublishSessionController({
+      createKey: () => "scr05-idem-key-1",
+    });
+
+    const p1 = controller.startPublish({
+      draftId: draft.id,
+      kibitzApiBaseUrl: "http://localhost:4002",
+      session: coachSession,
+      tags: ["openings"],
+      title: draft.manifest.title,
+      description: draft.manifest.description,
+      manifest: draft.manifest,
+      buildArchive: async () => zipBytes,
+      fetchImpl: mockFetch,
+    });
+
+    // Simulate closing and reopening the dialog while still in flight
+    controller.syncActiveDraft(draft.id);
+    expect(controller.getState().status).toBe("publishing");
+
+    // Re-attempting submit after reopen returns the existing in-flight promise (no 2nd fetch)
+    const p2 = controller.startPublish({
+      draftId: draft.id,
+      kibitzApiBaseUrl: "http://localhost:4002",
+      session: coachSession,
+      tags: ["openings"],
+      title: draft.manifest.title,
+      description: draft.manifest.description,
+      manifest: draft.manifest,
+      buildArchive: async () => zipBytes,
+      fetchImpl: mockFetch,
+    });
+    expect(p2).toBe(p1);
+
+    // Resolve while dialog is closed; result remains retrievable upon reopen
+    responseGate.resolve(
+      new Response(
+        JSON.stringify({
+          studyId: "study-scr05-1",
+          study: { id: "study-scr05-1", ownerHandle: "coach-alice", tags: ["openings"] },
+        }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const result = await p1;
+    expect(fetchCalls).toBe(1);
+    expect(result.published).toBe(true);
+    expect(result.studyId).toBe("study-scr05-1");
+    expect(controller.getState().status).toBe("succeeded");
+    expect(controller.getState().result).toEqual(result);
+  });
+
+  it("round-trips boundary-length metadata unchanged and rejects overflow before archive build or fetch", async () => {
+    const draft = createDemoItalianDraft();
+    const exactTitle = "A".repeat(MAX_PUBLISH_TITLE_LENGTH);
+    const exactDescription = "B".repeat(MAX_PUBLISH_DESCRIPTION_LENGTH);
+    const exactTags = Array.from({ length: MAX_PUBLISH_TAGS }, (_, i) => `t${i + 1}`);
+
+    expect(
+      validatePublishMetadata({
+        title: exactTitle,
+        description: exactDescription,
+        tags: exactTags,
+      }),
+    ).toEqual({
+      ok: true,
+      title: exactTitle,
+      description: exactDescription,
+      tags: exactTags,
+    });
+
+    // Batched comma-separated paste crossing 12 tags surfaces overflow instead of truncating
+    const batched = mergePendingTagInput(exactTags.slice(0, 10), "t11, t12, t13");
+    expect(batched.overflow).toEqual(["t13"]);
+
+    const buildSpy = vi.fn(async () => buildValidatedPgnaArchive(draft));
+    const fetchSpy = vi.fn<typeof fetch>();
+    const controller = createPublishSessionController();
+
+    const overTitleRes = await controller.startPublish({
+      draftId: draft.id,
+      kibitzApiBaseUrl: "http://localhost:4002",
+      session: coachSession,
+      title: "A".repeat(MAX_PUBLISH_TITLE_LENGTH + 1),
+      description: exactDescription,
+      tags: exactTags,
+      manifest: draft.manifest,
+      buildArchive: buildSpy,
+      fetchImpl: fetchSpy,
+    });
+    expect(overTitleRes.published).toBe(false);
+    expect(overTitleRes.message).toContain(`${MAX_PUBLISH_TITLE_LENGTH}`);
+
+    const overDescRes = await controller.startPublish({
+      draftId: draft.id,
+      kibitzApiBaseUrl: "http://localhost:4002",
+      session: coachSession,
+      title: exactTitle,
+      description: "B".repeat(MAX_PUBLISH_DESCRIPTION_LENGTH + 1),
+      tags: exactTags,
+      manifest: draft.manifest,
+      buildArchive: buildSpy,
+      fetchImpl: fetchSpy,
+    });
+    expect(overDescRes.published).toBe(false);
+    expect(overDescRes.message).toContain(`${MAX_PUBLISH_DESCRIPTION_LENGTH}`);
+
+    const overTagsRes = await controller.startPublish({
+      draftId: draft.id,
+      kibitzApiBaseUrl: "http://localhost:4002",
+      session: coachSession,
+      title: exactTitle,
+      description: exactDescription,
+      tags: [...exactTags, "t13"],
+      manifest: draft.manifest,
+      buildArchive: buildSpy,
+      fetchImpl: fetchSpy,
+    });
+    expect(overTagsRes.published).toBe(false);
+    expect(overTagsRes.message).toContain(`${MAX_PUBLISH_TAGS}`);
+
+    expect(buildSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

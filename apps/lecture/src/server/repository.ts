@@ -6,14 +6,17 @@ import {
   type UserRole,
 } from "@suite/auth-core";
 import {
+  and,
   coachStudentLinks,
   desc,
   eq,
+  isNull,
   or,
   programMemberships,
   programs,
   sql,
   studies,
+  studyObjectDeletions,
   users,
   type SuiteDatabase,
 } from "@suite/db";
@@ -29,6 +32,7 @@ import type { PgnaObjectStore } from "./objectStore.js";
 
 export type StudyVisibility = "public_moderated" | "coach_students" | "program" | "private";
 export type ModerationStatus = "pending" | "approved" | "rejected";
+export type ObjectDeletionStatus = "pending" | "completed" | "failed";
 
 export interface StudyRecord {
   id: string;
@@ -44,6 +48,32 @@ export interface StudyRecord {
   moderationStatus: ModerationStatus;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface StudyObjectDeletionRecord {
+  id: string;
+  studyId: string;
+  pgnaObjectKey: string;
+  status: ObjectDeletionStatus;
+  attemptCount: number;
+  lastError: string | null;
+  nextAttemptAt: string;
+  completedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ObjectDeletionMetrics {
+  pendingCount: number;
+  failedCount: number;
+  completedCount: number;
+  totalFailureAttempts: number;
+}
+
+export interface TombstoneStudyResult {
+  study: StudyRecord;
+  deletionJob: StudyObjectDeletionRecord;
+  alreadyDeleted: boolean;
 }
 
 export interface AccountProfile {
@@ -70,6 +100,7 @@ export interface CreateStudyInput {
   pgnaObjectKey: string;
   visibility: StudyVisibility;
   moderationStatus: ModerationStatus;
+  idempotencyKey?: string | null;
 }
 
 export interface UpdateStudyInput {
@@ -89,13 +120,27 @@ export interface ViewerAccessContext {
 export interface StudyRepository {
   readonly storageKind: "postgres" | "memory";
   createStudy(input: CreateStudyInput): Promise<StudyRecord>;
+  findStudyByIdempotencyKey(ownerUserId: string, idempotencyKey: string): Promise<StudyRecord | null>;
   getStudyById(studyId: string): Promise<StudyRecord | null>;
+  getStudyByIdIncludingDeleted(
+    studyId: string,
+  ): Promise<(StudyRecord & { deletedAt: string | null }) | null>;
   listAllStudies(): Promise<StudyRecord[]>;
   listStudiesByOwnerId(ownerUserId: string): Promise<StudyRecord[]>;
   findAccountById(userId: string): Promise<AccountProfile | null>;
   findAccountByHandle(handle: string): Promise<AccountProfile | null>;
   updateStudy(studyId: string, patch: UpdateStudyInput): Promise<StudyRecord | null>;
   deleteStudy(studyId: string): Promise<StudyRecord | null>;
+  tombstoneStudyForDeletion(studyId: string, now?: Date): Promise<TombstoneStudyResult | null>;
+  listDueObjectDeletions(now: Date, limit?: number): Promise<StudyObjectDeletionRecord[]>;
+  markObjectDeletionSucceeded(deletionId: string, now?: Date): Promise<void>;
+  markObjectDeletionFailed(
+    deletionId: string,
+    errorMessage: string,
+    nextAttemptAt: Date,
+    now?: Date,
+  ): Promise<void>;
+  getObjectDeletionMetrics(): Promise<ObjectDeletionMetrics>;
   getViewerAccessContext(userId: string): Promise<ViewerAccessContext>;
   programExists(programId: string): Promise<boolean>;
   listAllPrograms(): Promise<ProgramSummary[]>;
@@ -109,6 +154,23 @@ function toIso(date: Date | string): string {
 function parseTagsArray(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter((item): item is string => typeof item === "string");
+}
+
+function mapObjectDeletionRow(
+  row: typeof studyObjectDeletions.$inferSelect,
+): StudyObjectDeletionRecord {
+  return {
+    id: row.id,
+    studyId: row.studyId,
+    pgnaObjectKey: row.pgnaObjectKey,
+    status: row.status,
+    attemptCount: row.attemptCount,
+    lastError: row.lastError ?? null,
+    nextAttemptAt: toIso(row.nextAttemptAt),
+    completedAt: row.completedAt ? toIso(row.completedAt) : null,
+    createdAt: toIso(row.createdAt),
+    updatedAt: toIso(row.updatedAt),
+  };
 }
 
 /**
@@ -134,6 +196,7 @@ export class PostgresStudyRepository implements StudyRepository {
         pgnaObjectKey: input.pgnaObjectKey,
         visibility: input.visibility,
         moderationStatus: input.moderationStatus,
+        idempotencyKey: input.idempotencyKey ?? null,
         createdAt: now,
         updatedAt: now,
       })
@@ -160,7 +223,82 @@ export class PostgresStudyRepository implements StudyRepository {
     };
   }
 
+  async findStudyByIdempotencyKey(
+    ownerUserId: string,
+    idempotencyKey: string,
+  ): Promise<StudyRecord | null> {
+    const rows = await this.db
+      .select({
+        study: studies,
+        ownerHandle: users.handle,
+        ownerRole: users.role,
+      })
+      .from(studies)
+      .innerJoin(users, eq(studies.ownerUserId, users.id))
+      .where(
+        and(
+          eq(studies.ownerUserId, ownerUserId),
+          eq(studies.idempotencyKey, idempotencyKey),
+          isNull(studies.deletedAt),
+        ),
+      )
+      .limit(1);
+
+    const row = rows[0];
+    if (!row) return null;
+
+    return {
+      id: row.study.id,
+      ownerUserId: row.study.ownerUserId,
+      ownerHandle: row.ownerHandle,
+      ownerRole: row.ownerRole,
+      programId: row.study.programId,
+      title: row.study.title,
+      description: row.study.description,
+      tags: parseTagsArray(row.study.tags),
+      pgnaObjectKey: row.study.pgnaObjectKey,
+      visibility: row.study.visibility,
+      moderationStatus: row.study.moderationStatus,
+      createdAt: toIso(row.study.createdAt),
+      updatedAt: toIso(row.study.updatedAt),
+    };
+  }
+
   async getStudyById(studyId: string): Promise<StudyRecord | null> {
+    const rows = await this.db
+      .select({
+        study: studies,
+        ownerHandle: users.handle,
+        ownerRole: users.role,
+      })
+      .from(studies)
+      .innerJoin(users, eq(studies.ownerUserId, users.id))
+      .where(and(eq(studies.id, studyId), isNull(studies.deletedAt)))
+      .limit(1);
+
+    const row = rows[0];
+    if (!row) return null;
+
+    return {
+      id: row.study.id,
+      ownerUserId: row.study.ownerUserId,
+      ownerHandle: row.ownerHandle,
+      ownerRole: row.ownerRole,
+      programId: row.study.programId,
+      title: row.study.title,
+      description: row.study.description,
+      tags: parseTagsArray(row.study.tags),
+      pgnaObjectKey: row.study.pgnaObjectKey,
+      visibility: row.study.visibility,
+      moderationStatus: row.study.moderationStatus,
+      createdAt: toIso(row.study.createdAt),
+      updatedAt: toIso(row.study.updatedAt),
+    };
+  }
+
+  async getStudyByIdIncludingDeleted(
+    studyId: string,
+  ): Promise<(StudyRecord & { deletedAt: string | null }) | null> {
     const rows = await this.db
       .select({
         study: studies,
@@ -189,6 +327,7 @@ export class PostgresStudyRepository implements StudyRepository {
       moderationStatus: row.study.moderationStatus,
       createdAt: toIso(row.study.createdAt),
       updatedAt: toIso(row.study.updatedAt),
+      deletedAt: row.study.deletedAt ? toIso(row.study.deletedAt) : null,
     };
   }
 
@@ -201,6 +340,7 @@ export class PostgresStudyRepository implements StudyRepository {
       })
       .from(studies)
       .innerJoin(users, eq(studies.ownerUserId, users.id))
+      .where(isNull(studies.deletedAt))
       .orderBy(desc(studies.updatedAt));
 
     return rows.map((row) => ({
@@ -229,7 +369,7 @@ export class PostgresStudyRepository implements StudyRepository {
       })
       .from(studies)
       .innerJoin(users, eq(studies.ownerUserId, users.id))
-      .where(eq(studies.ownerUserId, ownerUserId))
+      .where(and(eq(studies.ownerUserId, ownerUserId), isNull(studies.deletedAt)))
       .orderBy(desc(studies.updatedAt));
 
     return rows.map((row) => ({
@@ -310,7 +450,7 @@ export class PostgresStudyRepository implements StudyRepository {
           : {}),
         updatedAt: now,
       })
-      .where(eq(studies.id, studyId))
+      .where(and(eq(studies.id, studyId), isNull(studies.deletedAt)))
       .returning();
 
     if (!updated) return null;
@@ -332,6 +472,194 @@ export class PostgresStudyRepository implements StudyRepository {
     if (!existing) return null;
     await this.db.delete(studies).where(eq(studies.id, studyId));
     return existing;
+  }
+
+  async tombstoneStudyForDeletion(
+    studyId: string,
+    now: Date = new Date(),
+  ): Promise<TombstoneStudyResult | null> {
+    return this.db.transaction(async (tx) => {
+      const rows = await tx
+        .select({
+          study: studies,
+          ownerHandle: users.handle,
+          ownerRole: users.role,
+        })
+        .from(studies)
+        .innerJoin(users, eq(studies.ownerUserId, users.id))
+        .where(eq(studies.id, studyId))
+        .limit(1);
+
+      const row = rows[0];
+      if (!row) return null;
+
+      let alreadyDeleted = row.study.deletedAt !== null;
+      let effectiveUpdatedAt = row.study.updatedAt;
+      if (!alreadyDeleted) {
+        const [tombstonedRow] = await tx
+          .update(studies)
+          .set({ deletedAt: now, updatedAt: now })
+          .where(and(eq(studies.id, studyId), isNull(studies.deletedAt)))
+          .returning();
+        if (tombstonedRow) {
+          effectiveUpdatedAt = tombstonedRow.updatedAt;
+        } else {
+          alreadyDeleted = true;
+        }
+      }
+
+      const [existingJob] = await tx
+        .select()
+        .from(studyObjectDeletions)
+        .where(eq(studyObjectDeletions.pgnaObjectKey, row.study.pgnaObjectKey))
+        .limit(1);
+
+      let jobRow = existingJob;
+      if (!jobRow) {
+        const [insertedJob] = await tx
+          .insert(studyObjectDeletions)
+          .values({
+            id: randomUUID(),
+            studyId: row.study.id,
+            pgnaObjectKey: row.study.pgnaObjectKey,
+            status: "pending",
+            attemptCount: 0,
+            lastError: null,
+            nextAttemptAt: now,
+            completedAt: null,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .onConflictDoNothing({ target: studyObjectDeletions.pgnaObjectKey })
+          .returning();
+
+        if (insertedJob) {
+          jobRow = insertedJob;
+        } else {
+          const [racedJob] = await tx
+            .select()
+            .from(studyObjectDeletions)
+            .where(eq(studyObjectDeletions.pgnaObjectKey, row.study.pgnaObjectKey))
+            .limit(1);
+          jobRow = racedJob;
+        }
+      }
+
+      if (!jobRow) {
+        throw new Error("Failed to enqueue durable study object deletion record.");
+      }
+
+      return {
+        study: {
+          id: row.study.id,
+          ownerUserId: row.study.ownerUserId,
+          ownerHandle: row.ownerHandle,
+          ownerRole: row.ownerRole,
+          programId: row.study.programId,
+          title: row.study.title,
+          description: row.study.description,
+          tags: parseTagsArray(row.study.tags),
+          pgnaObjectKey: row.study.pgnaObjectKey,
+          visibility: row.study.visibility,
+          moderationStatus: row.study.moderationStatus,
+          createdAt: toIso(row.study.createdAt),
+          updatedAt: toIso(effectiveUpdatedAt),
+        },
+        deletionJob: mapObjectDeletionRow(jobRow),
+        alreadyDeleted,
+      };
+    });
+  }
+
+  async listDueObjectDeletions(now: Date, limit = 100): Promise<StudyObjectDeletionRecord[]> {
+    const safeLimit = Math.max(1, Math.min(limit, 500));
+    const whereClause =
+      now.getUTCFullYear() > 9999
+        ? sql`${studyObjectDeletions.status} <> 'completed'`
+        : and(
+            sql`${studyObjectDeletions.status} <> 'completed'`,
+            sql`${studyObjectDeletions.nextAttemptAt} <= ${now}`,
+          );
+
+    const rows = await this.db
+      .select()
+      .from(studyObjectDeletions)
+      .where(whereClause)
+      .orderBy(sql`${studyObjectDeletions.nextAttemptAt} asc`)
+      .limit(safeLimit);
+
+    return rows.map(mapObjectDeletionRow);
+  }
+
+  async markObjectDeletionSucceeded(deletionId: string, now: Date = new Date()): Promise<void> {
+    await this.db.transaction(async (tx) => {
+      const [updatedJob] = await tx
+        .update(studyObjectDeletions)
+        .set({
+          status: "completed",
+          completedAt: now,
+          lastError: null,
+          updatedAt: now,
+        })
+        .where(eq(studyObjectDeletions.id, deletionId))
+        .returning();
+
+      if (!updatedJob) {
+        return;
+      }
+
+      await tx
+        .delete(studies)
+        .where(and(eq(studies.id, updatedJob.studyId), sql`${studies.deletedAt} is not null`));
+    });
+  }
+
+  async markObjectDeletionFailed(
+    deletionId: string,
+    errorMessage: string,
+    nextAttemptAt: Date,
+    now: Date = new Date(),
+  ): Promise<void> {
+    await this.db
+      .update(studyObjectDeletions)
+      .set({
+        status: "failed",
+        attemptCount: sql`${studyObjectDeletions.attemptCount} + 1`,
+        lastError: errorMessage.slice(0, 1000),
+        nextAttemptAt,
+        updatedAt: now,
+      })
+      .where(eq(studyObjectDeletions.id, deletionId));
+  }
+
+  async getObjectDeletionMetrics(): Promise<ObjectDeletionMetrics> {
+    const rows = await this.db
+      .select({
+        status: studyObjectDeletions.status,
+        rowCount: sql<number>`count(*)::int`,
+        failureAttempts: sql<number>`coalesce(sum(${studyObjectDeletions.attemptCount}), 0)::int`,
+      })
+      .from(studyObjectDeletions)
+      .groupBy(studyObjectDeletions.status);
+
+    let pendingCount = 0;
+    let failedCount = 0;
+    let completedCount = 0;
+    let totalFailureAttempts = 0;
+
+    for (const row of rows) {
+      const count = Number(row.rowCount) || 0;
+      totalFailureAttempts += Number(row.failureAttempts) || 0;
+      if (row.status === "pending") {
+        pendingCount += count;
+      } else if (row.status === "failed") {
+        failedCount += count;
+      } else if (row.status === "completed") {
+        completedCount += count;
+      }
+    }
+
+    return { pendingCount, failedCount, completedCount, totalFailureAttempts };
   }
 
   async getViewerAccessContext(userId: string): Promise<ViewerAccessContext> {
@@ -395,6 +723,29 @@ export class PostgresStudyRepository implements StudyRepository {
   }
 }
 
+interface StoredStudyRecord extends StudyRecord {
+  deletedAt: string | null;
+  idempotencyKey: string | null;
+}
+
+function toPublicStudyRecord(record: StoredStudyRecord): StudyRecord {
+  return {
+    id: record.id,
+    ownerUserId: record.ownerUserId,
+    ownerHandle: record.ownerHandle,
+    ownerRole: record.ownerRole,
+    programId: record.programId,
+    title: record.title,
+    description: record.description,
+    tags: [...record.tags],
+    pgnaObjectKey: record.pgnaObjectKey,
+    visibility: record.visibility,
+    moderationStatus: record.moderationStatus,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
+}
+
 /**
  * Deterministic in-memory repository for unit tests and zero-DB local development.
  */
@@ -403,7 +754,9 @@ export class InMemoryStudyRepository implements StudyRepository {
 
   private readonly accountsById = new Map<string, AccountProfile>();
   private readonly accountsByLowerHandle = new Map<string, string>();
-  private readonly studiesById = new Map<string, StudyRecord>();
+  private readonly studiesById = new Map<string, StoredStudyRecord>();
+  private readonly deletionJobsById = new Map<string, StudyObjectDeletionRecord>();
+  private readonly deletionJobIdByKey = new Map<string, string>();
   private readonly programsById = new Map<string, ProgramSummary>();
   private readonly coachLinks: CoachStudentLinkRecord[] = [];
   private readonly memberships: ProgramMembershipRecord[] = [];
@@ -470,8 +823,24 @@ export class InMemoryStudyRepository implements StudyRepository {
       role: input.ownerRole,
     });
 
+    const idempotencyKey = input.idempotencyKey ?? null;
+    if (idempotencyKey !== null) {
+      for (const existing of this.studiesById.values()) {
+        if (
+          existing.ownerUserId === input.ownerUserId &&
+          existing.idempotencyKey === idempotencyKey
+        ) {
+          const conflictError = new Error(
+            "duplicate key value violates unique constraint \"studies_owner_idempotency_key_idx\"",
+          ) as Error & { cause?: { code: string } };
+          conflictError.cause = { code: "23505" };
+          throw conflictError;
+        }
+      }
+    }
+
     const now = new Date().toISOString();
-    const record: StudyRecord = {
+    const record: StoredStudyRecord = {
       id: input.id ?? randomUUID(),
       ownerUserId: input.ownerUserId,
       ownerHandle: input.ownerHandle,
@@ -483,29 +852,57 @@ export class InMemoryStudyRepository implements StudyRepository {
       pgnaObjectKey: input.pgnaObjectKey,
       visibility: input.visibility,
       moderationStatus: input.moderationStatus,
+      deletedAt: null,
+      idempotencyKey,
       createdAt: now,
       updatedAt: now,
     };
     this.studiesById.set(record.id, record);
-    return { ...record, tags: [...record.tags] };
+    return toPublicStudyRecord(record);
+  }
+
+  async findStudyByIdempotencyKey(
+    ownerUserId: string,
+    idempotencyKey: string,
+  ): Promise<StudyRecord | null> {
+    for (const study of this.studiesById.values()) {
+      if (
+        study.ownerUserId === ownerUserId &&
+        study.idempotencyKey === idempotencyKey &&
+        study.deletedAt === null
+      ) {
+        return toPublicStudyRecord(study);
+      }
+    }
+    return null;
   }
 
   async getStudyById(studyId: string): Promise<StudyRecord | null> {
     const found = this.studiesById.get(studyId);
-    return found ? { ...found, tags: [...found.tags] } : null;
+    if (!found || found.deletedAt !== null) return null;
+    return toPublicStudyRecord(found);
+  }
+
+  async getStudyByIdIncludingDeleted(
+    studyId: string,
+  ): Promise<(StudyRecord & { deletedAt: string | null }) | null> {
+    const found = this.studiesById.get(studyId);
+    if (!found) return null;
+    return { ...toPublicStudyRecord(found), deletedAt: found.deletedAt };
   }
 
   async listAllStudies(): Promise<StudyRecord[]> {
     return [...this.studiesById.values()]
+      .filter((s) => s.deletedAt === null)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .map((s) => ({ ...s, tags: [...s.tags] }));
+      .map(toPublicStudyRecord);
   }
 
   async listStudiesByOwnerId(ownerUserId: string): Promise<StudyRecord[]> {
     return [...this.studiesById.values()]
-      .filter((s) => s.ownerUserId === ownerUserId)
+      .filter((s) => s.ownerUserId === ownerUserId && s.deletedAt === null)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .map((s) => ({ ...s, tags: [...s.tags] }));
+      .map(toPublicStudyRecord);
   }
 
   async findAccountById(userId: string): Promise<AccountProfile | null> {
@@ -520,8 +917,8 @@ export class InMemoryStudyRepository implements StudyRepository {
 
   async updateStudy(studyId: string, patch: UpdateStudyInput): Promise<StudyRecord | null> {
     const existing = this.studiesById.get(studyId);
-    if (!existing) return null;
-    const updated: StudyRecord = {
+    if (!existing || existing.deletedAt !== null) return null;
+    const updated: StoredStudyRecord = {
       ...existing,
       ...(patch.title !== undefined ? { title: patch.title } : {}),
       ...(patch.description !== undefined ? { description: patch.description } : {}),
@@ -532,14 +929,125 @@ export class InMemoryStudyRepository implements StudyRepository {
       updatedAt: new Date().toISOString(),
     };
     this.studiesById.set(studyId, updated);
-    return { ...updated, tags: [...updated.tags] };
+    return toPublicStudyRecord(updated);
   }
 
   async deleteStudy(studyId: string): Promise<StudyRecord | null> {
     const existing = this.studiesById.get(studyId);
-    if (!existing) return null;
+    if (!existing || existing.deletedAt !== null) return null;
     this.studiesById.delete(studyId);
-    return { ...existing, tags: [...existing.tags] };
+    return toPublicStudyRecord(existing);
+  }
+
+  async tombstoneStudyForDeletion(
+    studyId: string,
+    now: Date = new Date(),
+  ): Promise<TombstoneStudyResult | null> {
+    const existing = this.studiesById.get(studyId);
+    if (!existing) return null;
+
+    const alreadyDeleted = existing.deletedAt !== null;
+    const nowIso = now.toISOString();
+    const updated: StoredStudyRecord = alreadyDeleted
+      ? existing
+      : {
+          ...existing,
+          deletedAt: nowIso,
+          updatedAt: nowIso,
+        };
+    if (!alreadyDeleted) {
+      this.studiesById.set(studyId, updated);
+    }
+
+    const existingJobId = this.deletionJobIdByKey.get(updated.pgnaObjectKey);
+    let job = existingJobId ? this.deletionJobsById.get(existingJobId) : undefined;
+    if (!job) {
+      job = {
+        id: randomUUID(),
+        studyId: updated.id,
+        pgnaObjectKey: updated.pgnaObjectKey,
+        status: "pending",
+        attemptCount: 0,
+        lastError: null,
+        nextAttemptAt: nowIso,
+        completedAt: null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      this.deletionJobsById.set(job.id, job);
+      this.deletionJobIdByKey.set(job.pgnaObjectKey, job.id);
+    }
+
+    return {
+      study: toPublicStudyRecord(updated),
+      deletionJob: { ...job },
+      alreadyDeleted,
+    };
+  }
+
+  async listDueObjectDeletions(now: Date, limit = 100): Promise<StudyObjectDeletionRecord[]> {
+    const nowMs = now.getTime();
+    const safeLimit = Math.max(1, Math.min(limit, 500));
+    return [...this.deletionJobsById.values()]
+      .filter((job) => job.status !== "completed" && Date.parse(job.nextAttemptAt) <= nowMs)
+      .sort((a, b) => Date.parse(a.nextAttemptAt) - Date.parse(b.nextAttemptAt))
+      .slice(0, safeLimit)
+      .map((job) => ({ ...job }));
+  }
+
+  async markObjectDeletionSucceeded(deletionId: string, now: Date = new Date()): Promise<void> {
+    const job = this.deletionJobsById.get(deletionId);
+    if (!job) return;
+    const nowIso = now.toISOString();
+    this.deletionJobsById.set(deletionId, {
+      ...job,
+      status: "completed",
+      completedAt: nowIso,
+      lastError: null,
+      updatedAt: nowIso,
+    });
+    const study = this.studiesById.get(job.studyId);
+    if (study && study.deletedAt !== null) {
+      this.studiesById.delete(job.studyId);
+    }
+  }
+
+  async markObjectDeletionFailed(
+    deletionId: string,
+    errorMessage: string,
+    nextAttemptAt: Date,
+    now: Date = new Date(),
+  ): Promise<void> {
+    const job = this.deletionJobsById.get(deletionId);
+    if (!job) return;
+    this.deletionJobsById.set(deletionId, {
+      ...job,
+      status: "failed",
+      attemptCount: job.attemptCount + 1,
+      lastError: errorMessage.slice(0, 1000),
+      nextAttemptAt: nextAttemptAt.toISOString(),
+      updatedAt: now.toISOString(),
+    });
+  }
+
+  async getObjectDeletionMetrics(): Promise<ObjectDeletionMetrics> {
+    let pendingCount = 0;
+    let failedCount = 0;
+    let completedCount = 0;
+    let totalFailureAttempts = 0;
+
+    for (const job of this.deletionJobsById.values()) {
+      totalFailureAttempts += job.attemptCount;
+      if (job.status === "pending") {
+        pendingCount++;
+      } else if (job.status === "failed") {
+        failedCount++;
+      } else if (job.status === "completed") {
+        completedCount++;
+      }
+    }
+
+    return { pendingCount, failedCount, completedCount, totalFailureAttempts };
   }
 
   async getViewerAccessContext(userId: string): Promise<ViewerAccessContext> {

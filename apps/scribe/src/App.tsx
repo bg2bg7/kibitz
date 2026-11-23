@@ -66,7 +66,14 @@ import {
   type AudioClipAttachmentTemplate,
   type WorkspaceController,
 } from "./local/workspaceTransitions";
-import { PublishModal } from "./publish/PublishModal";
+import { PublishModal, type PublishSubmitInput } from "./publish/PublishModal";
+import {
+  INITIAL_PUBLISH_JOB_STATE,
+  createPublishSessionController,
+  type PublishJobState,
+  type PublishSessionController,
+  type PublishToKibitzResult,
+} from "./publish/kibitzPublisher";
 
 const MAX_PGNA_IMPORT_BYTES = 50 * 1024 * 1024; // 50 MB
 const MAX_PGN_IMPORT_BYTES = 5 * 1024 * 1024; // 5 MB
@@ -150,6 +157,7 @@ export function App() {
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [showDraftsModal, setShowDraftsModal] = useState(false);
   const [showPublishModal, setShowPublishModal] = useState(false);
+  const [publishState, setPublishState] = useState<PublishJobState>(INITIAL_PUBLISH_JOB_STATE);
   const [sessionUser, setSessionUser] = useState<KibitzSessionUser | null>(null);
   const [draftList, setDraftList] = useState<DraftSummary[]>([]);
   const [saveStatus, setSaveStatus] = useState(() => formatSaveStatus("idle-demo"));
@@ -159,11 +167,25 @@ export function App() {
   } | null>(null);
   const [waveformPeaksByClipId, setWaveformPeaksByClipId] = useState<Record<string, number[]>>({});
 
-  // Always-fresh draft reference + unified workspace persistence/transition controller
+  // Always-fresh draft/session references + unified workspace & publish controllers
   const draftRef = useRef<ScribeDraft>(draft);
+  const sessionUserRef = useRef<KibitzSessionUser | null>(sessionUser);
   const waveformDecodeTokenRef = useRef(0);
   const refreshDraftListRef = useRef<() => Promise<void>>(async () => undefined);
   const workspaceControllerRef = useRef<WorkspaceController | null>(null);
+  const publishControllerRef = useRef<PublishSessionController | null>(null);
+
+  const getPublishController = useCallback((): PublishSessionController => {
+    if (!publishControllerRef.current) {
+      publishControllerRef.current = createPublishSessionController({
+        onStateChange: setPublishState,
+        onUnauthorized: () => {
+          setSessionUser(null);
+        },
+      });
+    }
+    return publishControllerRef.current;
+  }, []);
 
   const getWorkspaceController = useCallback((): WorkspaceController => {
     if (!workspaceControllerRef.current) {
@@ -191,7 +213,12 @@ export function App() {
 
   useEffect(() => {
     draftRef.current = draft;
+    publishControllerRef.current?.syncActiveDraft(draft.id);
   }, [draft]);
+
+  useEffect(() => {
+    sessionUserRef.current = sessionUser;
+  }, [sessionUser]);
 
   useEffect(() => {
     return () => {
@@ -820,10 +847,37 @@ export function App() {
     }
   };
 
-  // Build validated .pgna ZIP bytes (FMT-02: throws PgnaPackError on missing media or validation failure)
-  const buildArchiveBytes = async (): Promise<Uint8Array> => {
-    return buildValidatedPgnaArchive(draftRef.current);
-  };
+  // Route publishing through the external PublishSessionController so pending/result state
+  // survives PublishModal close/reopen and enforces single in-flight + idempotent retries (SCR-05)
+  const handleStartPublish = useCallback(
+    async (input: PublishSubmitInput): Promise<PublishToKibitzResult> => {
+      const activeSession = sessionUserRef.current;
+      if (!activeSession) {
+        return {
+          published: false,
+          message: "Sign in with Kibitz ID before publishing to Lecture.",
+        };
+      }
+      const currentDraft = draftRef.current;
+      return getPublishController().startPublish({
+        draftId: currentDraft.id,
+        kibitzApiBaseUrl: input.kibitzApiBaseUrl,
+        session: activeSession,
+        visibility: input.visibility,
+        programId: input.programId,
+        tags: input.tags,
+        title: input.title,
+        description: input.description,
+        manifest: currentDraft.manifest,
+        buildArchive: () => buildValidatedPgnaArchive(currentDraft),
+      });
+    },
+    [getPublishController],
+  );
+
+  const handleResetPublishResult = useCallback(() => {
+    publishControllerRef.current?.resetResult();
+  }, []);
 
   const handleExportPgna = async () => {
     setStatusBanner(null);
@@ -1074,9 +1128,11 @@ export function App() {
         open={showPublishModal}
         manifest={draft.manifest}
         sessionUser={sessionUser}
+        publishState={publishState}
         onSessionChange={handleSessionChange}
+        onStartPublish={handleStartPublish}
+        onResetPublishResult={handleResetPublishResult}
         onClose={() => setShowPublishModal(false)}
-        onBuildArchive={buildArchiveBytes}
         onExportLocalPgna={() => void handleExportPgna()}
       />
     </div>

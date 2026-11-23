@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import { resolveAuthConfig } from "@suite/auth-core";
 import { createDbClient, runSuiteMigrations } from "@suite/db";
-import { createLectureApp } from "./app.js";
+import { createLectureApp, processPendingObjectDeletions } from "./app.js";
 import {
   InMemoryPgnaObjectStore,
   LocalDiskPgnaObjectStore,
@@ -82,6 +82,43 @@ const authConfig = resolveAuthConfig(process.env);
 const objectStore = bootstrapObjectStore();
 const { repository, readonlyZeroDbMode } = await bootstrapRepository(objectStore);
 const app = createLectureApp({ authConfig, repository, objectStore, readonlyZeroDbMode });
+
+if (repository.storageKind === "postgres") {
+  try {
+    const summary = await processPendingObjectDeletions(repository, objectStore);
+    if (summary.attempted > 0) {
+      console.log(
+        `[lecture] startup object deletion sweep: attempted=${summary.attempted} succeeded=${summary.succeeded} failed=${summary.failed}`,
+      );
+    }
+  } catch (err) {
+    console.warn("[lecture] startup object deletion sweep failed (will retry periodically):", err);
+  }
+
+  const configuredSweepMs = Number(process.env["LECTURE_DELETION_SWEEP_INTERVAL_MS"] ?? 60_000);
+  const sweepIntervalMs =
+    Number.isFinite(configuredSweepMs) && configuredSweepMs >= 1_000 ? configuredSweepMs : 60_000;
+  let sweepInProgress = false;
+  const sweepTimer = setInterval(() => {
+    if (sweepInProgress) return;
+    sweepInProgress = true;
+    void processPendingObjectDeletions(repository, objectStore)
+      .then((summary) => {
+        if (summary.attempted > 0) {
+          console.log(
+            `[lecture] periodic object deletion sweep: attempted=${summary.attempted} succeeded=${summary.succeeded} failed=${summary.failed}`,
+          );
+        }
+      })
+      .catch((err) => {
+        console.warn("[lecture] periodic object deletion sweep error:", err);
+      })
+      .finally(() => {
+        sweepInProgress = false;
+      });
+  }, sweepIntervalMs);
+  sweepTimer.unref();
+}
 
 serve({ fetch: app.fetch, port }, (info) => {
   console.log(`[lecture] listening on http://localhost:${info.port}`);

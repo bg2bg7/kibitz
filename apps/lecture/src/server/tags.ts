@@ -1,3 +1,5 @@
+export const MAX_STUDY_TITLE_LENGTH = 200;
+export const MAX_STUDY_DESCRIPTION_LENGTH = 4000;
 export const MAX_STUDY_TAGS = 12;
 export const MAX_TAG_LENGTH = 32;
 
@@ -20,15 +22,18 @@ export function normalizeTag(raw: string): string | null {
 
 /**
  * Normalizes, validates, and deduplicates an array of tags (preserving first-seen order).
+ * Reports valid tags beyond `MAX_STUDY_TAGS` in `overflow` so callers can reject rather than silently drop them.
  */
 export function normalizeStudyTags(rawTags: readonly string[]): {
   tags: string[];
   invalid: string[];
+  overflow: string[];
   truncated: boolean;
 } {
   const tags: string[] = [];
   const seen = new Set<string>();
   const invalid: string[] = [];
+  const overflow: string[] = [];
   let truncated = false;
 
   for (const item of rawTags) {
@@ -43,13 +48,15 @@ export function normalizeStudyTags(rawTags: readonly string[]): {
     if (seen.has(normalized)) continue;
     if (tags.length >= MAX_STUDY_TAGS) {
       truncated = true;
+      seen.add(normalized);
+      overflow.push(normalized);
       continue;
     }
     seen.add(normalized);
     tags.push(normalized);
   }
 
-  return { tags, invalid, truncated };
+  return { tags, invalid, overflow, truncated };
 }
 
 /**

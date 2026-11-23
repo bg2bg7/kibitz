@@ -1,26 +1,37 @@
 #!/bin/sh
 # ==============================================================================
-# PostgreSQL First-Startup Bootstrap (runs only on an empty PGDATA volume)
-# 1. Applies all Drizzle SQL migrations mounted at /migrations and records them
-#    in drizzle.__drizzle_migrations so `pnpm db:migrate` stays in sync.
-# 2. Optionally creates an initial admin account when INITIAL_ADMIN_HANDLE and
+# PostgreSQL First-Startup & Resumable Bootstrap
+# 1. Acquires the shared migration advisory lock (42190837, matching
+#    MIGRATION_ADVISORY_LOCK_KEY in packages/db/src/client.ts) and ensures
+#    drizzle.__drizzle_migrations exists.
+# 2. Applies each Drizzle SQL migration from /migrations (or MIGRATIONS_DIR)
+#    and records its hash in drizzle.__drizzle_migrations inside ONE atomic
+#    transaction per migration, skipping already-applied hashes so the script
+#    can be safely re-run after an interrupted bootstrap.
+# 3. Optionally creates an initial admin account when INITIAL_ADMIN_HANDLE and
 #    INITIAL_ADMIN_PASSWORD (<= 72 UTF-8 bytes) are explicitly provided, using
-#    pgcrypto bcrypt (compatible with @suite/auth-core).
+#    pgcrypto bcrypt (compatible with @suite/auth-core) and ON CONFLICT DO NOTHING.
 # ==============================================================================
 set -eu
 
-MIGRATIONS_DIR="/migrations"
+MIGRATIONS_DIR="${MIGRATIONS_DIR:-/migrations}"
 JOURNAL_FILE="${MIGRATIONS_DIR}/meta/_journal.json"
+MIGRATION_ADVISORY_LOCK_KEY="42190837"
 
 echo "[kibitz-init] Ensuring drizzle migration tracking table exists..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+{
+  printf 'BEGIN;\n'
+  printf 'SELECT pg_advisory_xact_lock(%s);\n' "$MIGRATION_ADVISORY_LOCK_KEY"
+  cat <<'SQL'
 CREATE SCHEMA IF NOT EXISTS "drizzle";
 CREATE TABLE IF NOT EXISTS "drizzle"."__drizzle_migrations" (
   id SERIAL PRIMARY KEY,
   hash text NOT NULL,
   created_at bigint
 );
+COMMIT;
 SQL
+} | psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"
 
 if [ -f "$JOURNAL_FILE" ]; then
   # Extract (tag, when) pairs in journal order without external dependencies like jq.
@@ -45,16 +56,34 @@ if [ -f "$JOURNAL_FILE" ]; then
       exit 1
     fi
     file_hash="$(sha256sum "$sql_file" | awk '{print $1}')"
-    echo "[kibitz-init] Applying Drizzle migration ${tag}..."
-    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -f "$sql_file"
-    psql -v ON_ERROR_STOP=1 \
-      --username "$POSTGRES_USER" \
-      --dbname "$POSTGRES_DB" \
-      -v migration_hash="$file_hash" \
-      -v migration_when="$when_ms" <<'SQL'
+    echo "[kibitz-init] Ensuring Drizzle migration ${tag}..."
+    {
+      printf 'BEGIN;\n'
+      printf 'SELECT pg_advisory_xact_lock(%s);\n' "$MIGRATION_ADVISORY_LOCK_KEY"
+      cat <<'SQL'
+SELECT EXISTS (
+  SELECT 1
+  FROM "drizzle"."__drizzle_migrations"
+  WHERE "hash" = :'migration_hash'
+) AS already_applied \gset
+\if :already_applied
+\echo [kibitz-init] Skipping already-applied Drizzle migration :migration_tag
+\else
+SQL
+      cat "$sql_file"
+      printf '\n'
+      cat <<'SQL'
 INSERT INTO "drizzle"."__drizzle_migrations" ("hash", "created_at")
 VALUES (:'migration_hash', :'migration_when');
+\endif
+COMMIT;
 SQL
+    } | psql -v ON_ERROR_STOP=1 \
+      --username "$POSTGRES_USER" \
+      --dbname "$POSTGRES_DB" \
+      -v migration_tag="$tag" \
+      -v migration_hash="$file_hash" \
+      -v migration_when="$when_ms"
   done
 else
   echo "[kibitz-init] WARNING: No Drizzle journal found at ${JOURNAL_FILE}; skipping SQL migrations."

@@ -1,7 +1,13 @@
 import { resolveAuthConfig, signSessionToken } from "@suite/auth-core";
 import { PGNA_FORMAT_VERSION, PGNA_MIME_TYPE, packPgnaArchive, unpackPgnaArchive } from "@suite/pgna";
 import { describe, expect, it } from "vitest";
-import { createLectureApp } from "./app.js";
+import {
+  MAX_STUDY_DESCRIPTION_LENGTH,
+  MAX_STUDY_TAGS,
+  MAX_STUDY_TITLE_LENGTH,
+  createLectureApp,
+  processPendingObjectDeletions,
+} from "./app.js";
 import { InMemoryPgnaObjectStore } from "./objectStore.js";
 import { InMemoryStudyRepository, seedDemoLecturePrimer } from "./repository.js";
 
@@ -944,5 +950,693 @@ describe("@suite/lecture server", () => {
     });
     expect(zeroDbDelete.status).toBe(503);
     expect(zeroDbDelete.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("LEC-04: tombstones studies immediately, retains object key across restarts on transient delete failure, exposes operator metrics, and converges on retry or repeated DELETE", async () => {
+    const repository = new InMemoryStudyRepository();
+    const innerStore = new InMemoryPgnaObjectStore();
+    let failDeletes = false;
+    const flakyObjectStore = {
+      kind: innerStore.kind,
+      async put(key: string, bytes: Uint8Array, contentType: string) {
+        await innerStore.put(key, bytes, contentType);
+      },
+      async get(key: string) {
+        return innerStore.get(key);
+      },
+      async delete(key: string) {
+        if (failDeletes) {
+          throw new Error("S3 temporary outage (503)");
+        }
+        await innerStore.delete(key);
+      },
+    };
+
+    const coachId = "66666666-6666-4666-8666-666666666661";
+    const adminId = "66666666-6666-4666-8666-666666666662";
+    const studentId = "66666666-6666-4666-8666-666666666663";
+    repository.registerAccount({ id: coachId, handle: "coach_del", role: "coach" });
+    repository.registerAccount({ id: adminId, handle: "admin_ops", role: "admin" });
+    repository.registerAccount({ id: studentId, handle: "student_del", role: "student" });
+
+    const { token: coachToken } = await signSessionToken(
+      { sub: coachId, handle: "coach_del", role: "coach", programIds: [] },
+      TEST_AUTH_CONFIG,
+    );
+    const { token: adminToken } = await signSessionToken(
+      { sub: adminId, handle: "admin_ops", role: "admin", programIds: [] },
+      TEST_AUTH_CONFIG,
+    );
+    const { token: studentToken } = await signSessionToken(
+      { sub: studentId, handle: "student_del", role: "student", programIds: [] },
+      TEST_AUTH_CONFIG,
+    );
+
+    const app = createLectureApp({
+      authConfig: TEST_AUTH_CONFIG,
+      repository,
+      objectStore: flakyObjectStore,
+    });
+
+    const pgnaBytes = await createSamplePgnaBytes("Deletion Target");
+    const uploadStudy = async (title: string) => {
+      const form = new FormData();
+      const copy = new Uint8Array(pgnaBytes.byteLength);
+      copy.set(pgnaBytes);
+      form.append("file", new Blob([copy], { type: PGNA_MIME_TYPE }), "study.pgna");
+      form.append("title", title);
+      form.append("visibility", "public_moderated");
+      const res = await app.request("/api/studies", {
+        method: "POST",
+        headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5174" },
+        body: form,
+      });
+      expect(res.status).toBe(201);
+      return (await res.json()) as { id: string };
+    };
+
+    // 1. Normal delete removes both DB visibility and object store blob immediately (200 completed)
+    const normalStudy = await uploadStudy("Normal Delete Study");
+    const normalRecord = await repository.getStudyById(normalStudy.id);
+    expect(normalRecord).not.toBeNull();
+    const normalKey = normalRecord!.pgnaObjectKey;
+    expect(await innerStore.get(normalKey)).not.toBeNull();
+
+    const normalDelRes = await app.request(`/api/studies/${normalStudy.id}`, {
+      method: "DELETE",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5172" },
+    });
+    expect(normalDelRes.status).toBe(200);
+    expect(await normalDelRes.json()).toEqual({
+      deleted: true,
+      id: normalStudy.id,
+      cleanupStatus: "completed",
+    });
+    expect(await innerStore.get(normalKey)).toBeNull();
+    expect(await repository.getStudyByIdIncludingDeleted(normalStudy.id)).toBeNull();
+
+    // 2. Transient storage failure during DELETE: tombstones immediately, returns 202 pending_retry
+    const retryStudy = await uploadStudy("Flaky Storage Study");
+    const retryRecord = await repository.getStudyById(retryStudy.id);
+    expect(retryRecord).not.toBeNull();
+    const retryKey = retryRecord!.pgnaObjectKey;
+
+    failDeletes = true;
+    const flakyDelRes = await app.request(`/api/studies/${retryStudy.id}`, {
+      method: "DELETE",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5172" },
+    });
+    expect(flakyDelRes.status).toBe(202);
+    expect(await flakyDelRes.json()).toEqual({
+      deleted: true,
+      id: retryStudy.id,
+      cleanupStatus: "pending_retry",
+    });
+
+    // Blob still exists in storage while outage continues, but study is IMMEDIATELY hidden from all reads & edits
+    expect(await innerStore.get(retryKey)).not.toBeNull();
+    const listAfterTombstone = (await (
+      await app.request("/api/studies", {
+        headers: { cookie: `kibitz_session=${coachToken}` },
+      })
+    ).json()) as { studies: Array<{ id: string }> };
+    expect(listAfterTombstone.studies.map((s) => s.id)).not.toContain(retryStudy.id);
+    expect(
+      (
+        await app.request(`/api/studies/${retryStudy.id}`, {
+          headers: { cookie: `kibitz_session=${coachToken}` },
+        })
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await app.request(`/api/studies/${retryStudy.id}/archive`, {
+          headers: { cookie: `kibitz_session=${coachToken}` },
+        })
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await app.request(`/api/studies/${retryStudy.id}`, {
+          method: "PATCH",
+          headers: {
+            cookie: `kibitz_session=${coachToken}`,
+            "Content-Type": "application/json",
+            origin: "http://localhost:5172",
+          },
+          body: JSON.stringify({ title: "Should Fail" }),
+        })
+      ).status,
+    ).toBe(404);
+
+    // Non-admin / anonymous cannot inspect or retry admin object-deletion queue
+    expect((await app.request("/api/admin/object-deletions")).status).toBe(401);
+    expect(
+      (
+        await app.request("/api/admin/object-deletions", {
+          headers: { cookie: `kibitz_session=${coachToken}` },
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await app.request("/api/admin/object-deletions", {
+          headers: { cookie: `kibitz_session=${studentToken}` },
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await app.request("/api/admin/object-deletions/retry", {
+          method: "POST",
+          headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5172" },
+        })
+      ).status,
+    ).toBe(403);
+
+    // Admin sees failed counter and retained object key
+    const adminQueueRes = await app.request("/api/admin/object-deletions", {
+      headers: { cookie: `kibitz_session=${adminToken}` },
+    });
+    expect(adminQueueRes.status).toBe(200);
+    const adminQueueJson = (await adminQueueRes.json()) as {
+      metrics: {
+        pendingCount: number;
+        failedCount: number;
+        completedCount: number;
+        totalFailureAttempts: number;
+      };
+      pending: Array<{ studyId: string; pgnaObjectKey: string; status: string; attemptCount: number }>;
+    };
+    expect(adminQueueJson.metrics).toEqual({
+      pendingCount: 0,
+      failedCount: 1,
+      completedCount: 1,
+      totalFailureAttempts: 1,
+    });
+    expect(adminQueueJson.pending).toHaveLength(1);
+    expect(adminQueueJson.pending[0]).toMatchObject({
+      studyId: retryStudy.id,
+      pgnaObjectKey: retryKey,
+      status: "failed",
+      attemptCount: 1,
+    });
+
+    // Simulate process restart: brand-new createLectureApp over same durable repository & object store
+    const restartedApp = createLectureApp({
+      authConfig: TEST_AUTH_CONFIG,
+      repository,
+      objectStore: flakyObjectStore,
+    });
+
+    // Before backoff elapses, a normal sweep with current time does not hammer storage
+    const prematureSweep = await processPendingObjectDeletions(repository, flakyObjectStore, {
+      now: new Date(),
+    });
+    expect(prematureSweep).toEqual({ attempted: 0, succeeded: 0, failed: 0 });
+
+    // Storage recovers -> operator triggers admin retry on restarted app -> blob removed & study purged
+    failDeletes = false;
+    const adminRetryRes = await restartedApp.request("/api/admin/object-deletions/retry", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${adminToken}`, origin: "http://localhost:5172" },
+    });
+    expect(adminRetryRes.status).toBe(200);
+    expect(await adminRetryRes.json()).toEqual({
+      attempted: 1,
+      succeeded: 1,
+      failed: 0,
+      metrics: {
+        pendingCount: 0,
+        failedCount: 0,
+        completedCount: 2,
+        totalFailureAttempts: 1,
+      },
+    });
+    expect(await innerStore.get(retryKey)).toBeNull();
+    expect(await repository.getStudyByIdIncludingDeleted(retryStudy.id)).toBeNull();
+
+    // 3. Repeated DELETE /api/studies/:id after restart converges to 200 completed once storage recovers
+    const repeatStudy = await uploadStudy("Repeated Delete Convergence");
+    const repeatRecord = await repository.getStudyById(repeatStudy.id);
+    const repeatKey = repeatRecord!.pgnaObjectKey;
+
+    failDeletes = true;
+    const firstRepeatDel = await app.request(`/api/studies/${repeatStudy.id}`, {
+      method: "DELETE",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5172" },
+    });
+    expect(firstRepeatDel.status).toBe(202);
+    expect(await innerStore.get(repeatKey)).not.toBeNull();
+
+    // Non-owner still cannot trigger delete on tombstoned study
+    expect(
+      (
+        await restartedApp.request(`/api/studies/${repeatStudy.id}`, {
+          method: "DELETE",
+          headers: { cookie: `kibitz_session=${studentToken}`, origin: "http://localhost:5172" },
+        })
+      ).status,
+    ).toBe(403);
+
+    // Storage recovers -> repeated DELETE converges to 200 completed and removes blob
+    failDeletes = false;
+    const secondRepeatDel = await restartedApp.request(`/api/studies/${repeatStudy.id}`, {
+      method: "DELETE",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5172" },
+    });
+    expect(secondRepeatDel.status).toBe(200);
+    expect(await secondRepeatDel.json()).toEqual({
+      deleted: true,
+      id: repeatStudy.id,
+      cleanupStatus: "completed",
+    });
+    expect(await innerStore.get(repeatKey)).toBeNull();
+    expect(await repository.getStudyByIdIncludingDeleted(repeatStudy.id)).toBeNull();
+
+    // 4. processPendingObjectDeletions converges once nextAttemptAt arrives
+    const sweepStudy = await uploadStudy("Scheduled Sweep Convergence");
+    const sweepRecord = await repository.getStudyById(sweepStudy.id);
+    const sweepKey = sweepRecord!.pgnaObjectKey;
+
+    failDeletes = true;
+    expect(
+      (
+        await app.request(`/api/studies/${sweepStudy.id}`, {
+          method: "DELETE",
+          headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5172" },
+        })
+      ).status,
+    ).toBe(202);
+    expect(await innerStore.get(sweepKey)).not.toBeNull();
+
+    failDeletes = false;
+    const futureSweep = await processPendingObjectDeletions(repository, flakyObjectStore, {
+      now: new Date(Date.now() + 2 * 60 * 1000),
+    });
+    expect(futureSweep).toEqual({ attempted: 1, succeeded: 1, failed: 0 });
+    expect(await innerStore.get(sweepKey)).toBeNull();
+  });
+
+  it("LEC-03: enforces bounded streaming upload cap, Content-Length check, per-file limit, and concurrent upload guard", async () => {
+    const repository = new InMemoryStudyRepository();
+    const innerStore = new InMemoryPgnaObjectStore();
+    const coachId = "77777777-7777-4777-8777-777777777771";
+    repository.registerAccount({ id: coachId, handle: "coach_upload", role: "coach" });
+    const { token: coachToken } = await signSessionToken(
+      { sub: coachId, handle: "coach_upload", role: "coach", programIds: [] },
+      TEST_AUTH_CONFIG,
+    );
+
+    let putCalls = 0;
+    const trackingStore = {
+      kind: innerStore.kind,
+      async put(key: string, bytes: Uint8Array, contentType: string) {
+        putCalls++;
+        await innerStore.put(key, bytes, contentType);
+      },
+      async get(key: string) {
+        return innerStore.get(key);
+      },
+      async delete(key: string) {
+        await innerStore.delete(key);
+      },
+    };
+
+    // 1. Small maxUploadRequestBytes rejects streaming oversized body WITHOUT Content-Length before formData/storage
+    const tightApp = createLectureApp({
+      authConfig: TEST_AUTH_CONFIG,
+      repository,
+      objectStore: trackingStore,
+      maxUploadBytes: 1500,
+      maxUploadRequestBytes: 2048,
+    });
+
+    let chunksGenerated = 0;
+    let streamCancelled = false;
+    const oversizedStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (chunksGenerated >= 20) {
+          controller.close();
+          return;
+        }
+        chunksGenerated++;
+        controller.enqueue(new Uint8Array(512).fill(65));
+      },
+      cancel() {
+        streamCancelled = true;
+      },
+    });
+
+    const streamingReq = new Request("http://localhost/api/studies", {
+      method: "POST",
+      headers: {
+        cookie: `kibitz_session=${coachToken}`,
+        origin: "http://localhost:5174",
+        "content-type": "multipart/form-data; boundary=----kibitz-stream-test",
+      },
+      body: oversizedStream,
+      // @ts-expect-error Node fetch requires duplex for ReadableStream bodies
+      duplex: "half",
+    });
+    expect(streamingReq.headers.get("content-length")).toBeNull();
+
+    const streamingRes = await tightApp.fetch(streamingReq);
+    expect(streamingRes.status).toBe(413);
+    expect(streamCancelled).toBe(true);
+    expect(chunksGenerated).toBeLessThan(20);
+    expect(putCalls).toBe(0);
+
+    // 2. Oversized Content-Length header rejected immediately with 413 before reading body
+    let clStreamPulled = false;
+    const clBody = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          clStreamPulled = true;
+          controller.enqueue(new Uint8Array(100));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const clReq = new Request("http://localhost/api/studies", {
+      method: "POST",
+      headers: {
+        cookie: `kibitz_session=${coachToken}`,
+        origin: "http://localhost:5174",
+        "content-type": "multipart/form-data; boundary=----kibitz-cl-test",
+        "content-length": "999999",
+      },
+      body: clBody,
+      // @ts-expect-error Node fetch requires duplex for ReadableStream bodies
+      duplex: "half",
+    });
+    const clRes = await tightApp.fetch(clReq);
+    expect(clRes.status).toBe(413);
+    expect(clReq.bodyUsed).toBe(false);
+    expect(clStreamPulled).toBe(false);
+    expect(putCalls).toBe(0);
+
+    // 3. Normal workbook publishes (201) under a reasonable cap, and per-file maxUploadBytes is enforced
+    const pgnaBytes = await createSamplePgnaBytes("Bounded Workbook");
+    const reasonableApp = createLectureApp({
+      authConfig: TEST_AUTH_CONFIG,
+      repository,
+      objectStore: trackingStore,
+      maxUploadBytes: 64 * 1024,
+      maxUploadRequestBytes: 128 * 1024,
+    });
+
+    const validForm = new FormData();
+    const validCopy = new Uint8Array(pgnaBytes.byteLength);
+    validCopy.set(pgnaBytes);
+    validForm.append("file", new Blob([validCopy], { type: PGNA_MIME_TYPE }), "study.pgna");
+    validForm.append("title", "Bounded Workbook");
+
+    const okRes = await reasonableApp.request("/api/studies", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5174" },
+      body: validForm,
+    });
+    expect(okRes.status).toBe(201);
+    expect(putCalls).toBe(1);
+
+    // 4. Concurrency guard: maxConcurrentUploads: 1 returns 429 + Retry-After for overlapping second upload
+    let releaseFirstPut!: () => void;
+    let notifyFirstPutEntered!: () => void;
+    const firstPutEntered = new Promise<void>((resolve) => {
+      notifyFirstPutEntered = resolve;
+    });
+    const firstPutGate = new Promise<void>((resolve) => {
+      releaseFirstPut = resolve;
+    });
+    let gatedOnce = false;
+    const slowStore = {
+      kind: innerStore.kind,
+      async put(key: string, bytes: Uint8Array, contentType: string) {
+        if (!gatedOnce) {
+          gatedOnce = true;
+          notifyFirstPutEntered();
+          await firstPutGate;
+        }
+        await innerStore.put(key, bytes, contentType);
+      },
+      async get(key: string) {
+        return innerStore.get(key);
+      },
+      async delete(key: string) {
+        await innerStore.delete(key);
+      },
+    };
+
+    const singleSlotApp = createLectureApp({
+      authConfig: TEST_AUTH_CONFIG,
+      repository,
+      objectStore: slowStore,
+      maxConcurrentUploads: 1,
+    });
+
+    const makeUploadForm = (title: string) => {
+      const form = new FormData();
+      const copy = new Uint8Array(pgnaBytes.byteLength);
+      copy.set(pgnaBytes);
+      form.append("file", new Blob([copy], { type: PGNA_MIME_TYPE }), "study.pgna");
+      form.append("title", title);
+      return form;
+    };
+
+    const firstUploadPromise = singleSlotApp.request("/api/studies", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5174" },
+      body: makeUploadForm("First In-Flight Upload"),
+    });
+
+    await firstPutEntered;
+
+    const secondConcurrentRes = await singleSlotApp.request("/api/studies", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5174" },
+      body: makeUploadForm("Rejected Concurrent Upload"),
+    });
+    expect(secondConcurrentRes.status).toBe(429);
+    expect(secondConcurrentRes.headers.get("retry-after")).toBe("5");
+
+    releaseFirstPut();
+    const firstUploadRes = await firstUploadPromise;
+    expect(firstUploadRes.status).toBe(201);
+
+    // After first upload completes, semaphore is released and a new upload succeeds
+    const afterReleaseRes = await singleSlotApp.request("/api/studies", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5174" },
+      body: makeUploadForm("Post-Release Upload"),
+    });
+    expect(afterReleaseRes.status).toBe(201);
+  });
+
+  it("SCR-05: rejects metadata overflow without silent truncation and deduplicates sequential and concurrent Idempotency-Key publishes", async () => {
+    const repository = new InMemoryStudyRepository();
+    const innerStore = new InMemoryPgnaObjectStore();
+    const coachId = "88888888-8888-4888-8888-888888888881";
+    repository.registerAccount({ id: coachId, handle: "coach_meta", role: "coach" });
+    const { token: coachToken } = await signSessionToken(
+      { sub: coachId, handle: "coach_meta", role: "coach", programIds: [] },
+      TEST_AUTH_CONFIG,
+    );
+
+    let putCalls = 0;
+    let putDelayMs = 0;
+    const trackingStore = {
+      kind: innerStore.kind,
+      async put(key: string, bytes: Uint8Array, contentType: string) {
+        if (putDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, putDelayMs));
+        }
+        putCalls++;
+        await innerStore.put(key, bytes, contentType);
+      },
+      async get(key: string) {
+        return innerStore.get(key);
+      },
+      async delete(key: string) {
+        await innerStore.delete(key);
+      },
+    };
+
+    const app = createLectureApp({
+      authConfig: TEST_AUTH_CONFIG,
+      repository,
+      objectStore: trackingStore,
+    });
+
+    // CORS preflight permits Idempotency-Key
+    const preflight = await app.request("/api/studies", {
+      method: "OPTIONS",
+      headers: { origin: "http://localhost:5174" },
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("access-control-allow-headers")).toContain("Idempotency-Key");
+
+    const pgnaBytes = await createSamplePgnaBytes("Boundary Metadata Study");
+    const buildForm = (opts: { title?: string; description?: string; tags?: string[] }) => {
+      const form = new FormData();
+      const copy = new Uint8Array(pgnaBytes.byteLength);
+      copy.set(pgnaBytes);
+      form.append("file", new Blob([copy], { type: PGNA_MIME_TYPE }), "study.pgna");
+      form.append("title", opts.title ?? "Valid Title");
+      form.append("description", opts.description ?? "Valid Description");
+      if (opts.tags !== undefined) {
+        form.append("tags", JSON.stringify(opts.tags));
+      }
+      return form;
+    };
+
+    const twelveTags = Array.from({ length: MAX_STUDY_TAGS }, (_, i) => `tag-${i + 1}`);
+    const thirteenTags = [...twelveTags, "tag-overflow"];
+
+    // 1. Over-limit title (201), description (4001), and tags (13) are rejected with 400 and NO blob is written
+    const overTitleRes = await app.request("/api/studies", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5174" },
+      body: buildForm({ title: "T".repeat(MAX_STUDY_TITLE_LENGTH + 1) }),
+    });
+    expect(overTitleRes.status).toBe(400);
+    expect(putCalls).toBe(0);
+
+    const overDescRes = await app.request("/api/studies", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5174" },
+      body: buildForm({ description: "D".repeat(MAX_STUDY_DESCRIPTION_LENGTH + 1) }),
+    });
+    expect(overDescRes.status).toBe(400);
+    expect(putCalls).toBe(0);
+
+    const overTagsRes = await app.request("/api/studies", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5174" },
+      body: buildForm({ tags: thirteenTags }),
+    });
+    expect(overTagsRes.status).toBe(400);
+    expect(putCalls).toBe(0);
+
+    // Invalid Idempotency-Key rejected with 400
+    const badKeyRes = await app.request("/api/studies", {
+      method: "POST",
+      headers: {
+        cookie: `kibitz_session=${coachToken}`,
+        origin: "http://localhost:5174",
+        "Idempotency-Key": "invalid key with spaces!",
+      },
+      body: buildForm({}),
+    });
+    expect(badKeyRes.status).toBe(400);
+    expect(putCalls).toBe(0);
+
+    // 2. Exact boundary lengths (title=200, description=4000, 12 tags) succeed and round-trip unchanged
+    const exactTitle = "A".repeat(MAX_STUDY_TITLE_LENGTH);
+    const exactDescription = "B".repeat(MAX_STUDY_DESCRIPTION_LENGTH);
+    const boundaryRes = await app.request("/api/studies", {
+      method: "POST",
+      headers: { cookie: `kibitz_session=${coachToken}`, origin: "http://localhost:5174" },
+      body: buildForm({ title: exactTitle, description: exactDescription, tags: twelveTags }),
+    });
+    expect(boundaryRes.status).toBe(201);
+    const boundaryJson = (await boundaryRes.json()) as {
+      id: string;
+      study: { title: string; description: string; tags: string[] };
+    };
+    expect(boundaryJson.study.title).toBe(exactTitle);
+    expect(boundaryJson.study.description).toBe(exactDescription);
+    expect(boundaryJson.study.tags).toEqual(twelveTags);
+    expect(putCalls).toBe(1);
+
+    const fetchedBoundary = (await (
+      await app.request(`/api/studies/${boundaryJson.id}`)
+    ).json()) as { study: { title: string; description: string; tags: string[] } };
+    expect(fetchedBoundary.study.title).toBe(exactTitle);
+    expect(fetchedBoundary.study.description).toBe(exactDescription);
+    expect(fetchedBoundary.study.tags).toEqual(twelveTags);
+
+    // PATCH also rejects 13 unique tags instead of silently dropping overflow
+    const patchOverTagsRes = await app.request(`/api/studies/${boundaryJson.id}`, {
+      method: "PATCH",
+      headers: {
+        cookie: `kibitz_session=${coachToken}`,
+        "Content-Type": "application/json",
+        origin: "http://localhost:5172",
+      },
+      body: JSON.stringify({ tags: thirteenTags }),
+    });
+    expect(patchOverTagsRes.status).toBe(400);
+
+    // 3. Sequential Idempotency-Key replay produces exactly ONE study and ONE blob
+    const seqKey = "scribe-publish-seq-001";
+    const seqFirstRes = await app.request("/api/studies", {
+      method: "POST",
+      headers: {
+        cookie: `kibitz_session=${coachToken}`,
+        origin: "http://localhost:5174",
+        "Idempotency-Key": seqKey,
+      },
+      body: buildForm({ title: "Idempotent Sequential Study" }),
+    });
+    expect(seqFirstRes.status).toBe(201);
+    const seqFirstJson = (await seqFirstRes.json()) as { id: string; studyId: string };
+    expect(putCalls).toBe(2);
+
+    const seqReplayRes = await app.request("/api/studies", {
+      method: "POST",
+      headers: {
+        cookie: `kibitz_session=${coachToken}`,
+        origin: "http://localhost:5174",
+        "Idempotency-Key": seqKey,
+      },
+      body: buildForm({ title: "Idempotent Sequential Study" }),
+    });
+    expect(seqReplayRes.status).toBe(200);
+    const seqReplayJson = (await seqReplayRes.json()) as {
+      id: string;
+      studyId: string;
+      idempotentReplay: boolean;
+    };
+    expect(seqReplayJson.id).toBe(seqFirstJson.id);
+    expect(seqReplayJson.studyId).toBe(seqFirstJson.id);
+    expect(seqReplayJson.idempotentReplay).toBe(true);
+    expect(putCalls).toBe(2);
+
+    // 4. Concurrent duplicate POSTs with the same Idempotency-Key coalesce to ONE study and ONE blob
+    putDelayMs = 40;
+    const concKey = "scribe-publish-concurrent-001";
+    const [concA, concB] = await Promise.all([
+      app.request("/api/studies", {
+        method: "POST",
+        headers: {
+          cookie: `kibitz_session=${coachToken}`,
+          origin: "http://localhost:5174",
+          "Idempotency-Key": concKey,
+        },
+        body: buildForm({ title: "Idempotent Concurrent Study" }),
+      }),
+      app.request("/api/studies", {
+        method: "POST",
+        headers: {
+          cookie: `kibitz_session=${coachToken}`,
+          origin: "http://localhost:5174",
+          "Idempotency-Key": concKey,
+        },
+        body: buildForm({ title: "Idempotent Concurrent Study" }),
+      }),
+    ]);
+
+    const statuses = [concA.status, concB.status].sort((a, b) => a - b);
+    expect(statuses).toEqual([200, 201]);
+    const concAJson = (await concA.json()) as { id: string; idempotentReplay?: boolean };
+    const concBJson = (await concB.json()) as { id: string; idempotentReplay?: boolean };
+    expect(concAJson.id).toBe(concBJson.id);
+    expect([concAJson.idempotentReplay, concBJson.idempotentReplay]).toContain(true);
+    expect(putCalls).toBe(3);
+
+    const allStudies = await repository.listAllStudies();
+    expect(allStudies).toHaveLength(3);
   });
 });

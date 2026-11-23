@@ -24,6 +24,9 @@ import {
   type StudyVisibility,
 } from "./repository.js";
 import {
+  MAX_STUDY_DESCRIPTION_LENGTH,
+  MAX_STUDY_TAGS,
+  MAX_STUDY_TITLE_LENGTH,
   collectTagCounts,
   groupStudiesByTag,
   normalizeStudyTags,
@@ -31,7 +34,15 @@ import {
   parseRawTagsField,
 } from "./tags.js";
 
-const MAX_PGNA_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+export { MAX_STUDY_DESCRIPTION_LENGTH, MAX_STUDY_TAGS, MAX_STUDY_TITLE_LENGTH } from "./tags.js";
+
+export const MAX_PGNA_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+const DEFAULT_MAX_UPLOAD_OVERHEAD_BYTES = 1024 * 1024; // 1 MB multipart overhead
+const DEFAULT_MAX_CONCURRENT_UPLOADS = 4;
+const DEFAULT_OBJECT_DELETION_BACKOFF_MS = 30_000;
+const MAX_OBJECT_DELETION_BACKOFF_MS = 60 * 60 * 1000; // 1 hour
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const ALL_PENDING_DELETIONS_CUTOFF = new Date(8640000000000000);
 
 const ZERO_DB_WRITE_ERROR =
   "Lecture is running in read-only zero-database dev mode. Configure DATABASE_URL (PostgreSQL) to enable cross-service publishing, editing, and deleting.";
@@ -46,8 +57,8 @@ const StudyVisibilitySchema = z.enum([
 ]);
 
 const UpdateStudyBodySchema = z.object({
-  title: z.string().trim().min(1).max(200).optional(),
-  description: z.string().max(4000).optional(),
+  title: z.string().trim().min(1).max(MAX_STUDY_TITLE_LENGTH).optional(),
+  description: z.string().max(MAX_STUDY_DESCRIPTION_LENGTH).optional(),
   tags: z.array(z.string()).optional(),
   visibility: StudyVisibilitySchema.optional(),
   programId: z.string().uuid().nullable().optional(),
@@ -73,6 +84,111 @@ export interface CreateLectureAppOptions {
   repository?: StudyRepository;
   objectStore?: PgnaObjectStore;
   readonlyZeroDbMode?: boolean;
+  maxUploadBytes?: number;
+  maxUploadRequestBytes?: number;
+  maxConcurrentUploads?: number;
+}
+
+class PayloadTooLargeError extends Error {
+  constructor(maxBytes: number) {
+    super(`Upload request body exceeds the ${maxBytes}-byte limit.`);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
+/**
+ * Streams a Request body while enforcing a hard byte limit, cancelling the stream
+ * immediately if incoming chunks exceed `maxBytes`.
+ */
+async function readBoundedBodyBytes(
+  req: Request,
+  maxBytes: number,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const body = req.body;
+  if (!body) {
+    return new Uint8Array(new ArrayBuffer(0));
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value || value.byteLength === 0) {
+        continue;
+      }
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new PayloadTooLargeError(maxBytes);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const buffer = new ArrayBuffer(totalBytes);
+  const combined = new Uint8Array(buffer);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return combined;
+}
+
+function computeNextObjectDeletionAttempt(
+  attemptCount: number,
+  now: Date,
+  baseBackoffMs = DEFAULT_OBJECT_DELETION_BACKOFF_MS,
+): Date {
+  const exponent = Math.min(Math.max(0, attemptCount), 20);
+  const delayMs = Math.min(baseBackoffMs * 2 ** exponent, MAX_OBJECT_DELETION_BACKOFF_MS);
+  return new Date(now.getTime() + delayMs);
+}
+
+/**
+ * Processes due study object-deletion jobs from the durable outbox queue (LEC-04).
+ */
+export async function processPendingObjectDeletions(
+  repository: StudyRepository,
+  objectStore: PgnaObjectStore,
+  options: { now?: Date; limit?: number; baseBackoffMs?: number } = {},
+): Promise<{ attempted: number; succeeded: number; failed: number }> {
+  const dueCutoff = options.now ?? new Date();
+  const recordedAt = dueCutoff.getUTCFullYear() > 9999 ? new Date() : dueCutoff;
+  const limit = options.limit ?? 100;
+  const baseBackoffMs = options.baseBackoffMs ?? DEFAULT_OBJECT_DELETION_BACKOFF_MS;
+
+  const dueJobs = await repository.listDueObjectDeletions(dueCutoff, limit);
+  let attempted = 0;
+  let succeeded = 0;
+  let failed = 0;
+
+  for (const job of dueJobs) {
+    attempted++;
+    try {
+      await objectStore.delete(job.pgnaObjectKey);
+      await repository.markObjectDeletionSucceeded(job.id, recordedAt);
+      succeeded++;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const nextAttemptAt = computeNextObjectDeletionAttempt(
+        job.attemptCount,
+        recordedAt,
+        baseBackoffMs,
+      );
+      await repository.markObjectDeletionFailed(job.id, message, nextAttemptAt, recordedAt);
+      failed++;
+    }
+  }
+
+  return { attempted, succeeded, failed };
 }
 
 interface CurrentPrincipal {
@@ -147,7 +263,18 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
   const repository = options.repository ?? new InMemoryStudyRepository();
   const objectStore = options.objectStore ?? new InMemoryPgnaObjectStore();
   const readonlyZeroDbMode = options.readonlyZeroDbMode ?? false;
+  const maxUploadBytes = options.maxUploadBytes ?? MAX_PGNA_UPLOAD_BYTES;
+  const maxUploadRequestBytes =
+    options.maxUploadRequestBytes ?? maxUploadBytes + DEFAULT_MAX_UPLOAD_OVERHEAD_BYTES;
+  const maxConcurrentUploads = options.maxConcurrentUploads ?? DEFAULT_MAX_CONCURRENT_UPLOADS;
   const clearCookieOnMissingAccount = !readonlyZeroDbMode;
+
+  let inFlightUploads = 0;
+  const inFlightIdempotentUploads = new Map<
+    string,
+    { promise: Promise<StudyRecord | null>; resolve: (study: StudyRecord | null) => void }
+  >();
+
   const app = new Hono();
 
   app.use("*", async (c, next) => {
@@ -157,7 +284,7 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
       c.header("Access-Control-Allow-Origin", allowedOrigin);
       c.header("Access-Control-Allow-Credentials", "true");
       c.header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
-      c.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      c.header("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key");
       c.header("Vary", "Origin");
     }
     if (c.req.method === "OPTIONS") {
@@ -342,166 +469,341 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
       );
     }
 
-    let formData: FormData;
-    try {
-      formData = await c.req.formData();
-    } catch {
-      return c.json({ error: "Expected multipart/form-data upload with a .pgna file." }, 400);
-    }
-
-    const fileEntry = formData.get("file");
-    if (!fileEntry || typeof fileEntry === "string") {
-      return c.json({ error: 'Missing required "file" field containing a .pgna archive.' }, 400);
-    }
-
-    if (fileEntry.size === 0) {
-      return c.json({ error: "Uploaded .pgna archive is empty." }, 400);
-    }
-    if (fileEntry.size > MAX_PGNA_UPLOAD_BYTES) {
-      return c.json({ error: "Uploaded .pgna archive exceeds the 50 MB limit." }, 413);
-    }
-
-    const bytes = new Uint8Array(await fileEntry.arrayBuffer());
-    const validation = await validatePgnaZip(bytes);
-    if (!validation.valid) {
-      const firstError = validation.diagnostics.find((d) => d.severity === "error");
-      return c.json(
-        {
-          error: `Invalid PGNA v1.0 archive: ${firstError?.code ?? "INVALID"} — ${firstError?.message ?? "validation failed"}`,
-          diagnostics: validation.diagnostics,
-        },
-        400,
-      );
-    }
-
-    const rawTitle = String(formData.get("title") ?? "").trim();
-    const title = (rawTitle || "Untitled PGNA Study").slice(0, 200);
-    const description = String(formData.get("description") ?? "").slice(0, 4000);
-
-    const rawVisibility = String(formData.get("visibility") ?? "public_moderated").trim();
-    const parsedVisibility = StudyVisibilitySchema.safeParse(rawVisibility || "public_moderated");
-    if (!parsedVisibility.success) {
-      return c.json({ error: `Unsupported visibility "${rawVisibility}".` }, 400);
-    }
-    const visibility = parsedVisibility.data;
-
-    const rawProgramId = formData.get("programId");
-    const trimmedProgramId =
-      typeof rawProgramId === "string" && rawProgramId.trim() ? rawProgramId.trim() : null;
-    if (trimmedProgramId !== null && !ProgramIdSchema.safeParse(trimmedProgramId).success) {
-      return c.json({ error: "Invalid programId format; expected a UUID." }, 400);
-    }
-
-    let resolvedProgramId: string | null = null;
-    if (visibility === "program") {
-      if (!trimmedProgramId) {
-        return c.json(
-          { error: "A target program must be selected when visibility is set to program." },
-          400,
-        );
-      }
-      if (!(await repository.programExists(trimmedProgramId))) {
-        return c.json({ error: "Target program not found." }, 404);
-      }
-      const ctx = await repository.getViewerAccessContext(principal.sub);
-      if (
-        !canPublishToProgram(
-          { id: principal.sub, role: principal.role },
-          trimmedProgramId,
-          ctx.programMemberships,
-        )
-      ) {
-        return c.json(
-          {
-            error: "Only admins and coaches assigned to that program may publish program studies.",
-          },
-          403,
-        );
-      }
-      resolvedProgramId = trimmedProgramId;
-    }
-
-    const rawTags = parseRawTagsField(formData.get("tags"));
-    const normalizedTags = normalizeStudyTags(rawTags);
-    if (normalizedTags.invalid.length > 0) {
-      return c.json(
-        {
-          error: `Invalid tag(s): ${normalizedTags.invalid.join(", ")}. Tags must be 1–32 characters using letters, numbers, spaces, hyphens, or underscores.`,
-        },
-        400,
-      );
-    }
-
-    // NOTE: Public studies are auto-approved for now so authors can browse and view them
-    // immediately without login. Once the moderator queue UI lands, flip this to "pending".
-    const moderationStatus = visibility === "public_moderated" ? "approved" : "pending";
-
-    const studyId = randomUUID();
-    const objectKey = `studies/${principal.sub}/${studyId}.pgna`;
-
-    try {
-      await objectStore.put(objectKey, bytes, PGNA_MIME_TYPE);
-    } catch (err) {
-      return c.json(
-        {
-          error: `Failed to persist .pgna archive to object storage: ${err instanceof Error ? err.message : String(err)}`,
-        },
-        502,
-      );
-    }
-
-    try {
-      const created = await repository.createStudy({
-        id: studyId,
-        ownerUserId: principal.sub,
-        ownerHandle: principal.handle,
-        ownerRole: principal.role,
-        programId: resolvedProgramId,
-        title,
-        description,
-        tags: normalizedTags.tags,
-        pgnaObjectKey: objectKey,
-        visibility,
-        moderationStatus,
-      });
-
-      const dto = toStudyDto(created);
-      return c.json(
-        {
-          id: dto.id,
-          studyId: dto.id,
-          study: dto,
-        },
-        201,
-      );
-    } catch (err) {
-      await objectStore.delete(objectKey).catch(() => undefined);
-      console.error("[lecture] failed to save study metadata:", err);
-      const cause = err instanceof Error ? (err as { cause?: unknown }).cause : undefined;
-      const pgCode =
-        typeof cause === "object" && cause !== null && "code" in cause
-          ? (cause as { code?: unknown }).code
-          : undefined;
-      if (pgCode === "23503") {
-        if (c.req.header("cookie") && clearCookieOnMissingAccount) {
-          c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
-        }
+    const rawIdempotencyKey = c.req.header("idempotency-key");
+    let idempotencyKey: string | null = null;
+    if (rawIdempotencyKey !== undefined) {
+      const trimmedKey = rawIdempotencyKey.trim();
+      if (!IDEMPOTENCY_KEY_PATTERN.test(trimmedKey)) {
         return c.json(
           {
             error:
-              "Your Kibitz ID session is no longer valid (account not found). Please sign in again.",
+              "Invalid Idempotency-Key header; must be 1–128 characters using letters, numbers, '.', '_', ':', or '-'.",
           },
-          401,
+          400,
         );
       }
-      const causeMsg =
-        cause instanceof Error && cause.message ? ` (${cause.message})` : "";
-      return c.json(
-        {
-          error: `Failed to save study metadata: ${err instanceof Error ? err.message : String(err)}${causeMsg}`,
-        },
-        500,
-      );
+      idempotencyKey = trimmedKey;
+    }
+
+    let flightKey: string | null = null;
+    let flightEntry: {
+      promise: Promise<StudyRecord | null>;
+      resolve: (study: StudyRecord | null) => void;
+    } | null = null;
+
+    if (idempotencyKey !== null) {
+      const key = `${principal.sub}:${idempotencyKey}`;
+      const existingFlight = inFlightIdempotentUploads.get(key);
+      if (existingFlight) {
+        const coalesced = await existingFlight.promise;
+        if (coalesced) {
+          const dto = toStudyDto(coalesced);
+          return c.json(
+            {
+              id: dto.id,
+              studyId: dto.id,
+              study: dto,
+              idempotentReplay: true,
+            },
+            200,
+          );
+        }
+      }
+
+      let resolveFlight!: (study: StudyRecord | null) => void;
+      const promise = new Promise<StudyRecord | null>((resolve) => {
+        resolveFlight = resolve;
+      });
+      flightKey = key;
+      flightEntry = { promise, resolve: resolveFlight };
+      inFlightIdempotentUploads.set(key, flightEntry);
+    }
+
+    let acquiredUploadSlot = false;
+    let resolvedIdempotentStudy: StudyRecord | null = null;
+
+    try {
+      if (idempotencyKey !== null) {
+        const existingByKey = await repository.findStudyByIdempotencyKey(
+          principal.sub,
+          idempotencyKey,
+        );
+        if (existingByKey) {
+          resolvedIdempotentStudy = existingByKey;
+          const dto = toStudyDto(existingByKey);
+          return c.json(
+            {
+              id: dto.id,
+              studyId: dto.id,
+              study: dto,
+              idempotentReplay: true,
+            },
+            200,
+          );
+        }
+      }
+
+      if (inFlightUploads >= maxConcurrentUploads) {
+        c.header("Retry-After", "5");
+        return c.json(
+          { error: "Too many concurrent uploads in progress. Please retry shortly." },
+          429,
+        );
+      }
+      inFlightUploads++;
+      acquiredUploadSlot = true;
+
+      const rawContentLength = c.req.header("content-length");
+      if (rawContentLength !== undefined) {
+        const parsedLength = Number(rawContentLength);
+        if (Number.isFinite(parsedLength) && parsedLength > maxUploadRequestBytes) {
+          return c.json(
+            {
+              error: `Upload request exceeds the ${maxUploadRequestBytes}-byte limit.`,
+            },
+            413,
+          );
+        }
+      }
+
+      let boundedBytes: Uint8Array<ArrayBuffer>;
+      try {
+        boundedBytes = await readBoundedBodyBytes(c.req.raw, maxUploadRequestBytes);
+      } catch (err) {
+        if (err instanceof PayloadTooLargeError) {
+          return c.json({ error: err.message }, 413);
+        }
+        return c.json({ error: "Failed to read upload request stream." }, 400);
+      }
+
+      const contentType = c.req.header("content-type");
+      if (!contentType) {
+        return c.json({ error: "Expected multipart/form-data upload with a .pgna file." }, 400);
+      }
+
+      let formData: FormData;
+      try {
+        formData = await new Response(boundedBytes, {
+          headers: { "content-type": contentType },
+        }).formData();
+      } catch {
+        return c.json({ error: "Expected multipart/form-data upload with a .pgna file." }, 400);
+      }
+
+      const fileEntry = formData.get("file");
+      if (!fileEntry || typeof fileEntry === "string") {
+        return c.json({ error: 'Missing required "file" field containing a .pgna archive.' }, 400);
+      }
+
+      if (fileEntry.size === 0) {
+        return c.json({ error: "Uploaded .pgna archive is empty." }, 400);
+      }
+      if (fileEntry.size > maxUploadBytes) {
+        return c.json(
+          {
+            error:
+              maxUploadBytes === MAX_PGNA_UPLOAD_BYTES
+                ? "Uploaded .pgna archive exceeds the 50 MB limit."
+                : `Uploaded .pgna archive exceeds the ${maxUploadBytes}-byte limit.`,
+          },
+          413,
+        );
+      }
+
+      const rawTitleField = formData.get("title");
+      const rawTitle = typeof rawTitleField === "string" ? rawTitleField.trim() : "";
+      if (rawTitle.length > MAX_STUDY_TITLE_LENGTH) {
+        return c.json(
+          { error: `Title exceeds the ${MAX_STUDY_TITLE_LENGTH}-character limit.` },
+          400,
+        );
+      }
+      const title = rawTitle || "Untitled PGNA Study";
+
+      const rawDescriptionField = formData.get("description");
+      const description = typeof rawDescriptionField === "string" ? rawDescriptionField : "";
+      if (description.length > MAX_STUDY_DESCRIPTION_LENGTH) {
+        return c.json(
+          { error: `Description exceeds the ${MAX_STUDY_DESCRIPTION_LENGTH}-character limit.` },
+          400,
+        );
+      }
+
+      const rawVisibility = String(formData.get("visibility") ?? "public_moderated").trim();
+      const parsedVisibility = StudyVisibilitySchema.safeParse(rawVisibility || "public_moderated");
+      if (!parsedVisibility.success) {
+        return c.json({ error: `Unsupported visibility "${rawVisibility}".` }, 400);
+      }
+      const visibility = parsedVisibility.data;
+
+      const rawProgramId = formData.get("programId");
+      const trimmedProgramId =
+        typeof rawProgramId === "string" && rawProgramId.trim() ? rawProgramId.trim() : null;
+      if (trimmedProgramId !== null && !ProgramIdSchema.safeParse(trimmedProgramId).success) {
+        return c.json({ error: "Invalid programId format; expected a UUID." }, 400);
+      }
+
+      let resolvedProgramId: string | null = null;
+      if (visibility === "program") {
+        if (!trimmedProgramId) {
+          return c.json(
+            { error: "A target program must be selected when visibility is set to program." },
+            400,
+          );
+        }
+        if (!(await repository.programExists(trimmedProgramId))) {
+          return c.json({ error: "Target program not found." }, 404);
+        }
+        const ctx = await repository.getViewerAccessContext(principal.sub);
+        if (
+          !canPublishToProgram(
+            { id: principal.sub, role: principal.role },
+            trimmedProgramId,
+            ctx.programMemberships,
+          )
+        ) {
+          return c.json(
+            {
+              error: "Only admins and coaches assigned to that program may publish program studies.",
+            },
+            403,
+          );
+        }
+        resolvedProgramId = trimmedProgramId;
+      }
+
+      const rawTags = parseRawTagsField(formData.get("tags"));
+      const normalizedTags = normalizeStudyTags(rawTags);
+      if (normalizedTags.invalid.length > 0) {
+        return c.json(
+          {
+            error: `Invalid tag(s): ${normalizedTags.invalid.join(", ")}. Tags must be 1–32 characters using letters, numbers, spaces, hyphens, or underscores.`,
+          },
+          400,
+        );
+      }
+      if (normalizedTags.overflow.length > 0) {
+        return c.json(
+          {
+            error: `Too many tags: a study may have at most ${MAX_STUDY_TAGS} unique tags (overflow: ${normalizedTags.overflow.join(", ")}).`,
+          },
+          400,
+        );
+      }
+
+      const bytes = new Uint8Array(await fileEntry.arrayBuffer());
+      const validation = await validatePgnaZip(bytes);
+      if (!validation.valid) {
+        const firstError = validation.diagnostics.find((d) => d.severity === "error");
+        return c.json(
+          {
+            error: `Invalid PGNA v1.0 archive: ${firstError?.code ?? "INVALID"} — ${firstError?.message ?? "validation failed"}`,
+            diagnostics: validation.diagnostics,
+          },
+          400,
+        );
+      }
+
+      // NOTE: Public studies are auto-approved for now so authors can browse and view them
+      // immediately without login. Once the moderator queue UI lands, flip this to "pending".
+      const moderationStatus = visibility === "public_moderated" ? "approved" : "pending";
+
+      const studyId = randomUUID();
+      const objectKey = `studies/${principal.sub}/${studyId}.pgna`;
+
+      try {
+        await objectStore.put(objectKey, bytes, PGNA_MIME_TYPE);
+      } catch (err) {
+        return c.json(
+          {
+            error: `Failed to persist .pgna archive to object storage: ${err instanceof Error ? err.message : String(err)}`,
+          },
+          502,
+        );
+      }
+
+      try {
+        const created = await repository.createStudy({
+          id: studyId,
+          ownerUserId: principal.sub,
+          ownerHandle: principal.handle,
+          ownerRole: principal.role,
+          programId: resolvedProgramId,
+          title,
+          description,
+          tags: normalizedTags.tags,
+          pgnaObjectKey: objectKey,
+          visibility,
+          moderationStatus,
+          idempotencyKey,
+        });
+
+        resolvedIdempotentStudy = created;
+        const dto = toStudyDto(created);
+        return c.json(
+          {
+            id: dto.id,
+            studyId: dto.id,
+            study: dto,
+          },
+          201,
+        );
+      } catch (err) {
+        await objectStore.delete(objectKey).catch(() => undefined);
+        const cause = err instanceof Error ? (err as { cause?: unknown }).cause : undefined;
+        const pgCode =
+          typeof cause === "object" && cause !== null && "code" in cause
+            ? (cause as { code?: unknown }).code
+            : undefined;
+        if (pgCode === "23505" && idempotencyKey !== null) {
+          const existing = await repository.findStudyByIdempotencyKey(
+            principal.sub,
+            idempotencyKey,
+          );
+          if (existing) {
+            resolvedIdempotentStudy = existing;
+            const dto = toStudyDto(existing);
+            return c.json(
+              {
+                id: dto.id,
+                studyId: dto.id,
+                study: dto,
+                idempotentReplay: true,
+              },
+              200,
+            );
+          }
+        }
+        console.error("[lecture] failed to save study metadata:", err);
+        if (pgCode === "23503") {
+          if (c.req.header("cookie") && clearCookieOnMissingAccount) {
+            c.header("Set-Cookie", buildClearSessionCookieHeader(authConfig));
+          }
+          return c.json(
+            {
+              error:
+                "Your Kibitz ID session is no longer valid (account not found). Please sign in again.",
+            },
+            401,
+          );
+        }
+        const causeMsg =
+          cause instanceof Error && cause.message ? ` (${cause.message})` : "";
+        return c.json(
+          {
+            error: `Failed to save study metadata: ${err instanceof Error ? err.message : String(err)}${causeMsg}`,
+          },
+          500,
+        );
+      }
+    } finally {
+      if (acquiredUploadSlot) {
+        inFlightUploads--;
+      }
+      if (flightKey && flightEntry) {
+        inFlightIdempotentUploads.delete(flightKey);
+        flightEntry.resolve(resolvedIdempotentStudy);
+      }
     }
   });
 
@@ -735,6 +1037,14 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
           400,
         );
       }
+      if (normalized.overflow.length > 0) {
+        return c.json(
+          {
+            error: `Too many tags: a study may have at most ${MAX_STUDY_TAGS} unique tags (overflow: ${normalized.overflow.join(", ")}).`,
+          },
+          400,
+        );
+      }
       nextTags = normalized.tags;
     }
 
@@ -795,7 +1105,9 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
   });
 
   /**
-   * Deletes a study and its `.pgna` blob (owner or admin only).
+   * Tombstones a study immediately and durably deletes its `.pgna` blob (owner or admin only).
+   * If object storage fails transiently, the key is retained in `study_object_deletions` for retry
+   * and `202 Accepted` is returned while the study is already hidden from all read paths (LEC-04).
    */
   app.delete("/api/studies/:id", async (c) => {
     if (readonlyZeroDbMode) {
@@ -813,7 +1125,7 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
     const { principal } = resolved;
 
     const studyId = c.req.param("id");
-    const existing = await repository.getStudyById(studyId);
+    const existing = await repository.getStudyByIdIncludingDeleted(studyId);
     if (!existing) {
       return c.json({ error: "Study not found." }, 404);
     }
@@ -821,12 +1133,87 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
       return c.json({ error: "Only the study owner or an admin may delete this study." }, 403);
     }
 
-    const deleted = await repository.deleteStudy(studyId);
-    if (deleted) {
-      await objectStore.delete(deleted.pgnaObjectKey).catch(() => undefined);
+    const tombstoned = await repository.tombstoneStudyForDeletion(studyId);
+    if (!tombstoned) {
+      if (existing.deletedAt !== null) {
+        return c.json({ deleted: true, id: studyId, cleanupStatus: "completed" }, 200);
+      }
+      return c.json({ error: "Study not found." }, 404);
     }
 
-    return c.json({ deleted: true, id: studyId });
+    if (tombstoned.deletionJob.status === "completed") {
+      return c.json({ deleted: true, id: studyId, cleanupStatus: "completed" }, 200);
+    }
+
+    try {
+      await objectStore.delete(tombstoned.study.pgnaObjectKey);
+      await repository.markObjectDeletionSucceeded(tombstoned.deletionJob.id);
+      return c.json({ deleted: true, id: studyId, cleanupStatus: "completed" }, 200);
+    } catch (err) {
+      const now = new Date();
+      const message = err instanceof Error ? err.message : String(err);
+      const nextAttemptAt = computeNextObjectDeletionAttempt(
+        tombstoned.deletionJob.attemptCount,
+        now,
+      );
+      await repository.markObjectDeletionFailed(
+        tombstoned.deletionJob.id,
+        message,
+        nextAttemptAt,
+        now,
+      );
+      return c.json({ deleted: true, id: studyId, cleanupStatus: "pending_retry" }, 202);
+    }
+  });
+
+  /**
+   * Operator visibility into pending/failed durable object deletions and failure counters (LEC-04).
+   */
+  app.get("/api/admin/object-deletions", async (c) => {
+    const resolved = await resolveCurrentPrincipal(c);
+    if (resolved.status !== "authenticated") {
+      const error =
+        resolved.status === "missing_account"
+          ? "Your Kibitz ID session is no longer valid (account not found). Please sign in again."
+          : "Authentication required.";
+      return c.json({ error }, 401);
+    }
+    if (resolved.principal.role !== "admin") {
+      return c.json({ error: "Admin access required." }, 403);
+    }
+
+    const [metrics, pending] = await Promise.all([
+      repository.getObjectDeletionMetrics(),
+      repository.listDueObjectDeletions(ALL_PENDING_DELETIONS_CUTOFF, 100),
+    ]);
+    return c.json({ metrics, pending });
+  });
+
+  /**
+   * Operator-triggered immediate retry of all pending/failed study object deletions (LEC-04).
+   */
+  app.post("/api/admin/object-deletions/retry", async (c) => {
+    if (readonlyZeroDbMode) {
+      return c.json({ error: ZERO_DB_WRITE_ERROR }, 503);
+    }
+
+    const resolved = await resolveCurrentPrincipal(c);
+    if (resolved.status !== "authenticated") {
+      const error =
+        resolved.status === "missing_account"
+          ? "Your Kibitz ID session is no longer valid (account not found). Please sign in again."
+          : "Authentication required.";
+      return c.json({ error }, 401);
+    }
+    if (resolved.principal.role !== "admin") {
+      return c.json({ error: "Admin access required." }, 403);
+    }
+
+    const summary = await processPendingObjectDeletions(repository, objectStore, {
+      now: ALL_PENDING_DELETIONS_CUTOFF,
+    });
+    const metrics = await repository.getObjectDeletionMetrics();
+    return c.json({ ...summary, metrics });
   });
 
   return app;

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,8 @@ const REPO_ROOT = resolve(THIS_DIR, "../../..");
 const COMPOSE_FILE = resolve(REPO_ROOT, "docker-compose.yml");
 const ENV_EXAMPLE_FILE = resolve(REPO_ROOT, ".env.example");
 const INIT_SCRIPT = resolve(REPO_ROOT, "docker/postgres/init-db-and-admin.sh");
+const DRIZZLE_DIR = resolve(REPO_ROOT, "packages/db/drizzle");
+const JOURNAL_FILE = resolve(DRIZZLE_DIR, "meta/_journal.json");
 
 const EXPECTED_POSTGRES_IMAGE =
   "postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d";
@@ -343,5 +346,309 @@ describe("OPS-03 containment: docker/postgres/init-db-and-admin.sh", () => {
     expect(multibyteResult.stderr).toContain("72-byte UTF-8 limit");
     expect(multibyteResult.stderr).toContain("75 bytes");
     expect(multibyteResult.psqlLog).not.toContain('INSERT INTO "users"');
+  });
+});
+
+interface DrizzleJournal {
+  version: string;
+  dialect: string;
+  entries: Array<{
+    idx: number;
+    version: string;
+    when: number;
+    tag: string;
+    breakpoints: boolean;
+  }>;
+}
+
+interface SimulatedPsqlInvocation {
+  args: string[];
+  rawSql: string;
+  executedSql: string;
+  skipped: boolean;
+  vars: Record<string, string>;
+}
+
+interface SimulatedPsqlState {
+  appliedHashes: string[];
+  invocations: SimulatedPsqlInvocation[];
+}
+
+function createStatefulStubPsql(binDir: string, statePath: string): void {
+  const stubScriptPath = resolve(binDir, "psql-sim.mjs");
+  const psqlWrapperPath = resolve(binDir, "psql");
+
+  // Simulates psql -v var=value, \gset already_applied check, and \if :already_applied / \else / \endif
+  // inside BEGIN ... COMMIT transactions against a persisted JSON state file.
+  const simScript = `
+import { readFileSync, writeFileSync } from "node:fs";
+
+const statePath = process.argv[2];
+const psqlArgs = process.argv.slice(3);
+const rawSql = readFileSync(0, "utf8");
+
+const vars = {};
+for (let i = 0; i < psqlArgs.length; i++) {
+  if (psqlArgs[i] === "-v" && i + 1 < psqlArgs.length) {
+    const pair = psqlArgs[++i];
+    const eq = pair.indexOf("=");
+    if (eq !== -1) {
+      vars[pair.slice(0, eq)] = pair.slice(eq + 1);
+    }
+  }
+}
+
+const state = JSON.parse(readFileSync(statePath, "utf8"));
+const appliedSet = new Set(state.appliedHashes);
+
+const lines = rawSql.split(/\\r?\\n/);
+let alreadyApplied = false;
+let inIf = false;
+let inElse = false;
+let skipped = false;
+const executedLines = [];
+
+for (const line of lines) {
+  const trimmed = line.trim();
+  if (trimmed.includes("AS already_applied \\\\gset")) {
+    alreadyApplied = vars.migration_hash ? appliedSet.has(vars.migration_hash) : false;
+    executedLines.push(line);
+    continue;
+  }
+  if (trimmed === "\\\\if :already_applied") {
+    inIf = true;
+    inElse = false;
+    if (alreadyApplied) {
+      skipped = true;
+    }
+    continue;
+  }
+  if (trimmed === "\\\\else") {
+    inElse = true;
+    continue;
+  }
+  if (trimmed === "\\\\endif") {
+    inIf = false;
+    inElse = false;
+    continue;
+  }
+
+  const branchActive = !inIf || (inElse ? !alreadyApplied : alreadyApplied);
+  if (!branchActive) {
+    continue;
+  }
+
+  if (trimmed.startsWith("\\\\echo ")) {
+    const msg = trimmed.slice(6).replace(/:([a-zA-Z0-9_]+)/g, (_, name) => vars[name] ?? ":" + name);
+    process.stdout.write(msg + "\\n");
+    continue;
+  }
+
+  executedLines.push(line);
+}
+
+const executedSql = executedLines.join("\\n");
+const committed =
+  executedSql.includes("BEGIN;") &&
+  executedSql.includes("COMMIT;") &&
+  executedSql.includes('INSERT INTO "drizzle"."__drizzle_migrations"');
+
+if (committed && vars.migration_hash && !appliedSet.has(vars.migration_hash)) {
+  state.appliedHashes.push(vars.migration_hash);
+}
+
+state.invocations.push({
+  args: psqlArgs,
+  rawSql,
+  executedSql,
+  skipped,
+  vars,
+});
+
+writeFileSync(statePath, JSON.stringify(state), "utf8");
+`;
+
+  writeFileSync(stubScriptPath, simScript, "utf8");
+  writeFileSync(
+    psqlWrapperPath,
+    `#!/bin/sh\nexec "${process.execPath}" "${stubScriptPath}" "${statePath}" "$@"\n`,
+    "utf8",
+  );
+  chmodSync(psqlWrapperPath, 0o755);
+}
+
+function readDrizzleJournal(): DrizzleJournal {
+  return JSON.parse(readFileSync(JOURNAL_FILE, "utf8")) as DrizzleJournal;
+}
+
+describe("OPS-04 transactional, locked, resumable migrations", () => {
+  it("keeps packages/db/drizzle/meta/_journal.json in sync with existing SQL files including 0002", () => {
+    const journal = readDrizzleJournal();
+    expect(journal.entries.length).toBeGreaterThanOrEqual(3);
+    expect(journal.entries.some((entry) => entry.tag.startsWith("0002_"))).toBe(true);
+
+    for (const [idx, entry] of journal.entries.entries()) {
+      expect(entry.idx).toBe(idx);
+      const sqlPath = resolve(DRIZZLE_DIR, `${entry.tag}.sql`);
+      expect(existsSync(sqlPath), `Missing migration SQL file: ${sqlPath}`).toBe(true);
+      const sqlContent = readFileSync(sqlPath, "utf8").trim();
+      expect(sqlContent.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("applies each migration DDL and drizzle.__drizzle_migrations insert in ONE advisory-locked transaction", () => {
+    const journal = readDrizzleJournal();
+
+    withTempDir("kibitz-ops04-atomic-", (dir) => {
+      const binDir = resolve(dir, "bin");
+      const statePath = resolve(dir, "state.json");
+      spawnSync("mkdir", ["-p", binDir], { encoding: "utf8" });
+      const initialState: SimulatedPsqlState = { appliedHashes: [], invocations: [] };
+      writeFileSync(statePath, JSON.stringify(initialState), "utf8");
+      createStatefulStubPsql(binDir, statePath);
+
+      const env: NodeJS.ProcessEnv = {
+        ...sanitizedBaseEnv(),
+        PATH: `${binDir}:${sanitizedBaseEnv()["PATH"] ?? "/usr/bin:/bin"}`,
+        POSTGRES_USER: "kibitz",
+        POSTGRES_DB: "kibitz_suite",
+        MIGRATIONS_DIR: DRIZZLE_DIR,
+      };
+
+      const result = spawnSync("sh", [INIT_SCRIPT], {
+        cwd: REPO_ROOT,
+        env,
+        encoding: "utf8",
+      });
+      expect(result.status, result.stderr).toBe(0);
+
+      const state = JSON.parse(readFileSync(statePath, "utf8")) as SimulatedPsqlState;
+      // 1 bootstrap invocation for drizzle.__drizzle_migrations + exactly 1 invocation per journal entry
+      // (never 2 separate psql calls for DDL and journal INSERT).
+      expect(state.invocations.length).toBe(1 + journal.entries.length);
+
+      const bootstrap = state.invocations[0];
+      expect(bootstrap?.rawSql).toContain("BEGIN;");
+      expect(bootstrap?.rawSql).toContain("SELECT pg_advisory_xact_lock(42190837);");
+      expect(bootstrap?.rawSql).toContain('CREATE TABLE IF NOT EXISTS "drizzle"."__drizzle_migrations"');
+      expect(bootstrap?.rawSql).toContain("COMMIT;");
+
+      for (const [index, entry] of journal.entries.entries()) {
+        const invocation = state.invocations[1 + index];
+        expect(invocation).toBeDefined();
+        if (!invocation) continue;
+
+        const sqlPath = resolve(DRIZZLE_DIR, `${entry.tag}.sql`);
+        const expectedSql = readFileSync(sqlPath, "utf8");
+        const expectedHash = createHash("sha256").update(expectedSql).digest("hex");
+
+        expect(invocation.args).toContain("ON_ERROR_STOP=1");
+        expect(invocation.vars["migration_tag"]).toBe(entry.tag);
+        expect(invocation.vars["migration_hash"]).toBe(expectedHash);
+        expect(invocation.vars["migration_when"]).toBe(String(entry.when));
+
+        const sql = invocation.rawSql;
+        const beginPos = sql.indexOf("BEGIN;");
+        const lockPos = sql.indexOf("SELECT pg_advisory_xact_lock(42190837);");
+        const checkPos = sql.indexOf("AS already_applied \\gset");
+        const ifPos = sql.indexOf("\\if :already_applied");
+        const elsePos = sql.indexOf("\\else");
+        const ddlPos = sql.indexOf(expectedSql.trim());
+        const insertPos = sql.indexOf('INSERT INTO "drizzle"."__drizzle_migrations"');
+        const endifPos = sql.indexOf("\\endif");
+        const commitPos = sql.indexOf("COMMIT;");
+
+        expect(beginPos).toBeGreaterThanOrEqual(0);
+        expect(lockPos).toBeGreaterThan(beginPos);
+        expect(checkPos).toBeGreaterThan(lockPos);
+        expect(ifPos).toBeGreaterThan(checkPos);
+        expect(elsePos).toBeGreaterThan(ifPos);
+        expect(ddlPos).toBeGreaterThan(elsePos);
+        expect(insertPos).toBeGreaterThan(ddlPos);
+        expect(endifPos).toBeGreaterThan(insertPos);
+        expect(commitPos).toBeGreaterThan(endifPos);
+
+        expect(invocation.skipped).toBe(false);
+        expect(invocation.executedSql).toContain(expectedSql.trim());
+        expect(invocation.executedSql).toContain('INSERT INTO "drizzle"."__drizzle_migrations"');
+      }
+    });
+  });
+
+  it("skips already-applied migration hashes on re-run and resumes cleanly after partial application", () => {
+    const journal = readDrizzleJournal();
+
+    withTempDir("kibitz-ops04-resumable-", (dir) => {
+      const binDir = resolve(dir, "bin");
+      const statePath = resolve(dir, "state.json");
+      spawnSync("mkdir", ["-p", binDir], { encoding: "utf8" });
+
+      // Simulate recovery after migration 0 succeeded and a later migration failed/interrupted.
+      const firstEntry = journal.entries[0];
+      expect(firstEntry).toBeDefined();
+      const firstSql = readFileSync(resolve(DRIZZLE_DIR, `${firstEntry!.tag}.sql`), "utf8");
+      const firstHash = createHash("sha256").update(firstSql).digest("hex");
+
+      const partialState: SimulatedPsqlState = {
+        appliedHashes: [firstHash],
+        invocations: [],
+      };
+      writeFileSync(statePath, JSON.stringify(partialState), "utf8");
+      createStatefulStubPsql(binDir, statePath);
+
+      const env: NodeJS.ProcessEnv = {
+        ...sanitizedBaseEnv(),
+        PATH: `${binDir}:${sanitizedBaseEnv()["PATH"] ?? "/usr/bin:/bin"}`,
+        POSTGRES_USER: "kibitz",
+        POSTGRES_DB: "kibitz_suite",
+        MIGRATIONS_DIR: DRIZZLE_DIR,
+      };
+
+      // Run 1 (resuming from partial state): skips migration 0, applies remaining migrations.
+      const resumeRun = spawnSync("sh", [INIT_SCRIPT], {
+        cwd: REPO_ROOT,
+        env,
+        encoding: "utf8",
+      });
+      expect(resumeRun.status, resumeRun.stderr).toBe(0);
+      expect(resumeRun.stdout).toContain(
+        `[kibitz-init] Skipping already-applied Drizzle migration ${firstEntry!.tag}`,
+      );
+
+      const afterResume = JSON.parse(readFileSync(statePath, "utf8")) as SimulatedPsqlState;
+      const resumeMigrations = afterResume.invocations.slice(1);
+      expect(resumeMigrations[0]?.skipped).toBe(true);
+      expect(resumeMigrations[0]?.executedSql).not.toContain(
+        'INSERT INTO "drizzle"."__drizzle_migrations"',
+      );
+      for (const applied of resumeMigrations.slice(1)) {
+        expect(applied.skipped).toBe(false);
+        expect(applied.executedSql).toContain('INSERT INTO "drizzle"."__drizzle_migrations"');
+      }
+      expect(afterResume.appliedHashes.length).toBe(journal.entries.length);
+
+      // Run 2 (full re-run when all migrations are already applied): skips every migration cleanly.
+      const invocationCountBeforeRerun = afterResume.invocations.length;
+      const rerun = spawnSync("sh", [INIT_SCRIPT], {
+        cwd: REPO_ROOT,
+        env,
+        encoding: "utf8",
+      });
+      expect(rerun.status, rerun.stderr).toBe(0);
+
+      const afterRerun = JSON.parse(readFileSync(statePath, "utf8")) as SimulatedPsqlState;
+      const rerunInvocations = afterRerun.invocations.slice(invocationCountBeforeRerun);
+      expect(rerunInvocations.length).toBe(1 + journal.entries.length);
+
+      for (const [index, entry] of journal.entries.entries()) {
+        const inv = rerunInvocations[1 + index];
+        expect(inv?.skipped).toBe(true);
+        expect(inv?.executedSql).not.toContain('INSERT INTO "drizzle"."__drizzle_migrations"');
+        expect(rerun.stdout).toContain(
+          `[kibitz-init] Skipping already-applied Drizzle migration ${entry.tag}`,
+        );
+      }
+      expect(afterRerun.appliedHashes.length).toBe(journal.entries.length);
+    });
   });
 });
