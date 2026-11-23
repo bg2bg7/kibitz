@@ -350,9 +350,15 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
       );
     } catch (err) {
       await objectStore.delete(objectKey).catch(() => undefined);
+      console.error("[lecture] failed to save study metadata:", err);
+      const cause = err instanceof Error ? (err as { cause?: unknown }).cause : undefined;
+      const causeMsg =
+        cause instanceof Error && cause.message
+          ? ` (${cause.message})`
+          : "";
       return c.json(
         {
-          error: `Failed to save study metadata: ${err instanceof Error ? err.message : String(err)}`,
+          error: `Failed to save study metadata: ${err instanceof Error ? err.message : String(err)}${causeMsg}`,
         },
         500,
       );

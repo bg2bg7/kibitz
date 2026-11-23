@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import { resolveAuthConfig } from "@suite/auth-core";
-import { createDbClient } from "@suite/db";
+import { createDbClient, runSuiteMigrations } from "@suite/db";
 import { createLectureApp } from "./app.js";
 import {
   InMemoryPgnaObjectStore,
@@ -55,8 +55,9 @@ function bootstrapObjectStore(): PgnaObjectStore {
 async function bootstrapRepository(objectStore: PgnaObjectStore): Promise<StudyRepository> {
   const databaseUrl = process.env["DATABASE_URL"]?.trim();
   if (databaseUrl) {
-    const { db } = createDbClient(databaseUrl);
-    console.log("[lecture] connected to PostgreSQL via DATABASE_URL");
+    const { db, pool } = createDbClient(databaseUrl);
+    await runSuiteMigrations(pool);
+    console.log("[lecture] connected to PostgreSQL via DATABASE_URL (migrations up to date)");
     return new PostgresStudyRepository(db);
   }
 
