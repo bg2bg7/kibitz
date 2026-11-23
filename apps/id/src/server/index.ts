@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import { hashPassword, resolveAuthConfig } from "@suite/auth-core";
 import { createDbClient } from "@suite/db";
@@ -7,6 +10,16 @@ import {
   PostgresIdentityRepository,
   type IdentityRepository,
 } from "./repository.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+for (const envPath of [
+  path.resolve(__dirname, "../../.env"),
+  path.resolve(__dirname, "../../../../.env"),
+]) {
+  if (existsSync(envPath) && typeof process.loadEnvFile === "function") {
+    process.loadEnvFile(envPath);
+  }
+}
 
 async function bootstrapRepository(): Promise<IdentityRepository> {
   const databaseUrl = process.env["DATABASE_URL"]?.trim();

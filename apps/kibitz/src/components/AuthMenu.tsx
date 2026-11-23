@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { createPortal } from "react-dom";
 import {
   fetchKibitzSession,
   loginWithKibitzId,
@@ -105,108 +106,111 @@ export function AuthMenu() {
         Sign in
       </button>
 
-      {modalOpen ? (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="kibitz-login-dialog-title"
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-xs"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) {
-              setModalOpen(false);
-            }
-          }}
-        >
-          <div className="w-full max-w-md rounded-2xl border border-stone-200 bg-white p-6 shadow-xl">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h2
-                  id="kibitz-login-dialog-title"
-                  className="text-lg font-bold tracking-tight text-slate-950"
-                >
-                  Sign in with Kibitz ID
-                </h2>
-                <p className="mt-1 text-xs leading-relaxed text-slate-500">
-                  One session across Kibitz, Scribe, Lecture, and Hall — plus read-only pulls in
-                  offline PWAs (Arbiter &amp; Seconds).
-                </p>
+      {modalOpen && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="kibitz-login-dialog-title"
+              className="fixed inset-0 z-50 flex min-h-dvh items-center justify-center overflow-y-auto bg-slate-950/45 p-4 backdrop-blur-xs"
+              onClick={(e) => {
+                if (e.target === e.currentTarget) {
+                  setModalOpen(false);
+                }
+              }}
+            >
+              <div className="my-auto w-full max-w-md rounded-2xl border border-stone-200 bg-white p-6 shadow-xl">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h2
+                      id="kibitz-login-dialog-title"
+                      className="text-lg font-bold tracking-tight text-slate-950"
+                    >
+                      Sign in with Kibitz ID
+                    </h2>
+                    <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                      One session across Kibitz, Scribe, Lecture, and Hall — plus read-only pulls in
+                      offline PWAs (Arbiter &amp; Seconds).
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="Close sign in dialog"
+                    onClick={() => setModalOpen(false)}
+                    className="rounded-md p-1 text-slate-400 transition hover:bg-stone-100 hover:text-slate-700"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                {error ? (
+                  <div
+                    role="alert"
+                    className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700"
+                  >
+                    {error}
+                  </div>
+                ) : null}
+
+                <form onSubmit={(e) => void handleLogin(e)} className="mt-5 space-y-4">
+                  <div>
+                    <label
+                      htmlFor="home-login-handle"
+                      className="block text-xs font-semibold text-slate-700"
+                    >
+                      Handle
+                    </label>
+                    <input
+                      id="home-login-handle"
+                      type="text"
+                      autoComplete="username"
+                      required
+                      value={handle}
+                      onChange={(e) => setHandle(e.target.value)}
+                      placeholder="e.g. admin or coach_alice"
+                      className="mt-1.5 block w-full rounded-lg border border-stone-300 px-3 py-2 text-sm text-slate-900 focus:border-slate-900 focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="home-login-password"
+                      className="block text-xs font-semibold text-slate-700"
+                    >
+                      Password
+                    </label>
+                    <input
+                      id="home-login-password"
+                      type="password"
+                      autoComplete="current-password"
+                      required
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      className="mt-1.5 block w-full rounded-lg border border-stone-300 px-3 py-2 text-sm text-slate-900 focus:border-slate-900 focus:outline-none"
+                    />
+                  </div>
+
+                  <button
+                    id="home-login-submit"
+                    type="submit"
+                    disabled={submitting}
+                    className="w-full rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-60"
+                  >
+                    {submitting ? "Signing in…" : "Sign In"}
+                  </button>
+                </form>
+
+                <div className="mt-5 flex flex-wrap items-center justify-between gap-2 border-t border-stone-100 pt-4 text-xs text-slate-500">
+                  <span>Invite-only · Zero PII</span>
+                  <a href={registerUrl} className="font-semibold text-slate-900 hover:underline">
+                    Have an invite code? Register →
+                  </a>
+                </div>
               </div>
-              <button
-                type="button"
-                aria-label="Close sign in dialog"
-                onClick={() => setModalOpen(false)}
-                className="rounded-md p-1 text-slate-400 transition hover:bg-stone-100 hover:text-slate-700"
-              >
-                ✕
-              </button>
-            </div>
-
-            {error ? (
-              <div
-                role="alert"
-                className="mt-4 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700"
-              >
-                {error}
-              </div>
-            ) : null}
-
-            <form onSubmit={(e) => void handleLogin(e)} className="mt-5 space-y-4">
-              <div>
-                <label
-                  htmlFor="home-login-handle"
-                  className="block text-xs font-semibold text-slate-700"
-                >
-                  Handle
-                </label>
-                <input
-                  id="home-login-handle"
-                  type="text"
-                  autoComplete="username"
-                  required
-                  value={handle}
-                  onChange={(e) => setHandle(e.target.value)}
-                  placeholder="e.g. admin or coach_alice"
-                  className="mt-1.5 block w-full rounded-lg border border-stone-300 px-3 py-2 text-sm text-slate-900 focus:border-slate-900 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label
-                  htmlFor="home-login-password"
-                  className="block text-xs font-semibold text-slate-700"
-                >
-                  Password
-                </label>
-                <input
-                  id="home-login-password"
-                  type="password"
-                  autoComplete="current-password"
-                  required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="mt-1.5 block w-full rounded-lg border border-stone-300 px-3 py-2 text-sm text-slate-900 focus:border-slate-900 focus:outline-none"
-                />
-              </div>
-
-              <button
-                id="home-login-submit"
-                type="submit"
-                disabled={submitting}
-                className="w-full rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:opacity-60"
-              >
-                {submitting ? "Signing in…" : "Sign In"}
-              </button>
-            </form>
-
-            <div className="mt-5 flex flex-wrap items-center justify-between gap-2 border-t border-stone-100 pt-4 text-xs text-slate-500">
-              <span>Invite-only · Zero PII</span>
-              <a href={registerUrl} className="font-semibold text-slate-900 hover:underline">
-                Have an invite code? Register →
-              </a>
-            </div>
-          </div>
-        </div>
-      ) : null}
+            </div>,
+            document.body,
+          )
+        : null}
     </>
   );
 }
