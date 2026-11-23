@@ -243,8 +243,12 @@ describe("@suite/lecture server", () => {
     const detailRes = await app.request(`/api/studies/${pub1Json.id}`);
     expect(detailRes.status).toBe(200);
 
-    const archiveRes = await app.request(`/api/studies/${pub1Json.id}/archive`);
+    const archiveRes = await app.request(`/api/studies/${pub1Json.id}/archive`, {
+      headers: { origin: "http://localhost:5172" },
+    });
     expect(archiveRes.status).toBe(200);
+    expect(archiveRes.headers.get("access-control-allow-origin")).toBe("http://localhost:5172");
+    expect(archiveRes.headers.get("access-control-allow-credentials")).toBe("true");
     expect(archiveRes.headers.get("content-type")).toBe(PGNA_MIME_TYPE);
     const downloadedBytes = new Uint8Array(await archiveRes.arrayBuffer());
     const unpacked = await unpackPgnaArchive(downloadedBytes);

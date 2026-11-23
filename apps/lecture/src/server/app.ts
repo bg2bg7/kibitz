@@ -550,7 +550,18 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
       return c.json({ error: "Study not found." }, 404);
     }
 
-    const bytes = await objectStore.get(study.pgnaObjectKey);
+    let bytes: Uint8Array | null;
+    try {
+      bytes = await objectStore.get(study.pgnaObjectKey);
+    } catch (err) {
+      console.error("[lecture] failed to read .pgna archive from object storage:", err);
+      return c.json(
+        {
+          error: `Failed to read .pgna archive from storage: ${err instanceof Error ? err.message : String(err)}`,
+        },
+        502,
+      );
+    }
     if (!bytes) {
       return c.json({ error: "PGNA archive file missing from storage." }, 404);
     }
@@ -562,15 +573,11 @@ export function createLectureApp(options: CreateLectureAppOptions = {}) {
     const isPublic =
       study.visibility === "public_moderated" && study.moderationStatus === "approved";
 
-    return new Response(copy, {
-      status: 200,
-      headers: {
-        "Content-Type": PGNA_MIME_TYPE,
-        "Content-Disposition": `inline; filename="${filename}"`,
-        "Content-Length": String(copy.byteLength),
-        "Cache-Control": isPublic ? "public, max-age=60" : "private, no-store",
-      },
-    });
+    c.header("Content-Type", PGNA_MIME_TYPE);
+    c.header("Content-Disposition", `inline; filename="${filename}"`);
+    c.header("Content-Length", String(copy.byteLength));
+    c.header("Cache-Control", isPublic ? "public, max-age=60" : "private, no-store");
+    return c.body(copy, 200);
   });
 
   /**
