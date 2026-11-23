@@ -3,6 +3,7 @@ import {
   DEFAULT_RETURN_PAUSE_MS,
   DEFAULT_SILENT_DURATION_MS,
   PGNA_FORMAT_VERSION,
+  PgnaPackError,
   ZIP_METHOD_DEFLATE,
   ZIP_METHOD_STORE,
   compilePgna,
@@ -1183,3 +1184,358 @@ describe("@suite/pgna Phase 3 spec compliance fixes", () => {
     expect(subPlayer.getSnapshot().audioTimeMs).toBe(500);
   });
 });
+
+describe("@suite/pgna FMT-02 archive completeness & subtitle track integrity", () => {
+  it("throws PgnaPackError(MISSING_MEDIA) when a manifest-referenced audio file is omitted", async () => {
+    const manifest = makeBaseManifest({
+      clips: {
+        c1: {
+          id: "c1",
+          path: "audio/c1.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 2500,
+        },
+      },
+    });
+
+    // Omitted audioByPath entirely
+    let caught: unknown;
+    try {
+      await packPgnaArchive({
+        manifest,
+        pgnText: "1. e4 { [%audio c1] [%at #1] } *",
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PgnaPackError);
+    expect((caught as PgnaPackError).name).toBe("PgnaPackError");
+    expect((caught as PgnaPackError).code).toBe("MISSING_MEDIA");
+    expect((caught as PgnaPackError).path).toBe("audio/c1.ogg");
+
+    // Provided audioByPath missing the referenced clip (and does not match Object.prototype keys)
+    await expect(
+      packPgnaArchive({
+        manifest: makeBaseManifest({
+          clips: {
+            c1: {
+              id: "c1",
+              path: "toString",
+              mimeType: "audio/ogg; codecs=opus",
+              durationMs: 1000,
+            },
+          },
+        }),
+        pgnText: "1. e4 { [%audio c1] [%at #1] } *",
+        audioByPath: {},
+      }),
+    ).rejects.toMatchObject({
+      name: "PgnaPackError",
+      code: "MISSING_MEDIA",
+      path: "toString",
+    });
+  });
+
+  it("throws PgnaPackError(MISSING_MEDIA) when a manifest-referenced subtitle file is omitted", async () => {
+    const manifest = makeBaseManifest({
+      defaultSubtitleLang: "en",
+      clips: {
+        c1: {
+          id: "c1",
+          path: "audio/c1.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 2500,
+          subtitles: { en: "subtitles/en/c1.vtt" },
+        },
+      },
+    });
+
+    let caught: unknown;
+    try {
+      await packPgnaArchive({
+        manifest,
+        pgnText: "1. e4 { [%audio c1] [%at #1] } *",
+        audioByPath: { "audio/c1.ogg": new Uint8Array([0x4f, 0x67, 0x67, 0x53]) },
+        subtitlesByPath: {},
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PgnaPackError);
+    expect((caught as PgnaPackError).code).toBe("MISSING_MEDIA");
+    expect((caught as PgnaPackError).path).toBe("subtitles/en/c1.vtt");
+  });
+
+  it("rejects real clip source vs generated merged subtitle collisions with SUBTITLE_PATH_COLLISION", async () => {
+    const manifest = makeBaseManifest({
+      defaultSubtitleLang: "en",
+      clips: {
+        c1: {
+          id: "c1",
+          path: "audio/c1.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 2500,
+          subtitles: { en: "subtitles/en/timeline.vtt" },
+        },
+      },
+    });
+
+    let caught: unknown;
+    try {
+      await packPgnaArchive({
+        manifest,
+        pgnText: "1. e4 { [%audio c1] [%at #1] } *",
+        audioByPath: { "audio/c1.ogg": new Uint8Array([1, 2, 3, 4]) },
+        subtitlesByPath: {
+          "subtitles/en/timeline.vtt": "WEBVTT\n\n00:00.000 --> 00:01.000\nOriginal source caption\n",
+        },
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PgnaPackError);
+    expect((caught as PgnaPackError).code).toBe("SUBTITLE_PATH_COLLISION");
+    expect((caught as PgnaPackError).path).toBe("subtitles/en/timeline.vtt");
+  });
+
+  it("preserves referenced source subtitles matching MERGED_SUBTITLE_PATH_RE when no generated merged track collides", async () => {
+    const unscheduledEnVtt =
+      "WEBVTT\n\n00:00.000 --> 00:01.200\nUnscheduled English source track\n";
+    const unscheduledFrVtt =
+      "WEBVTT\n\n00:00.000 --> 00:01.400\nPiste source française non planifiée\n";
+    const scheduledEnVtt = "WEBVTT\n\n00:00.000 --> 00:01.000\nScheduled English move\n";
+
+    // Case 1: unscheduled clip references subtitles/en/timeline.vtt and no clip is scheduled -> no collision
+    const unscheduledOnlyManifest = makeBaseManifest({
+      clips: {
+        cUnscheduled: {
+          id: "cUnscheduled",
+          path: "audio/unscheduled.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 2000,
+          subtitles: { en: "subtitles/en/timeline.vtt" },
+        },
+      },
+    });
+    const packedUnscheduled = await packPgnaArchive({
+      manifest: unscheduledOnlyManifest,
+      pgnText: "1. e4 { [%at #1] } *",
+      audioByPath: { "audio/unscheduled.ogg": new Uint8Array([10, 20, 30]) },
+      subtitlesByPath: { "subtitles/en/timeline.vtt": unscheduledEnVtt },
+    });
+    expect((await validatePgnaZip(packedUnscheduled.zipBytes)).valid).toBe(true);
+    const unpackedUnscheduled = await unpackPgnaArchive(packedUnscheduled.zipBytes);
+    expect(unpackedUnscheduled.subtitlesByPath["subtitles/en/timeline.vtt"]).toBe(unscheduledEnVtt);
+
+    // Case 2: scheduled clip generates subtitles/en/timeline.vtt, while unscheduled clip references
+    // subtitles/fr/timeline.vtt (distinct language, no collision) -> both survive round-trip & re-pack
+    const mixedLangManifest = makeBaseManifest({
+      defaultSubtitleLang: "en",
+      clips: {
+        c1: {
+          id: "c1",
+          path: "audio/c1.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 2000,
+          subtitles: { en: "subtitles/en/c1.vtt" },
+        },
+        cFr: {
+          id: "cFr",
+          path: "audio/cfr.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 2000,
+          subtitles: { fr: "subtitles/fr/timeline.vtt" },
+        },
+      },
+    });
+
+    const packedMixed = await packPgnaArchive({
+      manifest: mixedLangManifest,
+      pgnText: "1. e4 { [%audio c1] [%at #1] } *",
+      audioByPath: {
+        "audio/c1.ogg": new Uint8Array([1, 2, 3]),
+        "audio/cfr.ogg": new Uint8Array([4, 5, 6]),
+      },
+      subtitlesByPath: {
+        "subtitles/en/c1.vtt": scheduledEnVtt,
+        "subtitles/fr/timeline.vtt": unscheduledFrVtt,
+      },
+    });
+    expect((await validatePgnaZip(packedMixed.zipBytes)).valid).toBe(true);
+
+    const unpackedMixed = await unpackPgnaArchive(packedMixed.zipBytes);
+    expect(unpackedMixed.subtitlesByPath["subtitles/en/c1.vtt"]).toBe(scheduledEnVtt);
+    expect(unpackedMixed.subtitlesByPath["subtitles/fr/timeline.vtt"]).toBe(unscheduledFrVtt);
+    expect(unpackedMixed.subtitlesByPath["subtitles/en/timeline.vtt"]).toBeDefined();
+
+    // Re-pack directly from unpacked data -> referenced subtitles/fr/timeline.vtt MUST still survive
+    const repackedMixed = await packPgnaArchive({
+      manifest: unpackedMixed.manifest,
+      pgnText: unpackedMixed.pgnText,
+      audioByPath: unpackedMixed.audioByPath,
+      subtitlesByPath: unpackedMixed.subtitlesByPath,
+    });
+    expect((await validatePgnaZip(repackedMixed.zipBytes)).valid).toBe(true);
+    const reunpackedMixed = await unpackPgnaArchive(repackedMixed.zipBytes);
+    expect(reunpackedMixed.subtitlesByPath["subtitles/fr/timeline.vtt"]).toBe(unscheduledFrVtt);
+  });
+
+  it("rejects duplicate archive paths and invalid final archives with ARCHIVE_VALIDATION_FAILED", async () => {
+    // manifest.pgnPath colliding with manifest.json
+    await expect(
+      packPgnaArchive({
+        manifest: makeBaseManifest({ pgnPath: "manifest.json" }),
+        pgnText: "1. e4 { [%at #1] } *",
+      }),
+    ).rejects.toMatchObject({
+      name: "PgnaPackError",
+      code: "ARCHIVE_VALIDATION_FAILED",
+      path: "manifest.json",
+    });
+
+    // manifest.timelinePath colliding with manifest.pgnPath
+    await expect(
+      packPgnaArchive({
+        manifest: makeBaseManifest({ pgnPath: "study.pgn", timelinePath: "study.pgn" }),
+        pgnText: "1. e4 { [%at #1] } *",
+      }),
+    ).rejects.toMatchObject({
+      name: "PgnaPackError",
+      code: "ARCHIVE_VALIDATION_FAILED",
+      path: "study.pgn",
+    });
+
+    // PGN references unknown clip ID -> final archive validation fails
+    await expect(
+      packPgnaArchive({
+        manifest: makeBaseManifest(),
+        pgnText: "1. e4 { [%audio missing-clip] [%at #1] } *",
+      }),
+    ).rejects.toMatchObject({
+      name: "PgnaPackError",
+      code: "ARCHIVE_VALIDATION_FAILED",
+    });
+  });
+
+  it("round-trips a narrated study (pack -> validate -> unpack -> edit -> re-pack -> unpack) with byte-exact audio and exact subtitle survival", async () => {
+    const audioBytes1 = new Uint8Array(256);
+    const audioBytes2 = new Uint8Array(128);
+    for (let i = 0; i < audioBytes1.length; i++) audioBytes1[i] = i;
+    for (let i = 0; i < audioBytes2.length; i++) audioBytes2[i] = (255 - i * 2) & 0xff;
+
+    const clip1EnVtt = [
+      "WEBVTT",
+      "",
+      "00:00.000 --> 00:01.200",
+      "White opens with 1. e4, staking a claim in the center.",
+      "",
+      "00:01.300 --> 00:02.400",
+      "Notice the diagonal opened for the light-squared bishop.",
+      "",
+    ].join("\n");
+
+    const clip2EnVtt = [
+      "WEBVTT",
+      "",
+      "00:00.200 --> 00:01.800",
+      "Black replies symmetrically with 1... e5.",
+      "",
+    ].join("\n");
+
+    const clip2EsVtt = [
+      "WEBVTT",
+      "",
+      "00:00.200 --> 00:01.800",
+      "Las negras responden simétricamente con 1... e5.",
+      "",
+    ].join("\n");
+
+    const manifest = makeBaseManifest({
+      title: "Narrated Opening Study",
+      defaultSubtitleLang: "en",
+      clips: {
+        "clip-e4": {
+          id: "clip-e4",
+          path: "audio/clip-e4.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 2500,
+          subtitles: { en: "subtitles/en/clip-e4.vtt" },
+        },
+        "clip-e5": {
+          id: "clip-e5",
+          path: "audio/clip-e5.ogg",
+          mimeType: "audio/ogg; codecs=opus",
+          durationMs: 2000,
+          subtitles: {
+            en: "subtitles/en/clip-e5.vtt",
+            es: "subtitles/es/clip-e5.vtt",
+          },
+        },
+      },
+    });
+
+    const pgnText =
+      "1. e4 { Opening [%audio clip-e4] [%at #1] } 1... e5 { Reply [%audio clip-e5] [%at #2] } *";
+
+    const packed1 = await packPgnaArchive({
+      manifest,
+      pgnText,
+      audioByPath: {
+        "audio/clip-e4.ogg": audioBytes1,
+        "audio/clip-e5.ogg": audioBytes2,
+      },
+      subtitlesByPath: {
+        "subtitles/en/clip-e4.vtt": clip1EnVtt,
+        "subtitles/en/clip-e5.vtt": clip2EnVtt,
+        "subtitles/es/clip-e5.vtt": clip2EsVtt,
+      },
+      compiledAt: "2026-11-23T00:00:00.000Z",
+    });
+
+    expect((await validatePgnaZip(packed1.zipBytes)).valid).toBe(true);
+
+    const unpacked1 = await unpackPgnaArchive(packed1.zipBytes);
+    expect(unpacked1.audioByPath["audio/clip-e4.ogg"]).toEqual(audioBytes1);
+    expect(unpacked1.audioByPath["audio/clip-e5.ogg"]).toEqual(audioBytes2);
+    expect(unpacked1.subtitlesByPath["subtitles/en/clip-e4.vtt"]).toBe(clip1EnVtt);
+    expect(unpacked1.subtitlesByPath["subtitles/en/clip-e5.vtt"]).toBe(clip2EnVtt);
+    expect(unpacked1.subtitlesByPath["subtitles/es/clip-e5.vtt"]).toBe(clip2EsVtt);
+
+    // Edit title & PGN prose, then re-export and re-open
+    const editedManifest: PgnaManifest = {
+      ...unpacked1.manifest,
+      title: "Narrated Opening Study (Edited)",
+    };
+    const editedPgn =
+      "1. e4 { Updated opening [%audio clip-e4] [%at #1] } 1... e5 { Updated reply [%audio clip-e5] [%at #2] } *";
+
+    const packed2 = await packPgnaArchive({
+      manifest: editedManifest,
+      pgnText: editedPgn,
+      audioByPath: unpacked1.audioByPath,
+      subtitlesByPath: unpacked1.subtitlesByPath,
+      compiledAt: "2026-11-23T01:00:00.000Z",
+    });
+
+    expect((await validatePgnaZip(packed2.zipBytes)).valid).toBe(true);
+
+    const unpacked2 = await unpackPgnaArchive(packed2.zipBytes);
+    expect(unpacked2.manifest.title).toBe("Narrated Opening Study (Edited)");
+    expect(unpacked2.pgnText).toBe(editedPgn);
+    expect(unpacked2.audioByPath["audio/clip-e4.ogg"]).toEqual(audioBytes1);
+    expect(unpacked2.audioByPath["audio/clip-e5.ogg"]).toEqual(audioBytes2);
+    expect(unpacked2.subtitlesByPath["subtitles/en/clip-e4.vtt"]).toBe(clip1EnVtt);
+    expect(unpacked2.subtitlesByPath["subtitles/en/clip-e5.vtt"]).toBe(clip2EnVtt);
+    expect(unpacked2.subtitlesByPath["subtitles/es/clip-e5.vtt"]).toBe(clip2EsVtt);
+    expect(parseWebVtt(unpacked2.subtitlesByPath["subtitles/en/timeline.vtt"]!)).toEqual([
+      { startMs: 0, endMs: 1200, text: "White opens with 1. e4, staking a claim in the center." },
+      {
+        startMs: 1300,
+        endMs: 2400,
+        text: "Notice the diagonal opened for the light-squared bishop.",
+      },
+      { startMs: 2700, endMs: 4300, text: "Black replies symmetrically with 1... e5." },
+    ]);
+  });
+});
+

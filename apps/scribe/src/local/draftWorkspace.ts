@@ -3,6 +3,7 @@ import {
   DEFAULT_RETURN_PAUSE_MS,
   DEFAULT_SILENT_DURATION_MS,
   PGNA_FORMAT_VERSION,
+  type ClipDefinition,
   type PgnaManifest,
 } from "@suite/pgna";
 
@@ -15,6 +16,84 @@ export interface ScribeDraft {
   /** Map of archive subtitle path -> WebVTT text. */
   subtitlesByPath: Record<string, string>;
   updatedAt: string;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Normalizes persisted or imported ScribeDraft records so legacy drafts (such as silent
+ * PGNA v1.0 manifests with an omitted `clips` dictionary) load safely, while returning
+ * `null` for genuinely corrupt entries.
+ */
+export function normalizeScribeDraft(raw: unknown): ScribeDraft | null {
+  if (!isPlainRecord(raw)) {
+    return null;
+  }
+
+  const rawId = raw["id"];
+  const rawManifest = raw["manifest"];
+  const rawPgnText = raw["pgnText"];
+
+  if (typeof rawId !== "string" || rawId.trim().length === 0) {
+    return null;
+  }
+  if (!isPlainRecord(rawManifest)) {
+    return null;
+  }
+  if (typeof rawPgnText !== "string") {
+    return null;
+  }
+
+  const rawClips = rawManifest["clips"];
+  const clips: Record<string, ClipDefinition> = isPlainRecord(rawClips)
+    ? ({ ...rawClips } as Record<string, ClipDefinition>)
+    : {};
+
+  const manifest: PgnaManifest = {
+    ...(rawManifest as Partial<PgnaManifest>),
+    format: "pgna",
+    version: PGNA_FORMAT_VERSION,
+    pgnPath:
+      typeof rawManifest["pgnPath"] === "string" && rawManifest["pgnPath"].length > 0
+        ? rawManifest["pgnPath"]
+        : "study.pgn",
+    timelinePath:
+      typeof rawManifest["timelinePath"] === "string" && rawManifest["timelinePath"].length > 0
+        ? rawManifest["timelinePath"]
+        : "timeline.json",
+    clips,
+  };
+
+  if (manifest.title !== undefined && typeof manifest.title !== "string") {
+    delete manifest.title;
+  }
+
+  const rawAudioByPath = raw["audioByPath"];
+  const audioByPath: Record<string, Uint8Array> = isPlainRecord(rawAudioByPath)
+    ? ({ ...rawAudioByPath } as Record<string, Uint8Array>)
+    : {};
+
+  const rawSubtitlesByPath = raw["subtitlesByPath"];
+  const subtitlesByPath: Record<string, string> = isPlainRecord(rawSubtitlesByPath)
+    ? ({ ...rawSubtitlesByPath } as Record<string, string>)
+    : {};
+
+  const rawUpdatedAt = raw["updatedAt"];
+  const updatedAt =
+    typeof rawUpdatedAt === "string" && rawUpdatedAt.length > 0
+      ? rawUpdatedAt
+      : new Date().toISOString();
+
+  return {
+    id: rawId,
+    manifest,
+    pgnText: rawPgnText,
+    audioByPath,
+    subtitlesByPath,
+    updatedAt,
+  };
 }
 
 /**

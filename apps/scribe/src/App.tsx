@@ -3,9 +3,8 @@ import type { BoardAnnotationColor, PromotionPiece } from "@suite/board-ui";
 import { parsePgnGames, serializePgnGames, type PgnGameDocument } from "@suite/chess-core";
 import {
   PGNA_MIME_TYPE,
+  PgnaPackError,
   compilePgna,
-  isValidSubtitleLang,
-  packPgnaArchive,
   unpackPgnaArchive,
   validatePgnaPackage,
   type BoardOrientation,
@@ -25,6 +24,7 @@ import { TimelineDock } from "./components/TimelineDock";
 import { decodeAudioMetadataBatch } from "./local/audioStudio";
 import {
   deleteLocalDraft,
+  getDraftStorageMode,
   listLocalDrafts,
   loadLocalDraft,
   saveLocalDraft,
@@ -55,6 +55,17 @@ import {
   updateAtTagDuration,
   updateNodeTags,
 } from "./local/studyTree";
+import {
+  applyAudioClipAttachment,
+  applySubtitleUpdate,
+  buildImportedPgnaDraft,
+  buildValidatedPgnaArchive,
+  createWorkspaceController,
+  formatPgnaExportError,
+  formatSaveStatus,
+  type AudioClipAttachmentTemplate,
+  type WorkspaceController,
+} from "./local/workspaceTransitions";
 import { PublishModal } from "./publish/PublishModal";
 
 const MAX_PGNA_IMPORT_BYTES = 50 * 1024 * 1024; // 50 MB
@@ -141,21 +152,70 @@ export function App() {
   const [showPublishModal, setShowPublishModal] = useState(false);
   const [sessionUser, setSessionUser] = useState<KibitzSessionUser | null>(null);
   const [draftList, setDraftList] = useState<DraftSummary[]>([]);
-  const [saveStatus, setSaveStatus] = useState("Local-only · Ready");
+  const [saveStatus, setSaveStatus] = useState(() => formatSaveStatus("idle-demo"));
   const [statusBanner, setStatusBanner] = useState<{
     kind: "info" | "error";
     text: string;
   } | null>(null);
   const [waveformPeaksByClipId, setWaveformPeaksByClipId] = useState<Record<string, number[]>>({});
 
-  // Dirty flag prevents startup auto-save from overwriting previously edited drafts in IndexedDB
-  const isDirtyRef = useRef(false);
-  const activeDraftIdRef = useRef(draft.id);
+  // Always-fresh draft reference + unified workspace persistence/transition controller
+  const draftRef = useRef<ScribeDraft>(draft);
   const waveformDecodeTokenRef = useRef(0);
+  const refreshDraftListRef = useRef<() => Promise<void>>(async () => undefined);
+  const workspaceControllerRef = useRef<WorkspaceController | null>(null);
+
+  const getWorkspaceController = useCallback((): WorkspaceController => {
+    if (!workspaceControllerRef.current) {
+      workspaceControllerRef.current = createWorkspaceController({
+        getDraft: () => draftRef.current,
+        setDraft: (nextDraft) => {
+          draftRef.current = nextDraft;
+          setDraft(nextDraft);
+        },
+        saveDraft: saveLocalDraft,
+        getStorageMode: getDraftStorageMode,
+        debounceMs: 500,
+        onSaveStatus: setSaveStatus,
+        onAfterSave: () => refreshDraftListRef.current(),
+        onSaveError: (err) => {
+          setStatusBanner({
+            kind: "error",
+            text: `Local save failed (${err instanceof Error ? err.message : String(err)}). Your study is still open — export a .pgna archive to keep your changes.`,
+          });
+        },
+      });
+    }
+    return workspaceControllerRef.current;
+  }, []);
 
   useEffect(() => {
-    activeDraftIdRef.current = draft.id;
-  }, [draft.id]);
+    draftRef.current = draft;
+  }, [draft]);
+
+  useEffect(() => {
+    return () => {
+      workspaceControllerRef.current?.dispose();
+      workspaceControllerRef.current = null;
+    };
+  }, []);
+
+  // Centralized draft mutation helper: keeps draftRef synchronously updated for flush & concurrent edits
+  const applyDraftUpdate = useCallback(
+    (updater: (prev: ScribeDraft) => ScribeDraft | null, options?: { markDirty?: boolean }) => {
+      const next = updater(draftRef.current);
+      if (!next || next === draftRef.current) {
+        return null;
+      }
+      draftRef.current = next;
+      setDraft(next);
+      if (options?.markDirty !== false) {
+        getWorkspaceController().markDirty();
+      }
+      return next;
+    },
+    [getWorkspaceController],
+  );
 
   // Fetch active cross-service Kibitz ID session (non-blocking; authoring works offline/signed out)
   useEffect(() => {
@@ -171,21 +231,27 @@ export function App() {
     };
   }, []);
 
-  const handleSessionChange = useCallback((nextUser: KibitzSessionUser | null) => {
-    setSessionUser(nextUser);
-    if (nextUser) {
-      setDraft((prev) => {
-        if ((prev.manifest.author ?? "").trim() !== "") return prev;
-        return {
-          ...prev,
-          manifest: {
-            ...prev.manifest,
-            author: `@${nextUser.handle}`,
+  const handleSessionChange = useCallback(
+    (nextUser: KibitzSessionUser | null) => {
+      setSessionUser(nextUser);
+      if (nextUser) {
+        applyDraftUpdate(
+          (prev) => {
+            if ((prev.manifest.author ?? "").trim() !== "") return prev;
+            return {
+              ...prev,
+              manifest: {
+                ...prev.manifest,
+                author: `@${nextUser.handle}`,
+              },
+            };
           },
-        };
-      });
-    }
-  }, []);
+          { markDirty: false },
+        );
+      }
+    },
+    [applyDraftUpdate],
+  );
 
   // Helper to batch-decode waveform peaks for a draft with stale-draft cancellation
   const decodeWaveformsForDraft = useCallback(async (targetDraft: ScribeDraft) => {
@@ -198,13 +264,13 @@ export function App() {
       }
     }
     if (items.length === 0) {
-      if (waveformDecodeTokenRef.current === token && activeDraftIdRef.current === targetDraft.id) {
+      if (waveformDecodeTokenRef.current === token && draftRef.current.id === targetDraft.id) {
         setWaveformPeaksByClipId({});
       }
       return;
     }
     const decoded = await decodeAudioMetadataBatch(items);
-    if (waveformDecodeTokenRef.current !== token || activeDraftIdRef.current !== targetDraft.id) {
+    if (waveformDecodeTokenRef.current !== token || draftRef.current.id !== targetDraft.id) {
       return;
     }
     const peakEntries: Record<string, number[]> = {};
@@ -263,22 +329,31 @@ export function App() {
     }
   }, []);
 
+  useEffect(() => {
+    refreshDraftListRef.current = refreshDraftList;
+  }, [refreshDraftList]);
+
   // On startup, list saved drafts and auto-open the most recently edited local draft if present
   useEffect(() => {
     let cancelled = false;
+    const controller = getWorkspaceController();
+    const startupGen = controller.getGeneration();
     void listLocalDrafts()
       .then(async (items) => {
         if (cancelled) return;
         setDraftList(items);
-        if (items.length > 0 && !isDirtyRef.current) {
+        if (items.length > 0 && !controller.isDirty() && controller.getGeneration() === startupGen) {
           const mostRecent = await loadLocalDraft(items[0]!.id);
-          if (!cancelled && mostRecent && !isDirtyRef.current) {
-            isDirtyRef.current = false;
-            activeDraftIdRef.current = mostRecent.id;
-            setDraft(mostRecent);
-            setSelectedNodeId("g0");
-            setSaveStatus("Loaded saved draft (IndexedDB)");
-            void decodeWaveformsForDraft(mostRecent);
+          if (!cancelled && mostRecent) {
+            const committed = controller.commitIfGenerationMatches(startupGen, {
+              draft: mostRecent,
+              dirty: false,
+            });
+            if (committed) {
+              setSelectedNodeId("g0");
+              setWaveformPeaksByClipId({});
+              void decodeWaveformsForDraft(mostRecent);
+            }
           }
         }
       })
@@ -286,23 +361,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [decodeWaveformsForDraft]);
-
-  // Debounced IndexedDB auto-save (only after user mutations)
-  useEffect(() => {
-    if (!isDirtyRef.current) return;
-    const timer = window.setTimeout(() => {
-      void saveLocalDraft(draft)
-        .then(() => {
-          setSaveStatus("Saved locally (IndexedDB)");
-          void refreshDraftList();
-        })
-        .catch(() => {
-          setSaveStatus("Local session (unsaved)");
-        });
-    }, 500);
-    return () => clearTimeout(timer);
-  }, [draft, refreshDraftList]);
+  }, [decodeWaveformsForDraft, getWorkspaceController]);
 
   // Commit updated games AST back into serialized PGN text
   const commitGames = useCallback(
@@ -313,8 +372,7 @@ export function App() {
     ) => {
       const nextPgn = serializePgnGames(nextGames);
       const now = new Date().toISOString();
-      isDirtyRef.current = true;
-      setDraft((prev) => {
+      applyDraftUpdate((prev) => {
         if (options?.pruneOrphans) {
           const pruned = pruneUnreferencedClipAssets(prev, nextGames);
           return {
@@ -337,7 +395,7 @@ export function App() {
         setSelectedNodeId(nextNodeId);
       }
     },
-    [],
+    [applyDraftUpdate],
   );
 
   // Navigation helpers
@@ -492,78 +550,56 @@ export function App() {
     commitGames(reorderTimelineEntries(games, compiled.timeline.entries, fromIndex, toIndex));
   };
 
-  // Audio clip & subtitle mutations (enforcing max 1 clip per node)
-  const handleAttachAudioClip = (
-    nodeId: NodeId,
-    clip: ClipDefinition,
-    bytes: Uint8Array,
-    peaks: number[],
-  ) => {
-    const existingNode = studyIndex.nodesById[nodeId];
-    const shouldAutoSchedule = (existingNode?.tags.atTags.length ?? 0) === 0;
-
-    let nextGames = updateNodeTags(games, nodeId, (prev) => ({
-      ...prev,
-      audioClipId: clip.id,
-      // Clear any stale silent [%dur] so attaching audio never leaves an IGNORED_DUR_TAG warning
-      durMs: null,
-    }));
-    if (shouldAutoSchedule) {
-      nextGames = appendNodeToTimeline(nextGames, nodeId, undefined, { nextTimestampMs });
-    }
-    const nextPgn = serializePgnGames(nextGames);
-    const now = new Date().toISOString();
-
-    isDirtyRef.current = true;
-    setWaveformPeaksByClipId((prev) => ({ ...prev, [clip.id]: peaks }));
-    setDraft((prev) => {
-      const nextAudioByPath = { ...prev.audioByPath, [clip.path]: bytes };
-      const oldClip = prev.manifest.clips[clip.id];
-      if (oldClip && oldClip.path !== clip.path) {
-        const pathStillUsedByOtherClip = Object.entries(prev.manifest.clips).some(
-          ([otherId, otherClip]) => otherId !== clip.id && otherClip.path === oldClip.path,
-        );
-        if (!pathStillUsedByOtherClip) {
-          delete nextAudioByPath[oldClip.path];
-        }
+  // Audio clip & subtitle mutations (draft-identity guarded & applied against live state)
+  const handleAttachAudioClip = useCallback(
+    (params: {
+      targetDraftId: string;
+      nodeId: NodeId;
+      requestedClipId: string | null;
+      clipTemplate: AudioClipAttachmentTemplate;
+      bytes: Uint8Array;
+      peaks: number[];
+    }) => {
+      const applied = applyAudioClipAttachment(draftRef.current, {
+        targetDraftId: params.targetDraftId,
+        nodeId: params.nodeId,
+        requestedClipId: params.requestedClipId,
+        clipTemplate: params.clipTemplate,
+        bytes: params.bytes,
+      });
+      if (!applied) {
+        return;
       }
-      return {
-        ...prev,
-        pgnText: nextPgn,
-        manifest: {
-          ...prev.manifest,
-          updatedAt: now,
-          clips: {
-            ...prev.manifest.clips,
-            [clip.id]: clip,
-          },
-        },
-        audioByPath: nextAudioByPath,
-        updatedAt: now,
-      };
-    });
-  };
+      draftRef.current = applied.draft;
+      setDraft(applied.draft);
+      setWaveformPeaksByClipId((prev) => ({ ...prev, [applied.clipId]: params.peaks }));
+      getWorkspaceController().markDirty();
+    },
+    [getWorkspaceController],
+  );
 
-  const handleUpdateClip = (clipId: string, updater: (prev: ClipDefinition) => ClipDefinition) => {
-    isDirtyRef.current = true;
-    const now = new Date().toISOString();
-    setDraft((prev) => {
-      const existing = prev.manifest.clips[clipId];
-      if (!existing) return prev;
-      return {
-        ...prev,
-        manifest: {
-          ...prev.manifest,
-          updatedAt: now,
-          clips: {
-            ...prev.manifest.clips,
-            [clipId]: updater(existing),
+  const handleUpdateClip = useCallback(
+    (clipId: string, updater: (prev: ClipDefinition) => ClipDefinition) => {
+      const now = new Date().toISOString();
+      applyDraftUpdate((prev) => {
+        const existing = prev.manifest.clips[clipId];
+        if (!existing) return prev;
+        return {
+          ...prev,
+          manifest: {
+            ...prev.manifest,
+            updatedAt: now,
+            clips: {
+              ...prev.manifest.clips,
+              [clipId]: updater(existing),
+            },
           },
-        },
-        updatedAt: now,
-      };
-    });
-  };
+          updatedAt: now,
+        };
+      });
+    },
+    [applyDraftUpdate],
+  );
 
   const handleDetachAudioClip = (nodeId: NodeId) => {
     const node = studyIndex.nodesById[nodeId];
@@ -583,8 +619,7 @@ export function App() {
         (n) => n.nodeId !== nodeId && n.tags.audioClipId === clipId,
       );
 
-    isDirtyRef.current = true;
-    setDraft((prev) => {
+    applyDraftUpdate((prev) => {
       const nextClips = { ...prev.manifest.clips };
       const nextAudioByPath = { ...prev.audioByPath };
       const nextSubtitlesByPath = { ...prev.subtitlesByPath };
@@ -626,56 +661,31 @@ export function App() {
     });
   };
 
-  const handleUpdateSubtitle = (clipId: string, lang: string, vttText: string) => {
-    const trimmedLang = lang.trim();
-    if (!isValidSubtitleLang(trimmedLang)) {
-      return;
-    }
-    const subPath = `subtitles/${trimmedLang}/${clipId}.vtt`;
-    const now = new Date().toISOString();
-    isDirtyRef.current = true;
-    setDraft((prev) => {
-      const clip = prev.manifest.clips[clipId];
-      if (!clip) return prev;
-      const nextSubtitles = { ...(clip.subtitles ?? {}) };
-      const nextSubByPath = { ...prev.subtitlesByPath };
-      if (vttText.trim() === "") {
-        delete nextSubtitles[trimmedLang];
-        delete nextSubByPath[subPath];
-      } else {
-        nextSubtitles[trimmedLang] = subPath;
-        nextSubByPath[subPath] = vttText;
-      }
-      return {
-        ...prev,
-        manifest: {
-          ...prev.manifest,
-          updatedAt: now,
-          clips: {
-            ...prev.manifest.clips,
-            [clipId]: {
-              ...clip,
-              ...(Object.keys(nextSubtitles).length > 0
-                ? { subtitles: nextSubtitles }
-                : { subtitles: undefined }),
-            },
-          },
-        },
-        subtitlesByPath: nextSubByPath,
-        updatedAt: now,
-      };
-    });
-  };
+  const handleUpdateSubtitle = useCallback(
+    (clipId: string, lang: string, vttText: string, targetDraftId?: string) => {
+      applyDraftUpdate((prev) =>
+        applySubtitleUpdate(prev, {
+          targetDraftId: targetDraftId ?? prev.id,
+          clipId,
+          lang,
+          vttText,
+        }),
+      );
+    },
+    [applyDraftUpdate],
+  );
 
-  const handleUpdateManifest = (updater: (prev: PgnaManifest) => PgnaManifest) => {
-    const now = new Date().toISOString();
-    isDirtyRef.current = true;
-    setDraft((prev) => ({
-      ...prev,
-      manifest: { ...updater(prev.manifest), updatedAt: now },
-      updatedAt: now,
-    }));
-  };
+  const handleUpdateManifest = useCallback(
+    (updater: (prev: PgnaManifest) => PgnaManifest) => {
+      const now = new Date().toISOString();
+      applyDraftUpdate((prev) => ({
+        ...prev,
+        manifest: { ...updater(prev.manifest), updatedAt: now },
+        updatedAt: now,
+      }));
+    },
+    [applyDraftUpdate],
+  );
 
   // Multi-game chapter mutations
   const handleAddGame = (
@@ -700,69 +710,93 @@ export function App() {
     commitGames(res.games, res.fallbackNodeId, { pruneOrphans: true });
   };
 
-  // Import .pgna or .pgn
+  // Import .pgna or .pgn (routed through unified flush + generation-guarded workspace transition)
   const handleImportFile = async (file: File) => {
     setStatusBanner(null);
+    const isPgna = file.name.toLowerCase().endsWith(".pgna");
+    if (isPgna && file.size > MAX_PGNA_IMPORT_BYTES) {
+      setStatusBanner({
+        kind: "error",
+        text: `Import failed: "${file.name}" exceeds the 50 MB .pgna import limit.`,
+      });
+      return;
+    }
+    if (!isPgna && file.size > MAX_PGN_IMPORT_BYTES) {
+      setStatusBanner({
+        kind: "error",
+        text: `Import failed: "${file.name}" exceeds the 5 MB .pgn import limit.`,
+      });
+      return;
+    }
+
+    type ImportMeta =
+      | {
+          kind: "pgna";
+          clipCount: number;
+          importErrors: Array<{ code: string; message: string }>;
+          importWarningsCount: number;
+        }
+      | { kind: "pgn" };
+
     try {
-      if (file.name.toLowerCase().endsWith(".pgna")) {
-        if (file.size > MAX_PGNA_IMPORT_BYTES) {
-          setStatusBanner({
-            kind: "error",
-            text: `Import failed: "${file.name}" exceeds the 50 MB .pgna import limit.`,
-          });
-          return;
-        }
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        const unpacked = await unpackPgnaArchive(bytes);
-        const validation = validatePgnaPackage(unpacked.entries);
-        const importErrors = validation.diagnostics.filter((d) => d.severity === "error");
-        const importWarnings = validation.diagnostics.filter((d) => d.severity === "warning");
-
-        // Strip compiler-generated merged timeline.vtt entries so re-export never duplicates them
-        const referencedSubPaths = new Set<string>();
-        for (const clip of Object.values(unpacked.manifest.clips ?? {})) {
-          for (const sp of Object.values(clip.subtitles ?? {})) {
-            referencedSubPaths.add(sp);
+      const transition = await getWorkspaceController().transitionWorkspace<ImportMeta>(
+        async () => {
+          if (isPgna) {
+            const bytes = new Uint8Array(await file.arrayBuffer());
+            const unpacked = await unpackPgnaArchive(bytes);
+            const validation = validatePgnaPackage(unpacked.entries);
+            const importErrors = validation.diagnostics
+              .filter((d) => d.severity === "error")
+              .map((d) => ({ code: d.code, message: d.message }));
+            const importWarningsCount = validation.diagnostics.filter(
+              (d) => d.severity === "warning",
+            ).length;
+            const importedDraft = buildImportedPgnaDraft(unpacked);
+            const clipCount = Object.keys(importedDraft.manifest.clips).length;
+            return {
+              draft: importedDraft,
+              dirty: true,
+              meta: { kind: "pgna", clipCount, importErrors, importWarningsCount },
+            };
           }
-        }
-        const mergedSubPaths = new Set<string>(
-          Object.values(unpacked.timeline.mergedSubtitles ?? {}),
-        );
-        const perClipSubtitles: Record<string, string> = {};
-        for (const [subPath, vtt] of Object.entries(unpacked.subtitlesByPath)) {
-          if (
-            referencedSubPaths.has(subPath) ||
-            (!mergedSubPaths.has(subPath) && !/^subtitles\/[^/]+\/timeline\.vtt$/.test(subPath))
-          ) {
-            perClipSubtitles[subPath] = vtt;
-          }
-        }
 
-        const importedDraft: ScribeDraft = {
-          id: createDraftId(),
-          manifest: unpacked.manifest,
-          pgnText: unpacked.pgnText,
-          audioByPath: unpacked.audioByPath,
-          subtitlesByPath: perClipSubtitles,
-          updatedAt: new Date().toISOString(),
-        };
-        isDirtyRef.current = true;
-        activeDraftIdRef.current = importedDraft.id;
-        setDraft(importedDraft);
-        setSelectedNodeId("g0");
-        setWaveformPeaksByClipId({});
+          const pgnText = await file.text();
+          const title = file.name.replace(/\.pgn$/i, "") || "Imported PGN Study";
+          const importedDraft: ScribeDraft = {
+            id: createDraftId(),
+            manifest: createLocalDraftManifest(title),
+            pgnText,
+            audioByPath: {},
+            subtitlesByPath: {},
+            updatedAt: new Date().toISOString(),
+          };
+          return {
+            draft: importedDraft,
+            dirty: true,
+            meta: { kind: "pgn" },
+          };
+        },
+      );
 
-        const clipCount = Object.keys(unpacked.manifest.clips ?? {}).length;
+      if (transition.status !== "committed") {
+        return;
+      }
+
+      setSelectedNodeId("g0");
+      setWaveformPeaksByClipId({});
+
+      if (transition.meta?.kind === "pgna") {
+        const { clipCount, importErrors, importWarningsCount } = transition.meta;
         if (importErrors.length > 0) {
           setShowDiagnostics(true);
           setStatusBanner({
             kind: "error",
             text: `Imported "${file.name}" (${clipCount} audio clips) with ${importErrors.length} validation error(s): ${importErrors[0]?.code ?? "INVALID"} — ${importErrors[0]?.message ?? ""}`,
           });
-        } else if (importWarnings.length > 0) {
+        } else if (importWarningsCount > 0) {
           setStatusBanner({
             kind: "info",
-            text: `Imported PGNA archive "${file.name}" (${clipCount} audio clips, ${importWarnings.length} warning(s)).`,
+            text: `Imported PGNA archive "${file.name}" (${clipCount} audio clips, ${importWarningsCount} warning(s)).`,
           });
         } else {
           setStatusBanner({
@@ -770,32 +804,9 @@ export function App() {
             text: `Imported valid PGNA archive "${file.name}" (${clipCount} audio clips).`,
           });
         }
-
-        void decodeWaveformsForDraft(importedDraft);
+        void decodeWaveformsForDraft(transition.draft);
       } else {
-        if (file.size > MAX_PGN_IMPORT_BYTES) {
-          setStatusBanner({
-            kind: "error",
-            text: `Import failed: "${file.name}" exceeds the 5 MB .pgn import limit.`,
-          });
-          return;
-        }
-        const pgnText = await file.text();
-        const title = file.name.replace(/\.pgn$/i, "") || "Imported PGN Study";
-        const importedDraft: ScribeDraft = {
-          id: createDraftId(),
-          manifest: createLocalDraftManifest(title),
-          pgnText,
-          audioByPath: {},
-          subtitlesByPath: {},
-          updatedAt: new Date().toISOString(),
-        };
-        isDirtyRef.current = true;
-        activeDraftIdRef.current = importedDraft.id;
         waveformDecodeTokenRef.current++;
-        setDraft(importedDraft);
-        setSelectedNodeId("g0");
-        setWaveformPeaksByClipId({});
         setStatusBanner({
           kind: "info",
           text: `Imported PGN "${file.name}".`,
@@ -809,15 +820,9 @@ export function App() {
     }
   };
 
-  // Build validated .pgna ZIP bytes
+  // Build validated .pgna ZIP bytes (FMT-02: throws PgnaPackError on missing media or validation failure)
   const buildArchiveBytes = async (): Promise<Uint8Array> => {
-    const packed = await packPgnaArchive({
-      manifest: draft.manifest,
-      pgnText: draft.pgnText,
-      audioByPath: draft.audioByPath,
-      subtitlesByPath: draft.subtitlesByPath,
-    });
-    return packed.zipBytes;
+    return buildValidatedPgnaArchive(draftRef.current);
   };
 
   const handleExportPgna = async () => {
@@ -830,68 +835,77 @@ export function App() {
       });
       return;
     }
+    const exportDraft = draftRef.current;
     try {
-      const zipBytes = await buildArchiveBytes();
+      const zipBytes = await buildValidatedPgnaArchive(exportDraft);
       const copy = new Uint8Array(zipBytes.byteLength);
       copy.set(zipBytes);
       triggerBrowserDownload(
         new Blob([copy], { type: PGNA_MIME_TYPE }),
-        `${slugifyFilename(draft.manifest.title || "study")}.pgna`,
+        `${slugifyFilename(exportDraft.manifest.title || "study")}.pgna`,
       );
       setStatusBanner({
         kind: "info",
         text: `Exported valid PGNA v1.0 archive (${(zipBytes.byteLength / 1024).toFixed(1)} KB).`,
       });
     } catch (err) {
+      if (err instanceof PgnaPackError) {
+        setShowDiagnostics(true);
+      }
       setStatusBanner({
         kind: "error",
-        text: `Export failed: ${err instanceof Error ? err.message : String(err)}`,
+        text: formatPgnaExportError(err),
       });
     }
   };
 
   const handleExportPgn = () => {
+    const current = draftRef.current;
     triggerBrowserDownload(
-      new Blob([draft.pgnText], { type: "application/x-chess-pgn" }),
-      `${slugifyFilename(draft.manifest.title || "study")}.pgn`,
+      new Blob([current.pgnText], { type: "application/x-chess-pgn" }),
+      `${slugifyFilename(current.manifest.title || "study")}.pgn`,
     );
   };
 
-  // Draft management
-  const handleCreateBlankDraft = () => {
-    const blank = createBlankDraft("Untitled PGNA Study");
-    if (sessionUser) {
-      blank.manifest.author = `@${sessionUser.handle}`;
+  // Draft management (all routed through unified flush-before-switch + monotonic generation)
+  const handleCreateBlankDraft = async () => {
+    const res = await getWorkspaceController().transitionWorkspace(() => {
+      const blank = createBlankDraft("Untitled PGNA Study");
+      if (sessionUser) {
+        blank.manifest.author = `@${sessionUser.handle}`;
+      }
+      return { draft: blank, dirty: true };
+    });
+    if (res.status === "committed") {
+      waveformDecodeTokenRef.current++;
+      setSelectedNodeId("g0");
+      setWaveformPeaksByClipId({});
     }
-    isDirtyRef.current = true;
-    activeDraftIdRef.current = blank.id;
-    waveformDecodeTokenRef.current++;
-    setDraft(blank);
-    setSelectedNodeId("g0");
-    setWaveformPeaksByClipId({});
   };
 
-  const handleLoadDemo = () => {
-    const demo = createDemoItalianDraft();
-    isDirtyRef.current = false;
-    activeDraftIdRef.current = demo.id;
-    waveformDecodeTokenRef.current++;
-    setDraft(demo);
-    setSelectedNodeId("g0");
-    setWaveformPeaksByClipId({});
-    setSaveStatus("Demo loaded · Edit to save");
+  const handleLoadDemo = async () => {
+    const res = await getWorkspaceController().transitionWorkspace(() => ({
+      draft: createDemoItalianDraft(),
+      dirty: false,
+      saveStatusState: "idle-demo",
+    }));
+    if (res.status === "committed") {
+      waveformDecodeTokenRef.current++;
+      setSelectedNodeId("g0");
+      setWaveformPeaksByClipId({});
+    }
   };
 
   const handleOpenDraft = async (id: string) => {
-    const loaded = await loadLocalDraft(id);
-    if (loaded) {
-      isDirtyRef.current = false;
-      activeDraftIdRef.current = loaded.id;
-      setDraft(loaded);
+    const res = await getWorkspaceController().transitionWorkspace(async () => {
+      const loaded = await loadLocalDraft(id);
+      if (!loaded) return null;
+      return { draft: loaded, dirty: false };
+    });
+    if (res.status === "committed") {
       setSelectedNodeId("g0");
       setWaveformPeaksByClipId({});
-      setSaveStatus("Loaded saved draft (IndexedDB)");
-      void decodeWaveformsForDraft(loaded);
+      void decodeWaveformsForDraft(res.draft);
     }
   };
 
@@ -989,6 +1003,7 @@ export function App() {
                 />
 
                 <NodeInspector
+                  draftId={draft.id}
                   node={activeNode}
                   gameOrientation={activeGameOrientation}
                   studyIndex={studyIndex}
@@ -1009,8 +1024,7 @@ export function App() {
                   onUpdateManifest={handleUpdateManifest}
                   onApplyRawPgn={(nextPgn) => {
                     const now = new Date().toISOString();
-                    isDirtyRef.current = true;
-                    setDraft((prev) => ({
+                    applyDraftUpdate((prev) => ({
                       ...prev,
                       pgnText: nextPgn,
                       manifest: { ...prev.manifest, updatedAt: now },
@@ -1050,8 +1064,8 @@ export function App() {
         activeDraftId={draft.id}
         drafts={draftList}
         onClose={() => setShowDraftsModal(false)}
-        onCreateBlank={handleCreateBlankDraft}
-        onLoadDemo={handleLoadDemo}
+        onCreateBlank={() => void handleCreateBlankDraft()}
+        onLoadDemo={() => void handleLoadDemo()}
         onOpenDraft={(id) => void handleOpenDraft(id)}
         onDeleteDraft={(id) => void handleDeleteDraft(id)}
       />

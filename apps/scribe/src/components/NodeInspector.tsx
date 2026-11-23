@@ -18,16 +18,27 @@ import {
 } from "@suite/pgna";
 import {
   decodeAudioMetadata,
-  generateClipId,
   guessAudioExtension,
-  startMicRecording,
   type ActiveRecordingSession,
 } from "../local/audioStudio";
 import type { IndexedStudyNode, StudyIndex } from "../local/studyTree";
+import {
+  createRawPgnBuffer,
+  deriveRawPgnView,
+  editRawPgnBuffer,
+  runCancelMicRecording,
+  runStartMicRecording,
+  runStopMicRecording,
+  type AudioClipAttachmentTemplate,
+  type MicRecordingStateAdapter,
+  type MicRecordingTarget,
+  type RawPgnBufferState,
+} from "../local/workspaceTransitions";
 
 export type InspectorTab = "move" | "audio" | "guess" | "study";
 
 export interface NodeInspectorProps {
+  draftId: string;
   node: IndexedStudyNode;
   gameOrientation: BoardOrientation;
   studyIndex: StudyIndex;
@@ -41,15 +52,22 @@ export interface NodeInspectorProps {
   onScheduleNode: (nodeId: NodeId, durMs?: number) => void;
   onRemoveAtTag: (nodeId: NodeId, atIndex: number) => void;
   onUpdateAtTagDuration: (nodeId: NodeId, atIndex: number, durMs: number | undefined) => void;
-  onAttachAudioClip: (
-    nodeId: NodeId,
-    clip: ClipDefinition,
-    bytes: Uint8Array,
-    peaks: number[],
-  ) => void;
+  onAttachAudioClip: (params: {
+    targetDraftId: string;
+    nodeId: NodeId;
+    requestedClipId: string | null;
+    clipTemplate: AudioClipAttachmentTemplate;
+    bytes: Uint8Array;
+    peaks: number[];
+  }) => void;
   onUpdateClip: (clipId: string, updater: (prev: ClipDefinition) => ClipDefinition) => void;
   onDetachAudioClip: (nodeId: NodeId) => void;
-  onUpdateSubtitle: (clipId: string, lang: string, vttText: string) => void;
+  onUpdateSubtitle: (
+    clipId: string,
+    lang: string,
+    vttText: string,
+    targetDraftId?: string,
+  ) => void;
   onUpdateManifest: (updater: (prev: PgnaManifest) => PgnaManifest) => void;
   onApplyRawPgn: (nextPgnText: string) => void;
   waveformPeaksByClipId: Record<string, number[]>;
@@ -65,6 +83,7 @@ const NAG_BUTTONS = [
 ] as const;
 
 export function NodeInspector({
+  draftId,
   node,
   gameOrientation,
   studyIndex,
@@ -88,20 +107,20 @@ export function NodeInspector({
 }: NodeInspectorProps) {
   const [activeTab, setActiveTab] = useState<InspectorTab>("move");
 
-  // Audio recording state (bound to the node where recording started)
+  // Audio recording state (bound to the draft and node where recording started)
+  const [isAcquiringMic, setIsAcquiringMic] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingNodeId, setRecordingNodeId] = useState<NodeId | null>(null);
   const [recordMs, setRecordMs] = useState(0);
   const [micLevel, setMicLevel] = useState(0);
   const [audioError, setAudioError] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+  const draftIdRef = useRef(draftId);
+  const isAcquiringMicRef = useRef(false);
+  const micAbortControllerRef = useRef<AbortController | null>(null);
   const recorderRef = useRef<ActiveRecordingSession | null>(null);
-  const recordingTargetRef = useRef<{
-    nodeId: NodeId;
-    san: string | null;
-    attachedClipId: string | null;
-    attachedSubtitles?: Record<string, string>;
-  } | null>(null);
-  const recordTimerRef = useRef<number | null>(null);
+  const recordingTargetRef = useRef<MicRecordingTarget | null>(null);
+  const recordTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Audio audition state
   const [isAuditioning, setIsAuditioning] = useState(false);
@@ -132,12 +151,15 @@ export function NodeInspector({
   const isDefaultLangValid =
     displayedDefaultLang.trim() === "" || isValidSubtitleLang(displayedDefaultLang.trim());
 
-  // Raw PGN draft state synced on explicit user focus/edit
-  const [rawPgnDraft, setRawPgnDraft] = useState<{ base: string; value: string }>({
-    base: pgnText,
-    value: pgnText,
-  });
-  const displayedPgn = rawPgnDraft.base === pgnText ? rawPgnDraft.value : pgnText;
+  // Raw PGN draft state: preserves user edits across external PGN changes and flags conflicts
+  const [rawPgnDraft, setRawPgnDraft] = useState<RawPgnBufferState>(() =>
+    createRawPgnBuffer(draftId, pgnText),
+  );
+  const {
+    displayedPgn,
+    isDirty: isRawPgnDirty,
+    hasConflict: hasRawPgnConflict,
+  } = deriveRawPgnView(rawPgnDraft, draftId, pgnText);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const vttInputRef = useRef<HTMLInputElement | null>(null);
@@ -171,100 +193,101 @@ export function NodeInspector({
     setIsAuditioning(false);
   }, []);
 
-  // Stop auditioning whenever the selected node changes
+  const callbacksRef = useRef({ stopAudition, onAttachAudioClip });
+  useEffect(() => {
+    callbacksRef.current = { stopAudition, onAttachAudioClip };
+  }, [stopAudition, onAttachAudioClip]);
+
+  const buildMicAdapter = useCallback(
+    (): MicRecordingStateAdapter => ({
+      isMounted: () => mountedRef.current,
+      getDraftId: () => draftIdRef.current,
+      getIsAcquiring: () => isAcquiringMicRef.current,
+      setIsAcquiring: (value) => {
+        isAcquiringMicRef.current = value;
+        if (mountedRef.current) {
+          setIsAcquiringMic(value);
+        }
+      },
+      getAbortController: () => micAbortControllerRef.current,
+      setAbortController: (controller) => {
+        micAbortControllerRef.current = controller;
+      },
+      getRecorder: () => recorderRef.current,
+      setRecorder: (session) => {
+        recorderRef.current = session;
+      },
+      getTarget: () => recordingTargetRef.current,
+      setTarget: (target) => {
+        recordingTargetRef.current = target;
+      },
+      getTimer: () => recordTimerRef.current,
+      setTimer: (timer) => {
+        recordTimerRef.current = timer;
+      },
+      setIsRecording,
+      setRecordingNodeId,
+      setRecordMs,
+      setMicLevel,
+      setAudioError,
+      stopAudition: () => callbacksRef.current.stopAudition(),
+      onAttachAudioClip: (params) => callbacksRef.current.onAttachAudioClip(params),
+    }),
+    [],
+  );
+
+  // Track mounted lifecycle before draftId cleanup so unmount skips UI state updates
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // Stop auditioning whenever the selected node or draft changes
   useEffect(() => {
     return () => {
       stopAudition();
     };
-  }, [node.nodeId, stopAudition]);
+  }, [draftId, node.nodeId, stopAudition]);
 
-  // Cleanup active recording on unmount
+  // Keep draftIdRef synced and abort/cleanup active or pending recording on unmount or draft switch
   useEffect(() => {
+    draftIdRef.current = draftId;
     return () => {
-      if (recordTimerRef.current !== null) {
-        clearInterval(recordTimerRef.current);
+      runCancelMicRecording(buildMicAdapter(), { resetUi: true });
+      if (mountedRef.current) {
+        setAudioError(null);
       }
-      recorderRef.current?.cancel();
     };
-  }, []);
+  }, [draftId, buildMicAdapter]);
 
   const handleStartRecording = async () => {
-    setAudioError(null);
-    stopAudition();
-    const target = {
+    const originDraftId = draftId;
+    const target: MicRecordingTarget = {
+      draftId: originDraftId,
       nodeId: node.nodeId,
       san: node.san,
       attachedClipId,
       attachedSubtitles: attachedClip?.subtitles ? { ...attachedClip.subtitles } : undefined,
     };
-    try {
-      const session = await startMicRecording();
-      recorderRef.current = session;
-      recordingTargetRef.current = target;
-      const started = Date.now();
-      setIsRecording(true);
-      setRecordingNodeId(target.nodeId);
-      setRecordMs(0);
-      recordTimerRef.current = window.setInterval(() => {
-        setRecordMs(Date.now() - started);
-        setMicLevel(session.getLevel());
-      }, 60);
-    } catch (err) {
-      setAudioError(err instanceof Error ? err.message : "Could not access microphone.");
-    }
+    await runStartMicRecording(buildMicAdapter(), target);
   };
 
   const handleStopRecording = async () => {
-    if (!recorderRef.current) return;
-    if (recordTimerRef.current !== null) {
-      clearInterval(recordTimerRef.current);
-      recordTimerRef.current = null;
-    }
-    const session = recorderRef.current;
-    const target = recordingTargetRef.current ?? {
+    const originDraftId = recordingTargetRef.current?.draftId ?? draftId;
+    const fallbackTarget: MicRecordingTarget = {
+      draftId: originDraftId,
       nodeId: node.nodeId,
       san: node.san,
       attachedClipId,
       attachedSubtitles: attachedClip?.subtitles ? { ...attachedClip.subtitles } : undefined,
     };
-    recorderRef.current = null;
-    recordingTargetRef.current = null;
-    setIsRecording(false);
-    setRecordingNodeId(null);
-    setMicLevel(0);
-
-    try {
-      const result = await session.stop();
-      const clipId = target.attachedClipId ?? generateClipId(Object.keys(manifest.clips));
-      const clipPath = `audio/${clipId}.${result.extension}`;
-      const clipDef: ClipDefinition = {
-        id: clipId,
-        path: clipPath,
-        mimeType: result.mimeType,
-        durationMs: result.durationMs,
-        trimStartMs: 0,
-        trimEndMs: result.durationMs,
-        label: target.san ? `Narration for ${target.san}` : `Intro (${target.nodeId})`,
-        ...(target.attachedSubtitles ? { subtitles: target.attachedSubtitles } : {}),
-      };
-      onAttachAudioClip(target.nodeId, clipDef, result.bytes, result.peaks);
-    } catch (err) {
-      setAudioError(err instanceof Error ? err.message : "Failed to save recording.");
-    }
+    await runStopMicRecording(buildMicAdapter(), fallbackTarget);
   };
 
   const handleCancelRecording = () => {
-    if (recordTimerRef.current !== null) {
-      clearInterval(recordTimerRef.current);
-      recordTimerRef.current = null;
-    }
-    recorderRef.current?.cancel();
-    recorderRef.current = null;
-    recordingTargetRef.current = null;
-    setIsRecording(false);
-    setRecordingNodeId(null);
-    setMicLevel(0);
-    setRecordMs(0);
+    runCancelMicRecording(buildMicAdapter(), { resetUi: true });
   };
 
   const handleAudioFileUpload = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -273,6 +296,7 @@ export function NodeInspector({
     if (!file) return;
     setAudioError(null);
     stopAudition();
+    const originDraftId = draftId;
     const targetNodeId = node.nodeId;
     const targetClipId = attachedClipId;
     const targetSubtitles = attachedClip?.subtitles ? { ...attachedClip.subtitles } : undefined;
@@ -281,22 +305,33 @@ export function NodeInspector({
       const bytes = new Uint8Array(buf);
       const mimeType = file.type || "audio/ogg";
       const ext = guessAudioExtension(mimeType, file.name);
-      const meta = await decodeAudioMetadata(bytes, 3000);
-      const clipId = targetClipId ?? generateClipId(Object.keys(manifest.clips));
-      const clipPath = `audio/${clipId}.${ext}`;
-      const clipDef: ClipDefinition = {
-        id: clipId,
-        path: clipPath,
+      const meta = await decodeAudioMetadata(bytes, undefined, 64, {
+        strictDuration: true,
         mimeType,
-        durationMs: meta.durationMs,
-        trimStartMs: 0,
-        trimEndMs: meta.durationMs,
-        label: file.name,
-        ...(targetSubtitles ? { subtitles: targetSubtitles } : {}),
-      };
-      onAttachAudioClip(targetNodeId, clipDef, bytes, meta.peaks);
+      });
+      if (!mountedRef.current || draftIdRef.current !== originDraftId) {
+        return;
+      }
+      onAttachAudioClip({
+        targetDraftId: originDraftId,
+        nodeId: targetNodeId,
+        requestedClipId: targetClipId,
+        clipTemplate: {
+          mimeType,
+          extension: ext,
+          durationMs: meta.durationMs,
+          trimStartMs: 0,
+          trimEndMs: meta.durationMs,
+          label: file.name,
+          ...(targetSubtitles ? { subtitles: targetSubtitles } : {}),
+        },
+        bytes,
+        peaks: meta.peaks,
+      });
     } catch (err) {
-      setAudioError(err instanceof Error ? err.message : "Failed to import audio file.");
+      if (mountedRef.current && draftIdRef.current === originDraftId) {
+        setAudioError(err instanceof Error ? err.message : "Failed to import audio file.");
+      }
     }
   };
 
@@ -398,8 +433,14 @@ export function NodeInspector({
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file || !attachedClip || !isSubLangValid) return;
+    const originDraftId = draftId;
+    const targetClipId = attachedClip.id;
+    const targetLang = trimmedSubLang;
     const text = await file.text();
-    onUpdateSubtitle(attachedClip.id, trimmedSubLang, text);
+    if (!mountedRef.current || draftIdRef.current !== originDraftId) {
+      return;
+    }
+    onUpdateSubtitle(targetClipId, targetLang, text, originDraftId);
   };
 
   // Determine which [%at] tags are primary vs silent revisit using sorted value order
@@ -671,18 +712,33 @@ export function NodeInspector({
                     <>
                       <button
                         type="button"
+                        disabled={isAcquiringMic}
                         onClick={handleStartRecording}
-                        className="rounded-md bg-red-600 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-red-700"
+                        className="rounded-md bg-red-600 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
                       >
-                        {attachedClip ? "Re-record" : "Record Mic"}
+                        {isAcquiringMic
+                          ? "Requesting mic…"
+                          : attachedClip
+                            ? "Re-record"
+                            : "Record Mic"}
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => fileInputRef.current?.click()}
-                        className="rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                      >
-                        {attachedClip ? "Replace File" : "Import Audio"}
-                      </button>
+                      {isAcquiringMic ? (
+                        <button
+                          type="button"
+                          onClick={handleCancelRecording}
+                          className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-600 hover:bg-slate-50"
+                        >
+                          Cancel
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                          className="rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                        >
+                          {attachedClip ? "Replace File" : "Import Audio"}
+                        </button>
+                      )}
                     </>
                   ) : (
                     <>
@@ -993,7 +1049,7 @@ export function NodeInspector({
                   value={currentVtt}
                   onChange={(e) => {
                     if (isSubLangValid) {
-                      onUpdateSubtitle(attachedClip.id, trimmedSubLang, e.target.value);
+                      onUpdateSubtitle(attachedClip.id, trimmedSubLang, e.target.value, draftId);
                     }
                   }}
                   placeholder={"WEBVTT\n\n00:00.000 --> 00:02.500\nNotice how the bishop eyes f7."}
@@ -1290,20 +1346,60 @@ export function NodeInspector({
             </div>
 
             <div>
-              <div className="mb-1 flex items-center justify-between">
-                <span className="font-semibold text-slate-800">Raw PGN Source (study.pgn)</span>
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-slate-800">Raw PGN Source (study.pgn)</span>
+                  {isRawPgnDirty && !hasRawPgnConflict ? (
+                    <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
+                      Unapplied edits
+                    </span>
+                  ) : null}
+                </div>
                 <button
                   type="button"
-                  onClick={() => onApplyRawPgn(displayedPgn)}
+                  onClick={() => {
+                    onApplyRawPgn(displayedPgn);
+                    setRawPgnDraft(createRawPgnBuffer(draftId, displayedPgn));
+                  }}
                   className="rounded bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-slate-800"
                 >
                   Apply PGN Changes
                 </button>
               </div>
+              {hasRawPgnConflict ? (
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-300 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-900">
+                  <span>
+                    The study changed elsewhere while you have unapplied raw PGN edits. Your edits
+                    are preserved below.
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onApplyRawPgn(displayedPgn);
+                        setRawPgnDraft(createRawPgnBuffer(draftId, displayedPgn));
+                      }}
+                      className="rounded bg-amber-900 px-2 py-1 font-semibold text-white hover:bg-amber-800"
+                    >
+                      Apply My Raw PGN
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRawPgnDraft(createRawPgnBuffer(draftId, pgnText))}
+                      className="rounded border border-amber-400 bg-white px-2 py-1 font-medium text-amber-900 hover:bg-amber-100"
+                    >
+                      Discard &amp; Reload Latest
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               <textarea
                 rows={7}
                 value={displayedPgn}
-                onChange={(e) => setRawPgnDraft({ base: pgnText, value: e.target.value })}
+                onChange={(e) => {
+                  const nextValue = e.target.value;
+                  setRawPgnDraft((prev) => editRawPgnBuffer(prev, draftId, pgnText, nextValue));
+                }}
                 className="w-full rounded-lg border border-slate-300 p-2 font-mono text-[11px] text-slate-800 focus:border-sky-500 focus:outline-none"
               />
             </div>

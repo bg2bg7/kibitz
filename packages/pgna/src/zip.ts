@@ -6,7 +6,32 @@ import type {
   PgnaTimeline,
   ZipCompressionMethod,
 } from "./types.js";
-import { ZIP_METHOD_DEFLATE, ZIP_METHOD_STORE, isSafeArchivePath } from "./validator.js";
+import {
+  ZIP_METHOD_DEFLATE,
+  ZIP_METHOD_STORE,
+  isSafeArchivePath,
+  validatePgnaZip,
+} from "./validator.js";
+
+export type PgnaPackErrorCode =
+  | "MISSING_MEDIA"
+  | "SUBTITLE_PATH_COLLISION"
+  | "ARCHIVE_VALIDATION_FAILED";
+
+export class PgnaPackError extends Error {
+  readonly code: PgnaPackErrorCode;
+  readonly path?: string;
+
+  constructor(code: PgnaPackErrorCode, message: string, path?: string) {
+    super(message);
+    this.name = "PgnaPackError";
+    this.code = code;
+    if (path !== undefined) {
+      this.path = path;
+    }
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
 
 export interface PackPgnaOptions {
   /** Entry paths that must be stored uncompressed (method 0) — mandatory for audio clips. */
@@ -632,29 +657,108 @@ export async function unpackPgnaZip(
   return entries;
 }
 
+function isUint8Array(value: unknown): value is Uint8Array {
+  return (
+    value instanceof Uint8Array ||
+    Object.prototype.toString.call(value) === "[object Uint8Array]"
+  );
+}
+
 /**
  * Compiles `manifest` + `pgnText` + subtitles and packs a complete spec-compliant `.pgna` ZIP archive.
  */
 export async function packPgnaArchive(
   input: PackPgnaArchiveInput,
 ): Promise<PackPgnaArchiveResult> {
+  const audioByPath = input.audioByPath;
+  const subtitlesByPath = input.subtitlesByPath;
+  const audioPaths = new Set<string>();
+  const referencedSubtitlePaths = new Set<string>();
+
+  if (isPlainObject(input.manifest.clips)) {
+    for (const [clipId, rawClip] of Object.entries(input.manifest.clips)) {
+      if (!isPlainObject(rawClip)) {
+        continue;
+      }
+
+      const clipPath = rawClip["path"];
+      if (typeof clipPath === "string") {
+        audioPaths.add(clipPath);
+        if (
+          !audioByPath ||
+          !Object.prototype.hasOwnProperty.call(audioByPath, clipPath) ||
+          !isUint8Array(audioByPath[clipPath])
+        ) {
+          throw new PgnaPackError(
+            "MISSING_MEDIA",
+            `Referenced audio clip "${clipPath}" (clip "${clipId}") is missing from audioByPath.`,
+            clipPath,
+          );
+        }
+      }
+
+      const clipSubtitles = rawClip["subtitles"];
+      if (isPlainObject(clipSubtitles)) {
+        for (const [lang, subPath] of Object.entries(clipSubtitles)) {
+          if (typeof subPath !== "string") {
+            continue;
+          }
+          referencedSubtitlePaths.add(subPath);
+          if (
+            !subtitlesByPath ||
+            !Object.prototype.hasOwnProperty.call(subtitlesByPath, subPath) ||
+            typeof subtitlesByPath[subPath] !== "string"
+          ) {
+            throw new PgnaPackError(
+              "MISSING_MEDIA",
+              `Referenced subtitle track "${subPath}" (clip "${clipId}", lang "${lang}") is missing from subtitlesByPath.`,
+              subPath,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  if (audioByPath) {
+    for (const p of Object.keys(audioByPath)) {
+      audioPaths.add(p);
+    }
+  }
+
   const compiled = compilePgna({
     manifest: input.manifest,
     pgnText: input.pgnText,
-    subtitlesByPath: input.subtitlesByPath,
+    subtitlesByPath,
     compiledAt: input.compiledAt,
   });
 
   const pgnPath = input.manifest.pgnPath ?? "study.pgn";
-  const timelinePath = input.manifest.timelinePath ?? "timeline.json";
-
-  const audioPaths = new Set<string>();
-  for (const clip of Object.values(input.manifest.clips ?? {})) {
-    audioPaths.add(clip.path);
+  if (typeof pgnPath !== "string" || !isSafeArchivePath(pgnPath)) {
+    throw new PgnaPackError(
+      "ARCHIVE_VALIDATION_FAILED",
+      `Invalid or unsafe manifest.pgnPath "${String(pgnPath)}".`,
+      typeof pgnPath === "string" ? pgnPath : undefined,
+    );
   }
-  if (input.audioByPath) {
-    for (const p of Object.keys(input.audioByPath)) {
-      audioPaths.add(p);
+
+  const timelinePath = input.manifest.timelinePath ?? "timeline.json";
+  if (typeof timelinePath !== "string" || !isSafeArchivePath(timelinePath)) {
+    throw new PgnaPackError(
+      "ARCHIVE_VALIDATION_FAILED",
+      `Invalid or unsafe manifest.timelinePath "${String(timelinePath)}".`,
+      typeof timelinePath === "string" ? timelinePath : undefined,
+    );
+  }
+
+  const mergedSubtitlePaths = new Set(Object.keys(compiled.mergedSubtitlesVtt));
+  for (const subPath of referencedSubtitlePaths) {
+    if (mergedSubtitlePaths.has(subPath)) {
+      throw new PgnaPackError(
+        "SUBTITLE_PATH_COLLISION",
+        `Clip source subtitle path "${subPath}" collides with generated merged subtitle track "${subPath}". Rename the clip source subtitle path.`,
+        subPath,
+      );
     }
   }
 
@@ -664,16 +768,18 @@ export async function packPgnaArchive(
     { path: timelinePath, data: utf8Encode(JSON.stringify(compiled.timeline, null, 2)) },
   ];
 
-  if (input.audioByPath) {
-    for (const [audioPath, bytes] of Object.entries(input.audioByPath)) {
+  if (audioByPath) {
+    for (const [audioPath, bytes] of Object.entries(audioByPath)) {
       rawFiles.push({ path: audioPath, data: bytes });
     }
   }
 
-  const mergedSubtitlePaths = new Set(Object.keys(compiled.mergedSubtitlesVtt));
-  if (input.subtitlesByPath) {
-    for (const [subPath, vttText] of Object.entries(input.subtitlesByPath)) {
-      if (mergedSubtitlePaths.has(subPath) || MERGED_SUBTITLE_PATH_RE.test(subPath)) {
+  if (subtitlesByPath) {
+    for (const [subPath, vttText] of Object.entries(subtitlesByPath)) {
+      if (
+        !referencedSubtitlePaths.has(subPath) &&
+        (mergedSubtitlePaths.has(subPath) || MERGED_SUBTITLE_PATH_RE.test(subPath))
+      ) {
         continue;
       }
       rawFiles.push({ path: subPath, data: utf8Encode(vttText) });
@@ -684,8 +790,57 @@ export async function packPgnaArchive(
     rawFiles.push({ path: mergedPath, data: utf8Encode(mergedVtt) });
   }
 
+  const seenRawPaths = new Set<string>();
+  for (const file of rawFiles) {
+    if (!isSafeArchivePath(file.path)) {
+      throw new PgnaPackError(
+        "ARCHIVE_VALIDATION_FAILED",
+        `Unsafe PGNA archive path: "${file.path}".`,
+        file.path,
+      );
+    }
+    if (seenRawPaths.has(file.path)) {
+      throw new PgnaPackError(
+        "ARCHIVE_VALIDATION_FAILED",
+        `Duplicate archive entry path "${file.path}" while packing PGNA archive.`,
+        file.path,
+      );
+    }
+    seenRawPaths.add(file.path);
+  }
+
   const entries = prepareArchiveEntries(rawFiles, { storePaths: audioPaths });
   const zipBytes = await packPgnaZip(entries);
+
+  const maxEntryBytes = entries.reduce(
+    (max, entry) => Math.max(max, entry.data.byteLength),
+    DEFAULT_MAX_ZIP_ENTRY_BYTES,
+  );
+  const totalUncompressedBytes = entries.reduce(
+    (sum, entry) => sum + entry.data.byteLength,
+    0,
+  );
+  const validation = await validatePgnaZip(zipBytes, {
+    maxEntries: Math.max(DEFAULT_MAX_ZIP_ENTRIES, entries.length),
+    maxEntryBytes,
+    maxTotalUncompressedBytes: Math.max(
+      DEFAULT_MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
+      totalUncompressedBytes,
+    ),
+  });
+  if (!validation.valid) {
+    const errorDiagnostics = validation.diagnostics.filter((d) => d.severity === "error");
+    const firstError = errorDiagnostics[0];
+    const summary =
+      errorDiagnostics.length > 0
+        ? errorDiagnostics.map((d) => `[${d.code}] ${d.message}`).join("; ")
+        : "Packed PGNA archive failed validation.";
+    throw new PgnaPackError(
+      "ARCHIVE_VALIDATION_FAILED",
+      `Packed PGNA archive failed validation: ${summary}`,
+      firstError?.path,
+    );
+  }
 
   return {
     zipBytes,
