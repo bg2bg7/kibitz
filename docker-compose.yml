@@ -1,16 +1,16 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d
     container_name: kibitz-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-kibitz}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kibitz_dev_password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-kibitz_suite}
-      INITIAL_ADMIN_HANDLE: ${INITIAL_ADMIN_HANDLE:-admin}
-      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-kibitz_dev_admin_password}
+      INITIAL_ADMIN_HANDLE: ${INITIAL_ADMIN_HANDLE:-}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - kibitz_pgdata:/var/lib/postgresql/data
       - ./packages/db/drizzle:/migrations:ro
@@ -22,7 +22,7 @@ services:
       retries: 10
 
   s3:
-    image: rustfs/rustfs:latest
+    image: rustfs/rustfs@sha256:ee717072290bec9b11abfc0365f8310b00df1cd9b3639943edae47bdef05044a
     container_name: kibitz-s3
     restart: unless-stopped
     command: ["/data"]
@@ -30,11 +30,11 @@ services:
       RUSTFS_ADDRESS: ":9000"
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_CONSOLE_ADDRESS: ":9001"
-      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY_ID:-kibitz_s3_admin}
-      RUSTFS_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:-kibitz_s3_dev_secret}
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID in .env}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY in .env}
     ports:
-      - "${S3_PORT:-9000}:9000"
-      - "${S3_CONSOLE_PORT:-9001}:9001"
+      - "${S3_BIND_HOST:-127.0.0.1}:${S3_PORT:-9000}:9000"
+      - "${S3_CONSOLE_BIND_HOST:-127.0.0.1}:${S3_CONSOLE_PORT:-9001}:9001"
     volumes:
       - kibitz_s3data:/data
     healthcheck:
@@ -44,14 +44,14 @@ services:
       retries: 10
 
   s3-init:
-    image: rustfs/rustfs:latest
+    image: rustfs/rustfs@sha256:ee717072290bec9b11abfc0365f8310b00df1cd9b3639943edae47bdef05044a
     container_name: kibitz-s3-init
     depends_on:
       s3:
         condition: service_healthy
     environment:
-      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-kibitz_s3_admin}
-      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-kibitz_s3_dev_secret}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID in .env}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY in .env}
       S3_BUCKET: ${S3_BUCKET:-kibitz-pgna}
     entrypoint:
       - /bin/sh

@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest";
 import {
+  BCRYPT_MAX_PASSWORD_BYTES,
+  DEFAULT_DEV_JWT_SECRET,
   buildClearSessionCookieHeader,
   buildSessionCookieHeader,
   canStudentReadStudy,
   computeEffectiveStudentAccess,
   evaluateDoubleBlindLinkTransition,
   extractSessionToken,
+  getPasswordByteLength,
   hashPassword,
   isAllowedSuiteOrigin,
+  isPlaceholderJwtSecret,
+  isWithinBcryptByteLimit,
   parseSessionCookie,
   resolveAuthConfig,
   signSessionToken,
@@ -237,5 +242,108 @@ describe("@suite/auth-core ACL & double-blind invariants", () => {
     expect(await verifyPassword("correct-horse-battery-staple", hash)).toBe(true);
     expect(await verifyPassword("wrong-password", hash)).toBe(false);
     expect(await verifyPassword("", hash)).toBe(false);
+  });
+
+  it("rejects default, placeholder, and short JWT secrets in production while accepting generated random secrets", () => {
+    expect(isPlaceholderJwtSecret(DEFAULT_DEV_JWT_SECRET)).toBe(true);
+    expect(
+      isPlaceholderJwtSecret("replace-me-with-something-long-enough-to-pass-32-chars"),
+    ).toBe(true);
+    expect(isPlaceholderJwtSecret("dev-only-secret-that-is-32-characters-long")).toBe(true);
+    expect(isPlaceholderJwtSecret("  CHANGE-ME-secret-with-extra-characters-here  ")).toBe(true);
+    expect(isPlaceholderJwtSecret("my-changeme-secret-long-enough-for-32-bytes")).toBe(true);
+    expect(isPlaceholderJwtSecret("this-is-a-placeholder-secret-value-123456")).toBe(true);
+    expect(isPlaceholderJwtSecret("your-secret-key-goes-here-at-least-32-bytes")).toBe(true);
+    expect(isPlaceholderJwtSecret("example-secret-value-copied-from-docs-1234")).toBe(true);
+    expect(
+      isPlaceholderJwtSecret("k9F2mQ8xR4pL7wV1nB6cT3yH5jD0sA8eU2zN4qW6vM9pK1rX3bG7tJ5cL8hF0dY2"),
+    ).toBe(false);
+
+    // Rejects bundled dev default in production
+    expect(() =>
+      resolveAuthConfig({
+        NODE_ENV: "production",
+        AUTH_JWT_SECRET: DEFAULT_DEV_JWT_SECRET,
+      }),
+    ).toThrow(/placeholder|default/i);
+
+    // Rejects placeholder secrets in production even when >= 32 bytes
+    for (const badSecret of [
+      "replace-me-with-something-long-enough-to-pass-32-chars",
+      "dev-only-secret-that-is-32-characters-long",
+      "change-me-to-something-unique-and-long-enough",
+      "this-placeholder-secret-must-be-rejected-in-prod",
+    ]) {
+      expect(() =>
+        resolveAuthConfig({
+          NODE_ENV: "production",
+          AUTH_JWT_SECRET: badSecret,
+        }),
+      ).toThrow(/openssl rand/i);
+    }
+
+    // Rejects missing or < 32 UTF-8 byte secrets in production
+    expect(() => resolveAuthConfig({ NODE_ENV: "production" })).toThrow(/32 UTF-8 bytes/i);
+    expect(() =>
+      resolveAuthConfig({
+        NODE_ENV: "production",
+        AUTH_JWT_SECRET: "x".repeat(31),
+      }),
+    ).toThrow(/32 UTF-8 bytes/i);
+
+    // Accepts a real generated random secret in production
+    const realSecret = "k9F2mQ8xR4pL7wV1nB6cT3yH5jD0sA8eU2zN4qW6vM9pK1rX3bG7tJ5cL8hF0dY2";
+    const prodCfg = resolveAuthConfig({
+      NODE_ENV: "production",
+      AUTH_JWT_SECRET: realSecret,
+    });
+    expect(prodCfg.secret).toBe(realSecret);
+    expect(prodCfg.secureCookie).toBe(true);
+  });
+
+  it("enforces bcrypt's 72-byte UTF-8 boundary on hashPassword while keeping verifyPassword non-throwing", async () => {
+    expect(BCRYPT_MAX_PASSWORD_BYTES).toBe(72);
+
+    // Exact 72 ASCII bytes succeeds and verifies
+    const ascii72 = "a".repeat(72);
+    expect(getPasswordByteLength(ascii72)).toBe(72);
+    expect(isWithinBcryptByteLimit(ascii72)).toBe(true);
+    const ascii72Hash = await hashPassword(ascii72, 4);
+    expect(await verifyPassword(ascii72, ascii72Hash)).toBe(true);
+
+    // 73 ASCII bytes throws
+    const ascii73 = "a".repeat(73);
+    expect(getPasswordByteLength(ascii73)).toBe(73);
+    expect(isWithinBcryptByteLimit(ascii73)).toBe(false);
+    await expect(hashPassword(ascii73, 4)).rejects.toThrow(/72-byte UTF-8 limit/);
+
+    // Exact 72 UTF-8 bytes using 4-byte emoji (18 * 4 = 72) succeeds and verifies
+    const emoji72 = "🔑".repeat(18);
+    expect(getPasswordByteLength(emoji72)).toBe(72);
+    expect(isWithinBcryptByteLimit(emoji72)).toBe(true);
+    const emoji72Hash = await hashPassword(emoji72, 4);
+    expect(await verifyPassword(emoji72, emoji72Hash)).toBe(true);
+
+    // 76 UTF-8 bytes using 4-byte emoji (19 * 4 = 76) throws
+    const emoji76 = "🔑".repeat(19);
+    expect(getPasswordByteLength(emoji76)).toBe(76);
+    expect(isWithinBcryptByteLimit(emoji76)).toBe(false);
+    await expect(hashPassword(emoji76, 4)).rejects.toThrow(/72-byte UTF-8 limit/);
+
+    // Exact 72 UTF-8 bytes using 3-byte euro signs (24 * 3 = 72) succeeds; 25 (75 bytes) throws
+    const euro72 = "€".repeat(24);
+    expect(getPasswordByteLength(euro72)).toBe(72);
+    expect(isWithinBcryptByteLimit(euro72)).toBe(true);
+    const euro72Hash = await hashPassword(euro72, 4);
+    expect(await verifyPassword(euro72, euro72Hash)).toBe(true);
+
+    const euro75 = "€".repeat(25);
+    expect(getPasswordByteLength(euro75)).toBe(75);
+    expect(isWithinBcryptByteLimit(euro75)).toBe(false);
+    await expect(hashPassword(euro75, 4)).rejects.toThrow(/72-byte UTF-8 limit/);
+
+    // verifyPassword remains non-throwing for legacy/overlong inputs
+    await expect(verifyPassword(`${ascii72}extra-legacy-suffix`, ascii72Hash)).resolves.toBe(true);
+    await expect(verifyPassword("b".repeat(100), ascii72Hash)).resolves.toBe(false);
   });
 });

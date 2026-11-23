@@ -18,13 +18,35 @@ Licensed under the **GNU Affero General Public License v3.0 (`AGPL-3.0-only`)**.
 
 ```bash
 cp .env.example .env
+```
+
+Before starting Docker, populate freshly generated local credentials in `.env`:
+
+- `POSTGRES_PASSWORD` (e.g. `openssl rand -hex 24`) and the matching password in `DATABASE_URL`
+- `S3_ACCESS_KEY_ID` (e.g. `openssl rand -hex 12`) and `S3_SECRET_ACCESS_KEY` (e.g. `openssl rand -hex 24`)
+- `AUTH_JWT_SECRET` (e.g. `openssl rand -base64 48`, required in production)
+- _(Optional, first volume init only)_ Set `INITIAL_ADMIN_HANDLE` and `INITIAL_ADMIN_PASSWORD` (`<= 72` UTF-8 bytes, e.g. `openssl rand -base64 36`) to seed an initial admin account on an empty Postgres volume; leave both empty to skip admin seeding.
+
+Then start the local services:
+
+```bash
 docker compose up -d
 ```
 
+If you opted into initial admin seeding, clear `INITIAL_ADMIN_PASSWORD` from `.env` after initialization completes.
+
 This starts:
 
-- **PostgreSQL 16** on `localhost:5432` (`kibitz_suite`) — on first startup (empty volume), [`docker/postgres/init-db-and-admin.sh`](./docker/postgres/init-db-and-admin.sh) automatically applies all Drizzle migrations in `packages/db/drizzle/` and seeds the default `admin` account from `INITIAL_ADMIN_HANDLE` and `INITIAL_ADMIN_PASSWORD`.
-- **RustFS (S3-compatible `.pgna` storage)** on `localhost:9000` (Console: `http://localhost:9001`), auto-creating the `kibitz-pgna` bucket.
+- **PostgreSQL 16** bound to `127.0.0.1:5432` by default (`kibitz_suite`) — on first startup (empty volume), [`docker/postgres/init-db-and-admin.sh`](./docker/postgres/init-db-and-admin.sh) automatically applies all Drizzle migrations in `packages/db/drizzle/` and seeds an initial admin account **only** when both `INITIAL_ADMIN_HANDLE` and `INITIAL_ADMIN_PASSWORD` are explicitly non-empty.
+- **RustFS (S3-compatible `.pgna` storage)** bound to `127.0.0.1:9000` (Console: `http://127.0.0.1:9001`) by default, auto-creating the `kibitz-pgna` bucket. Override `POSTGRES_BIND_HOST`, `S3_BIND_HOST`, or `S3_CONSOLE_BIND_HOST` only when intentionally exposing beyond loopback.
+
+#### Credential Rotation & Existing Installs
+
+Changing `.env` alone does **not** rotate credentials already persisted inside existing PostgreSQL (`kibitz_pgdata`) or RustFS (`kibitz_s3data`) volumes, nor does it remove an already-seeded admin account. On existing installs:
+
+- Inventory exposed service ports and ensure local infrastructure is bound to loopback or firewalled.
+- Rotate the PostgreSQL role password (`ALTER USER ... WITH PASSWORD ...`), existing admin account passwords, S3 access/secret keys, and `AUTH_JWT_SECRET` (which invalidates previously issued sessions).
+- Inspect existing bootstrap accounts in `"users"` (or recreate disposable local development volumes with `docker compose down -v` before re-initializing).
 
 ### 2. Install Dependencies & Sync Database Migrations
 

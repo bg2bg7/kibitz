@@ -35,18 +35,24 @@ async function bootstrapRepository(): Promise<IdentityRepository> {
   }
 
   const repo = new InMemoryIdentityRepository();
-  const devAdminHandle = process.env["INITIAL_ADMIN_HANDLE"]?.trim() || "admin";
-  const devAdminPassword =
-    process.env["INITIAL_ADMIN_PASSWORD"]?.trim() || "kibitz_dev_admin_password";
-  const passwordHash = await hashPassword(devAdminPassword, 8);
-  repo.seedUser({
-    handle: devAdminHandle,
-    passwordHash,
-    role: "admin",
-  });
-  console.warn(
-    `[id] DATABASE_URL not set; running with in-memory dev store (seeded admin handle: "${devAdminHandle}").`,
-  );
+  const devAdminHandle = process.env["INITIAL_ADMIN_HANDLE"]?.trim() ?? "";
+  const devAdminPassword = process.env["INITIAL_ADMIN_PASSWORD"]?.trim() ?? "";
+
+  if (devAdminHandle && devAdminPassword) {
+    const passwordHash = await hashPassword(devAdminPassword, 8);
+    repo.seedUser({
+      handle: devAdminHandle,
+      passwordHash,
+      role: "admin",
+    });
+    console.warn(
+      `[id] DATABASE_URL not set; running with in-memory dev store (seeded admin handle: "${devAdminHandle}").`,
+    );
+  } else {
+    console.warn(
+      "[id] DATABASE_URL not set; running with in-memory dev store without a seeded admin. Set both INITIAL_ADMIN_HANDLE and INITIAL_ADMIN_PASSWORD to opt in to seeding a dev admin.",
+    );
+  }
   return repo;
 }
 

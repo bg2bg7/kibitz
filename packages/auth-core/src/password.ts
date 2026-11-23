@@ -6,10 +6,29 @@ import bcrypt from "bcryptjs";
  */
 export const BCRYPT_COST = 12;
 
+/**
+ * Maximum password length processed by bcrypt (72 UTF-8 bytes).
+ * Bytes beyond this boundary are silently truncated by bcrypt implementations.
+ */
+export const BCRYPT_MAX_PASSWORD_BYTES = 72;
+
+const textEncoder = new TextEncoder();
+
+export function getPasswordByteLength(plainPassword: string): number {
+  return textEncoder.encode(plainPassword).byteLength;
+}
+
+export function isWithinBcryptByteLimit(plainPassword: string): boolean {
+  return getPasswordByteLength(plainPassword) <= BCRYPT_MAX_PASSWORD_BYTES;
+}
+
 export async function hashPassword(
   plainPassword: string,
   cost: number = BCRYPT_COST,
 ): Promise<string> {
+  if (!isWithinBcryptByteLimit(plainPassword)) {
+    throw new Error("Password exceeds bcrypt's 72-byte UTF-8 limit.");
+  }
   return bcrypt.hash(plainPassword, cost);
 }
 

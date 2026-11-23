@@ -6,6 +6,7 @@ import {
   extractSessionToken,
   hashPassword,
   isAllowedSuiteOrigin,
+  isWithinBcryptByteLimit,
   resolveAuthConfig,
   signSessionToken,
   verifyPassword,
@@ -33,7 +34,13 @@ const RegisterBodySchema = z.object({
       HANDLE_REGEX,
       "Handle must be 2–32 characters using only letters, numbers, underscores, or hyphens (no email addresses).",
     ),
-  password: z.string().min(10, "Password must be at least 10 characters.").max(256),
+  password: z
+    .string()
+    .min(10, "Password must be at least 10 characters.")
+    .refine(
+      (val) => isWithinBcryptByteLimit(val),
+      "Password must be at most 72 UTF-8 bytes (multi-byte characters and emoji count as multiple bytes).",
+    ),
 });
 
 const InviteCreateBodySchema = z.object({

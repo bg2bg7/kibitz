@@ -346,16 +346,49 @@ export function buildClearSessionCookieHeader(
   return attributes.join("; ");
 }
 
+const PLACEHOLDER_SECRET_MARKERS = [
+  "dev-only",
+  "replace-me",
+  "change-me",
+  "changeme",
+  "placeholder",
+  "your-secret",
+  "example-secret",
+] as const;
+
+/**
+ * Returns true if a JWT signing secret matches the bundled development default or
+ * contains obvious example/placeholder markers that must not be used in production.
+ */
+export function isPlaceholderJwtSecret(secret: string): boolean {
+  const normalized = secret.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized === DEFAULT_DEV_JWT_SECRET.toLowerCase()) {
+    return true;
+  }
+  return PLACEHOLDER_SECRET_MARKERS.some((marker) => normalized.includes(marker));
+}
+
 /**
  * Resolves cross-subdomain JWT & cookie settings from environment variables.
- * Fails fast in production if `AUTH_JWT_SECRET` is missing or weak (< 32 bytes).
+ * Fails fast in production if `AUTH_JWT_SECRET` is missing, weak (< 32 UTF-8 bytes),
+ * or matches a placeholder/example secret.
  */
 export function resolveAuthConfig(env: Record<string, string | undefined> = {}): SessionJwtConfig {
   const isProd = env["NODE_ENV"] === "production";
   const secret = env["AUTH_JWT_SECRET"]?.trim() || (isProd ? "" : DEFAULT_DEV_JWT_SECRET);
 
-  if (isProd && secret.length < 32) {
-    throw new Error("AUTH_JWT_SECRET must be set and at least 32 characters long in production.");
+  if (isProd) {
+    if (textEncoder.encode(secret).byteLength < 32) {
+      throw new Error("AUTH_JWT_SECRET must be set and at least 32 UTF-8 bytes long in production.");
+    }
+    if (isPlaceholderJwtSecret(secret)) {
+      throw new Error(
+        "AUTH_JWT_SECRET must not use the default or a placeholder/example secret in production. Generate a unique secret (e.g., `openssl rand -base64 48`).",
+      );
+    }
   }
 
   const parsedTtl = Number(env["AUTH_SESSION_TTL_SECONDS"] ?? DEFAULT_SESSION_TTL_SECONDS);

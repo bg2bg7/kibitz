@@ -287,4 +287,75 @@ describe("@suite/id server", () => {
     expect(invitesRes.status).toBe(401);
     expect(invitesRes.headers.get("set-cookie")).toContain("Max-Age=0");
   });
+
+  it("enforces bcrypt's 72-byte UTF-8 password boundary on POST /auth/register", async () => {
+    const { app } = await setupTestIdApp();
+
+    const adminLogin = await app.request("/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ handle: "admin", password: "admin-secret-passphrase" }),
+    });
+    const adminCookie = extractCookiePair(adminLogin.headers.get("set-cookie"));
+
+    const inviteRes = await app.request("/invites", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: adminCookie },
+      body: JSON.stringify({ assignedRole: "student", maxUses: 4 }),
+    });
+    expect(inviteRes.status).toBe(201);
+    const { invite } = (await inviteRes.json()) as { invite: { code: string } };
+
+    // Exact 72 ASCII bytes succeeds
+    const ascii72Res = await app.request("/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        inviteCode: invite.code,
+        handle: "student_ascii72",
+        password: "a".repeat(72),
+      }),
+    });
+    expect(ascii72Res.status).toBe(201);
+
+    // Exact 72 UTF-8 bytes with 3-byte euro signs (24 * 3 = 72) succeeds
+    const euro72Res = await app.request("/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        inviteCode: invite.code,
+        handle: "student_euro72",
+        password: "€".repeat(24),
+      }),
+    });
+    expect(euro72Res.status).toBe(201);
+
+    // 73 ASCII bytes is rejected with 400 mentioning 72 bytes
+    const ascii73Res = await app.request("/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        inviteCode: invite.code,
+        handle: "student_ascii73",
+        password: "a".repeat(73),
+      }),
+    });
+    expect(ascii73Res.status).toBe(400);
+    const ascii73Body = (await ascii73Res.json()) as { error: string };
+    expect(ascii73Body.error).toMatch(/72.*bytes/i);
+
+    // 76 UTF-8 bytes using 4-byte emoji (19 * 4 = 76) is rejected with 400 mentioning 72 bytes
+    const emoji76Res = await app.request("/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        inviteCode: invite.code,
+        handle: "student_emoji76",
+        password: "🔑".repeat(19),
+      }),
+    });
+    expect(emoji76Res.status).toBe(400);
+    const emoji76Body = (await emoji76Res.json()) as { error: string };
+    expect(emoji76Body.error).toMatch(/72.*bytes/i);
+  });
 });

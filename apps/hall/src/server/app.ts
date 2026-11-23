@@ -7,9 +7,12 @@ import {
 } from "@suite/auth-core";
 import { ChessPosition, INITIAL_FEN } from "@suite/chess-core";
 import { Hono } from "hono";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { z } from "zod";
 import type { Server as HttpServer } from "node:http";
+
+export const DEFAULT_HALL_WS_MAX_PAYLOAD_BYTES = 4096;
+export const DEFAULT_HALL_WS_MAX_GAMES = 256;
 
 const MoveMessageSchema = z.object({
   type: z.literal("move"),
@@ -28,12 +31,42 @@ export interface MoveValidationResponse {
 }
 
 /**
+ * Determines whether Hall's live WebSocket move channel (/ws) should be enabled.
+ *
+ * Disabled by default (HALL-01) and unconditionally disabled in production because
+ * seat, authentication, and tournament schedule enforcement are not implemented yet.
+ * Outside production, developers may opt in explicitly with HALL_ENABLE_DEV_WS=true.
+ */
+export function isHallWebSocketEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (env["NODE_ENV"]?.trim().toLowerCase() === "production") {
+    return false;
+  }
+  return env["HALL_ENABLE_DEV_WS"]?.trim().toLowerCase() === "true";
+}
+
+function rawDataToString(data: RawData): string {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (Buffer.isBuffer(data)) {
+    return data.toString("utf8");
+  }
+  if (Array.isArray(data)) {
+    return Buffer.concat(data).toString("utf8");
+  }
+  return Buffer.from(data).toString("utf8");
+}
+
+/**
  * Pure WebSocket move validator using @suite/chess-core.
  * Strictly scheduled club tournament games only — no open lobby, no matchmaking, no chat.
  */
 export function handleTournamentMoveMessage(
   rawPayload: string,
   positionByGameId: Map<string, ChessPosition>,
+  maxGames: number = DEFAULT_HALL_WS_MAX_GAMES,
 ): MoveValidationResponse {
   let json: unknown;
   try {
@@ -58,12 +91,17 @@ export function handleTournamentMoveMessage(
   }
 
   const { gameId, from, to, promotion } = parsed.data;
-  let position = positionByGameId.get(gameId);
-  if (!position) {
-    position = new ChessPosition(INITIAL_FEN);
-    positionByGameId.set(gameId, position);
+  const existingPosition = positionByGameId.get(gameId);
+  if (!existingPosition && positionByGameId.size >= maxGames) {
+    return {
+      type: "move_rejected",
+      gameId,
+      fen: INITIAL_FEN,
+      reason: `Tournament room capacity reached (max ${maxGames} active games).`,
+    };
   }
 
+  const position = existingPosition ?? new ChessPosition(INITIAL_FEN);
   const applied = position.tryMove(promotion ? { from, to, promotion } : { from, to });
   if (!applied) {
     return {
@@ -72,6 +110,10 @@ export function handleTournamentMoveMessage(
       fen: position.fen,
       reason: `Illegal move: ${from}${to}`,
     };
+  }
+
+  if (!existingPosition) {
+    positionByGameId.set(gameId, position);
   }
 
   return {
@@ -84,10 +126,12 @@ export function handleTournamentMoveMessage(
 
 export interface CreateHallAppOptions {
   authConfig?: SessionJwtConfig;
+  wsEnabled?: boolean;
 }
 
 export function createHallApp(options: CreateHallAppOptions = {}) {
   const authConfig = options.authConfig ?? resolveAuthConfig(process.env);
+  const wsEnabled = options.wsEnabled ?? isHallWebSocketEnabled(process.env);
   const app = new Hono();
 
   app.use("*", async (c, next) => {
@@ -113,6 +157,7 @@ export function createHallApp(options: CreateHallAppOptions = {}) {
       mode: "scheduled-club-tournaments-only",
       openLobby: false,
       chatEnabled: false,
+      wsEnabled,
     }),
   );
 
@@ -146,14 +191,69 @@ export function createHallApp(options: CreateHallAppOptions = {}) {
   return app;
 }
 
-export function attachHallWebSocketServer(httpServer: HttpServer): WebSocketServer {
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+export interface AttachHallWebSocketOptions {
+  maxPayloadBytes?: number;
+  maxGames?: number;
+  onError?: (err: Error, context: "server" | "connection") => void;
+}
+
+export function attachHallWebSocketServer(
+  httpServer: HttpServer,
+  options: AttachHallWebSocketOptions = {},
+): WebSocketServer {
+  const maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_HALL_WS_MAX_PAYLOAD_BYTES;
+  const maxGames = options.maxGames ?? DEFAULT_HALL_WS_MAX_GAMES;
+  const onError =
+    options.onError ??
+    ((err: Error, context: "server" | "connection") => {
+      console.error(`[hall] WebSocket ${context} error:`, err.message);
+    });
+
+  const reportError = (err: unknown, context: "server" | "connection") => {
+    const normalized = err instanceof Error ? err : new Error(String(err));
+    onError(normalized, context);
+  };
+
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: "/ws",
+    maxPayload: maxPayloadBytes,
+  });
   const positionByGameId = new Map<string, ChessPosition>();
 
+  wss.on("error", (err) => {
+    reportError(err, "server");
+  });
+
   wss.on("connection", (socket: WebSocket) => {
+    const containConnectionError = (err: unknown) => {
+      reportError(err, "connection");
+      if (socket.readyState !== WebSocket.CLOSED) {
+        socket.terminate();
+      }
+    };
+
+    socket.on("error", (err) => {
+      containConnectionError(err);
+    });
+
     socket.on("message", (data) => {
-      const response = handleTournamentMoveMessage(data.toString(), positionByGameId);
-      socket.send(JSON.stringify(response));
+      try {
+        const response = handleTournamentMoveMessage(
+          rawDataToString(data),
+          positionByGameId,
+          maxGames,
+        );
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify(response), (sendErr) => {
+            if (sendErr) {
+              containConnectionError(sendErr);
+            }
+          });
+        }
+      } catch (err) {
+        containConnectionError(err);
+      }
     });
   });
 

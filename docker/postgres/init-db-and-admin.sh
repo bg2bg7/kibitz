@@ -3,8 +3,9 @@
 # PostgreSQL First-Startup Bootstrap (runs only on an empty PGDATA volume)
 # 1. Applies all Drizzle SQL migrations mounted at /migrations and records them
 #    in drizzle.__drizzle_migrations so `pnpm db:migrate` stays in sync.
-# 2. Creates the default admin account from INITIAL_ADMIN_HANDLE and
-#    INITIAL_ADMIN_PASSWORD using pgcrypto bcrypt (compatible with @suite/auth-core).
+# 2. Optionally creates an initial admin account when INITIAL_ADMIN_HANDLE and
+#    INITIAL_ADMIN_PASSWORD (<= 72 UTF-8 bytes) are explicitly provided, using
+#    pgcrypto bcrypt (compatible with @suite/auth-core).
 # ==============================================================================
 set -eu
 
@@ -59,12 +60,23 @@ else
   echo "[kibitz-init] WARNING: No Drizzle journal found at ${JOURNAL_FILE}; skipping SQL migrations."
 fi
 
-ADMIN_HANDLE="${INITIAL_ADMIN_HANDLE:-}"
-ADMIN_PASSWORD="${INITIAL_ADMIN_PASSWORD:-}"
+trim_ws() {
+  printf '%s' "$1" | tr '\r\n\t\v\f' '     ' | sed 's/^ *//;s/ *$//'
+}
 
-if [ -z "$ADMIN_HANDLE" ] || [ -z "$ADMIN_PASSWORD" ]; then
-  echo "[kibitz-init] INITIAL_ADMIN_HANDLE or INITIAL_ADMIN_PASSWORD is empty; skipping default admin seed."
+ADMIN_HANDLE="$(trim_ws "${INITIAL_ADMIN_HANDLE:-}")"
+ADMIN_PASSWORD="${INITIAL_ADMIN_PASSWORD:-}"
+ADMIN_PASSWORD_TRIMMED="$(trim_ws "$ADMIN_PASSWORD")"
+
+if [ -z "$ADMIN_HANDLE" ] || [ -z "$ADMIN_PASSWORD_TRIMMED" ]; then
+  echo "[kibitz-init] INITIAL_ADMIN_HANDLE or INITIAL_ADMIN_PASSWORD is empty; skipping initial admin seed."
   exit 0
+fi
+
+ADMIN_PASSWORD_BYTES="$(printf '%s' "$ADMIN_PASSWORD" | wc -c | tr -d '[:space:]')"
+if [ "$ADMIN_PASSWORD_BYTES" -gt 72 ]; then
+  echo "[kibitz-init] ERROR: INITIAL_ADMIN_PASSWORD exceeds bcrypt's 72-byte UTF-8 limit (${ADMIN_PASSWORD_BYTES} bytes). Choose a password <= 72 UTF-8 bytes." >&2
+  exit 1
 fi
 
 echo "[kibitz-init] Seeding initial admin account '${ADMIN_HANDLE}'..."
@@ -84,4 +96,4 @@ VALUES (
 ON CONFLICT (lower("handle")) DO NOTHING;
 SQL
 
-echo "[kibitz-init] Default admin bootstrap complete."
+echo "[kibitz-init] Initial admin bootstrap complete."
